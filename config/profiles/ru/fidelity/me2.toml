@@ -1,0 +1,364 @@
+# ME2 deko3d - FIDELITY profile, RUSSIAN edition (2026-11-01). Pair with clocks CPU 1785 / GPU ~920-1000 / memory 1600 MHz (set them in sys-clk / your overclock
+# tool; this file cannot set clocks). Diagnostics are off: stack sampling, GPU timings, wait timing, per-collection
+# and spike log lines. Kept: the 10 s report file (logs/rex/rex_profile.log), the GC timing and its thread-pool boost,
+# the light trim, the image hold during streaming. Copy this file over me2.toml to use it.
+# ME2 DIAGNOSTIC RUN - 2026-10-31 (needs me2_opt.nro built 2026-10-31 20:50 or newer).
+# = the fidelity profile from the console logs of 10-30/10-31 (LOGS/more_more_logs/me2.toml), unchanged, plus the
+#   measurement switches at the end of this file. Copy as sdmc:/switch/me2-deko/me2.toml for ONE run, then put the
+#   previous me2.toml back. Play normally for 20-30 minutes, ideally including combat and a hub (Omega / Citadel),
+#   then send me2.log and logs/rex/rex_profile.log.
+# Based on the supplied 2026-10-29 fidelity profile; graphics and audio values preserved.
+# Copy as sdmc:/switch/me2-deko/me2.toml to select this profile on the console.
+# Requires me2_opt.nro build 20261030-querybias1 or newer with the same fixes.
+# Query-only bias, volume guards and camera epochs are implemented in that NRO.
+# Fresh occluded results need two confirmations; visible results apply immediately.
+# Emulator-only eager guest views remain disabled. No diagnostic capture is requested.
+
+# Renderer and console paths
+sa2_renderer = "renut"
+renut_gpu_backend = "deko3d"
+license_mask = 0xFFFFFFFF
+game_data_root = "/switch/me2-deko/game"
+# TU2 build (2026-11-03): the game folder holds the game + Title Update 2 (default.xexp, update/); update: is its
+# update/ folder (game_ru adds the Russian ones).
+update_game_dir = "update"
+# Asynchronous read-ahead of sequential streaming reads ("[io] readahead:" line every 30 s).
+sa2_io_readahead = true
+# Read-ahead tuning (2026-11-03, after the first console run: 75 % of the prefetched bytes went unread with 1-4 MB
+# blocks, 2 ahead): 256 KB-1 MB blocks, 1 ahead, a file is prefetched after 3 sequential reads in a row, and a file
+# whose 2 prefetched blocks in a row go unread is left alone until it reads 5 in a row.
+sa2_io_readahead_kb = 256
+sa2_io_readahead_max_kb = 1024
+sa2_io_readahead_ahead = 1
+sa2_io_readahead_start = 3
+sa2_io_readahead_backoff = 2
+# Gyro aiming (from masseffect-cinnamon): 0 off, 1 while ZL is held, 2 always. Options -> Controller has rows
+# for it; the choices made there are saved in me2/me2_gyro.cfg and win over this.
+input_gyro = 1
+# Both gyro axes inverted by default (user, 2026-11-03); the Options rows can change it.
+input_gyro_invert_x = true
+input_gyro_invert_y = true
+me2_gyro_menu_text = "Гироприцеливание|Прицеливание движением консоли или контроллера: только при зажатой ZL или всё время.|Выкл.|При прицеливании (ZL)|Всегда|Чувствительность гироскопа|Скорость поворота камеры при движении консоли или контроллера (в игре также L+R+X / L+R+Y).|Инверсия гироскопа по горизонтали|Меняет местами лево и право при гироприцеливании.|Инверсия гироскопа по вертикали|Меняет местами верх и низ при гироприцеливании."
+me2_subtitle_menu_text = "Размер субтитров|Увеличивает субтитры. Действует со следующей реплики."
+# Russian edition (Russian text, English voices): its five files that differ from the English edition (default.xex,
+# Unreap.xex, BioGame/CookedXenon/BIOGame_RUS.tlk, Engine.xxx, SFXGame.xxx; 27 MB) laid over the English game data
+# (game_overlay_root). The game then picks Russian from its own default.xex. Remove this line for English.
+game_overlay_root = "/switch/me2-deko/game_ru"
+user_data_root = "/switch/me2-deko/me2"
+asset_pack_build = false
+switch_guest_views_eager = false
+
+# Fidelity graphics: original scene 480p handheld / 720p docked; native HUD 720p / 1080p
+sa2_render_height_handheld = 540   # fidelity profile (2026-11-02, user): 960x540 + FXAA + FSR 1 EASU -> 1280x720 (needs the 11-02 build: deko3d scale code 4 = 3/4). Estimated GPU ~19 ms in heavy scenes (480p: 16 ms, native 720p: 25.8 ms)
+sa2_render_height_docked = 720
+me2_renut_ui_height_handheld = 720
+me2_renut_ui_height_docked = 1080
+me2_renut_no_game_msaa = true
+banjo_deko3d_alpha_spec = false
+me2_renut_ui_tonemap_low = true
+# 2026-11-01 (diag_1119, performance at stock clocks: run 23 at CPU 1020 / GPU 460.8 MHz was GPU-bound, 25 ms of
+# GPU a heavy frame against 18.5 of the render thread): MaxAnisotropy 8 -> 4 (texture bandwidth), Distortion off (the
+# refraction pass: heat haze, biotic warps), ShadowTexelsPerPixel 1.5 -> 1.0 (smaller dynamic shadow maps),
+# DetailMode 2 -> 1 (fewer detail meshes and effects), ParticleLODBias 0 -> 1 (cheaper particles in fights),
+# DynamicDecals off (no bullet / scorch decals), m_fMaxVFXBudget 75 -> 60. Character LODs, character shadows and the
+# resolution are unchanged.
+# fidelity profile: the engine settings below (diag_1119's cuts) are back to the earlier fuller ones: MaxAnisotropy 8,
+# Distortion on, ShadowTexelsPerPixel 1.5, DetailMode 2, ParticleLODBias 0, DynamicDecals on, m_fMaxVFXBudget 75.
+me2_ini_override = "SystemSettings:MaxShadowResolution=512|SystemSettings:MinShadowResolution=64|Engine.Engine:MaxShadowResolution=432|Engine.Engine:TimeBetweenPurgingPendingKillObjects=60|SFXGame.BioWorldInfo:m_fMaxVFXBudget=75.0|SFXGame.BioArtPlaceable:m_fCorpseCleanupFirstAttemptTime=2.0|SFXGame.BioArtPlaceable:m_fMaxCorpseCleanupScreenSizeThreshold=0.30|WwiseAudioSettings:UpdateObsOccTime=0.3|WwiseAudioSettings:UpdateEnvAudioTime=0.2|WwiseAudioSettings:ObstructionOcclusionRadius=5000|WwiseAudioSettings:StreamPriorityBoost=100|SystemSettings:DetailMode=2|SystemSettings:DynamicDecals=True|SystemSettings:Distortion=True|SystemSettings:ShadowTexelsPerPixel=1.5|SystemSettings:SkeletalMeshLODBias=0|SystemSettings:ParticleLODBias=0|SystemSettings:MotionBlur=False|SystemSettings:LightEnvironmentShadows=True|SystemSettings:MaxAnisotropy=8"
+
+# Input: Switch A/B layout, rumble and menu stick release
+me2_shared_input = true
+input_xbox_layout = true
+input_p1_a = "A"
+input_p1_b = "B"
+input_p2_a = "A"
+input_p2_b = "B"
+input_rumble = true
+me2_gui_axis_release = true
+
+# Button positions: current tested offsets
+me2_diagram_y_raise = 1.0
+me2_diagram_buttons_raise = 2.0
+me2_diagram_switch_y_right = 2.0
+me2_pause_button_b_raise = 1.0
+me2_hud_button_a_raise = 2.0
+me2_hud_button_a_right = 2
+
+# Wall and eyes: color bias stays zero; only visibility tests receive the new margin
+mgr_renut_color_depth_bias = 0
+me2_renut_occlusion_depth_bias = 16384
+me2_renut_occlusion_depth_bias_clamp = 0.0002
+
+# GPU occlusion and latent Umbra: enabled, depth prepass retained
+me2_occlusion_queries = true
+me2_occlusion_umbra_latent = true
+me2_occlusion_umbra_async = false
+me2_occlusion_umbra_skip = false
+me2_occlusion_umbra_defer = false
+me2_guest_skip_prepass = false
+me2_prepass_small_factor = 10
+# 2026-11-01: factor 10 won run 14's A/B against 30 (frames over 34 ms 418 -> 376 per 1k, over 67 ms 65 -> 32 per 10k,
+# GPU unchanged).
+me2_prepass_small_factor_ab_s = 0
+# 2026-11-01 A/B: UE3's per-light passes leave out small / distant objects (radius x 25 < distance: a 1 m prop beyond
+# ~12 m, a character beyond ~25 m); on and off in turn every 60 s ("[light-cull]" lines say which). Run 15 showed the
+# dynamic objects alone are only ~3 a frame; this build also skips small / distant STATIC meshes in the light passes
+# (most of the ~280-450 additive draws a frame). Such objects get no light from dynamic lights (muzzle flashes,
+# fires, lamps); their base pass, lightmaps and shadows are unchanged.
+# 2026-11-01 run 16: +6.6 % fps (+9.5 % in heavy scenes); now the build's default, no A/B.
+me2_light_small_factor = 25   # fidelity profile: 25 (performance: 20)
+# 2026-11-01 diagnostics: every draw of UE3's render thread counted by its UE3 caller and kind (depth only / opaque /
+# additive = per-light passes / other blending, +z = writes depth); "[draw-callers]" every 10 s. Cheap.
+me2_diag_draw_callers = false   # diag_1119: off (a stack walk on every draw)
+# 2026-11-01 A/B: UE3's material parameter lookups (GetVectorValue / GetScalarValue / GetTextureValue, ~4 % of the
+# render thread) answered from a per-frame cache; on and off in turn every 45 s ("[material-cache]" lines). The first
+# 4,096 hits and then 1 in 256 are checked against the original; any difference turns it off and logs DIFFERENCE.
+# 2026-11-01 run 20 (overclocked, both caches alive through the render thread changes): no measurable gain (render
+# thread 9.8 vs 9.6 us a draw), and the parameter cache met 20 materials whose values change within a frame (time-driven
+# and per-draw overrides). Both off.
+me2_material_cache = false
+me2_material_params = false
+# 2026-11-01: black screens while traversing Omega / the Normandy (UE3 blocking on level streaming). Every wait of
+# 0.5 s or more gets a "[stream-wait]" line (length, SD reads and MB/s, LZX, garbage collection, files opened); every
+# held image a "[hold]" line (me2_hold_image: the last picture stays on screen instead of the black frames).
+me2_occlusion_umbra_latent_key = 3
+me2_occlusion_umbra_latent_frames = 10
+me2_occlusion_umbra_latent_rot = 0.5
+me2_occlusion_umbra_latent_move = 500.0
+me2_occlusion_umbra_latent_still_frames = 0
+me2_occlusion_umbra_latent_confirm = 2
+# 2026-11-01: Umbra test boxes cost ~15 us of the UE3 render thread each (~95 a frame, up to ~200). A node last
+# counted VISIBLE skips its re-test box for up to 8 frames (its read answers that visible count; occluded nodes are
+# always re-tested, so nothing appears late). Was 2 (skipped only ~20 boxes a second). "[occlusion] Umbra retest" lines.
+me2_occlusion_umbra_retest_frames = 8
+me2_occlusion_umbra_retest_occluded = 2   # 2026-11-03 console A/B (Kasumi party, standing): +2-4 % fps, half the Umbra tests skipped, draws -11 %; a node found occluded is not re-tested for 2 frames while the camera is still
+me2_occlusion_umbra_retest_occluded_ab_s = 0
+me2_occlusion_carry = true
+
+# CPU occlusion remains disabled (mode 0); preserve base fallback settings
+me2_occlusion_umbra_cpu = 0
+me2_occlusion_cpu_unseen = false
+me2_occlusion_cpu_capture = 1
+me2_occlusion_cpu_unseen_min = 0.5
+me2_occlusion_cpu_grid = 1
+me2_occlusion_cpu_hold = 0
+me2_occlusion_cpu_debounce = 0
+me2_occlusion_cpu_oldview = true
+
+# Rendering and guest optimizations: unchanged from the fidelity base
+banjo_renut_store_cards = true
+me2_renut_repeat_draws = true
+me2_renut_delta_prefetch = false
+me2_renut_sparse_full_frames = 64
+me2_hot_stream_distance = true
+kernel_critsec_spin = 1024
+
+# Audio and scheduling: original console settings
+switch_guest_thread_priority = "82E22A90:3A,82FE7F48:39"
+switch_audio_guest_entries = "82E22A90,82FE7F48"
+switch_audio_core_mask = 0x6
+# 2026-11-01: only the host XMA Decoder thread on core 3 (it decodes ahead in the background; Wwise's real-time mixing
+# stays on cores 1-2, where core 3 starved it on 10-26). "[cores] XMA Decoder on cores 0x8" in me2.log when applied.
+# 0 = with the other audio threads (A/B: compare "[audio] dropout" lines per hour).
+switch_xma_core_mask = 0x8
+# 2026-11-01 (run 9: the asset pack's reads through the RAM range cache, 43 % hits, full at 64 MB): 128 MB.
+sa2_io_ranges_mb = 128
+# 2026-11-01 diagnostics: every wait of UE3's render thread (827CBEA8) and game thread (82865C98) is timed by guest
+# call site; each thread logs "[waits]" every 10 s with its top 10 sites. Cheap (only these threads, only at waits).
+diag_wait_sites = ""   # profile: off (diagnostic)
+# 2026-11-01: UE3's thread pool (827CB6D0, 8 threads) also runs the garbage collector's 4 parallel tasks; with all 8
+# preferring core 3 (which the system shares) the game thread waited ~55-65 % of every collection. Cores 2-3, no
+# preferred core (A/B: the previous value was "83055738:C:3,827CB6D0:C:3").
+switch_guest_thread_cores = "83055738:C:3,827CB6D0:C"
+banjo_background_compile_core = 3
+audio_xma_flush_reset = true
+
+# Basic async logging; CPU stacks, GPU profiling, dumps and diagnostic traces disabled
+log_file = "/switch/me2-deko/me2.log"
+log_level = "info"
+log_async = true
+log_flush_interval = 2
+ui_dev_overlays = false
+switch_profile_report = true
+# 2026-11-02 (user: smaller logs): the 10 s diagnostic reports stay out of me2.log (was ~2.2 MB per 20 min);
+# kept: the frame-rate report ("[renut] 10.", "[renut] game thread"), audio dropouts, image holds, saves,
+# start-up lines, every warning and error. Empty = everything (diagnostic runs).
+log_quiet_prefixes = "![io] readahead,![renut] 10.,![renut] game thread,[renut],[hot],[occlusion],[occlusion-camera],[io],[xma],[display],[me2-present],[latency],[tex-stream],[light-cull],[crowd],[prepass],[resolve-pool],[lzx],[sparse],[prio],[NtCreateFile]"
+# rex_profile.log (clocks, temperatures, CPU per thread): one report a minute instead of every 10 s (was ~0.9 MB)
+switch_profile_report_s = 60
+# 2026-11-01: off for this run (its 1 ms sampling of 5 threads added load and spikes in run 5)
+# 2026-11-01: stack sampling off for the prepass A/B below (clean frame times)
+switch_profile_stacks = false   # profile: off (lowers fps a little); diag_1119: on (garbage collection profile, "during the garbage collections"); 2026-10-31: stack samples for the unexplained spikes (rex_profile.log "during the hitches"); lowers fps a little
+me2_input_axis_trace = false
+renut_gpu_profile = 0.0   # profile: off (GPU timings in the log)
+banjo_renut_diag_gpu_shaders = false
+input_rumble_trace = false
+input_switch_diagnostic_shortcuts = false
+me2_occlusion_umbra_wall_trace = false
+me2_occlusion_umbra_flip_trace = false
+me2_occlusion_umbra_latent_dump = false
+me2_occlusion_umbra_latent_key_stats = false
+me2_occlusion_umbra_defer_trace = false
+me2_occlusion_cpu_diag = false
+me2_occlusion_diag_cmds = false
+me2_occlusion_view_dump = 0
+mgr_renut_diag_color_depth_bias = 0
+mgr_renut_diag_raster_override = 0
+banjo_renut_diag_draw_log_s = 0
+banjo_renut_diag_stream_dump_vs = ""
+banjo_deko3d_variant_log = false
+me2_diag_prepass_stacks_s = 0
+me2_diag_icon_dump = ""
+me2_selection_use_trace = false   # 2026-11-03: OFF again - with it the Kasumi loyalty mission tank (fuel canisters) showed a red square and could not be used (softlock)
+me2_selection_trace = false
+me2_diag_cerberus_natives = false
+me2_diag_cerberus_trace = false
+sa2_cpu_verify = false
+sa2_renut_snapshot_deltas_verify = false
+sa2_renut_chain_reuse_verify = false
+banjo_deko3d_push_constants_verify = false
+banjo_renut_store_cards_verify = false
+banjo_deko3d_txq_verify = false
+banjo_renut_diag_resolve_trace = false
+
+# --- 2026-10-31 diagnostic run ---------------------------------------------------------------------------------------
+# switch_profile_report = true above: per-thread CPU and the real clocks every 10 s (logs/rex/rex_profile.log).
+# renut_gpu_profile = 10.0 above: the GPU's time per frame by kind of work every 10 s (per-shader split stays off).
+# Occlusion A/B in one run: GetData waits 30 ms (current) / 2 ms / never, 60 s each, in turn. A timed-out wait answers
+# 'visible' (an extra draw); nothing disappears in any of the three.
+# 2026-11-01: the A/B is done (runs 3 and 5: no gain from shorter waits); the default 30 ms wait only.
+# me2_occlusion_wait_cycle = "30000,2000,0"
+# me2_occlusion_wait_cycle_s = 60
+# UE3 garbage collection timed ([gc] line per run) and frames of 70 ms or more explained ([spike] lines), plus a 10 s
+# frame-time histogram ([frames]).
+me2_diag_gc = false   # profile: off (a log line per garbage collection; the GC timing below still works)
+me2_diag_spike_ms = 0   # profile: off
+
+# --- 2026-10-31 second build (12:57): the three changes from the log analysis, on for this run --------------------------
+# Decoded audio of repeated sounds reused (bit-identical PCM; "[xma] pcm cache" line every 10 s shows the hit rate).
+# If you hear any audio difference, set this to 0 and tell me.
+audio_xma_pcm_cache_kb = 8192
+audio_xma_pcm_cache_frames = 128
+# GPU memory headroom counts the free space inside the image heap's chunks: stops the endless cold-texture eviction
+# after ~20 minutes ("Textures: ... under the 192 MB reserve" lines should stop repeating).
+me2_renut_budget_chunk_free = true
+me2_renut_budget_arena_floor_mb = 128
+# Measurement only: do the XDK's dirty tags cover what the device-delta compare finds ("[delta-tags]" every 60 s).
+# 2026-11-01: off (the measurement was done on 10-31; its counting loop was ~25 % of CaptureDelta on the render thread)
+me2_diag_delta_tags = false
+
+# --- 2026-10-31 third build: garbage collection --------------------------------------------------------------------------
+# Run 3: 152 collections in 43 min (every ~12-17 s), 70 ms median, the largest single cause of frames over 70 ms.
+# At most one collection the world's tick asks for (timer, script-forced, full-purge request) every 30 s; an earlier
+# one waits for the end of the gap (not dropped). Map loads and travel always collect at once. 0 = the game's own rate.
+me2_gc_min_gap_s = 120
+# 2026-11-01 build: level-streaming collections (sub_8259ABD0, ~70 % of all, in bursts) at most one per 10 s; a held-back
+# one runs at the end of the gap (a full purge stays full). Only while the guest has 48 MB+ of physical memory free.
+# "[gc]" lines now show the free physical memory before -> after each collection. 0 = off (A/B).
+me2_gc_stream_gap_s = 30
+me2_gc_stream_min_free_mb = 48
+# 2026-11-01 run 21 (overclocked): 36 collections in 14 min at 45-55 ms each, a visible hitch every 10-60 s, and the
+# gameplay ones freed nothing. Now both kinds above wait at least 120 s after the previous collection, and past that
+# for a quiet frame (a menu, the pause screen, a loading screen) where the hitch does not show; at the latest 300 s
+# after the previous one, and at once whenever free memory drops below 48 MB. Map loads / travel still collect at
+# once. The 60 s "[gc]" summary counts how the held ones went (quiet frame / maximum / low memory).
+me2_gc_max_gap_s = 300
+me2_gc_quiet_draws = 40
+# 2026-11-01 run 22: in 5 minutes of play no quiet frame came, and the held collection then ran as a full purge: one
+# 345 ms hitch. Streaming collections (their area unloads wait for one) now go at a quiet frame from 30 s, at the latest
+# 90 s after the previous collection; one let go by a maximum during play is a normal collection (its objects destroyed
+# over the next frames), never a full purge (those wait for a quiet frame, a load, or low memory).
+me2_gc_stream_max_gap_s = 90
+# 2026-11-01 diag_1121 (runs 24-25 stack samples: 41-71 % of every collection is UE3's game thread waiting for the
+# collector's 4 marking tasks on the thread pool; diag_1120's permanent move of the pool to cores 0, 2, 3 at a lower
+# priority made that worse, 56-71 %): only during each collection, the pool threads may also use core 0 (UE3's render
+# thread leaves it 82-88 % idle then) and run one step above the game threads (58 = 0x3A); each goes back to its own
+# priority and cores at its first wait after the collection. 0 / -1 = off. Compare the "[gc]" times with run 24 (stock:
+# 82-129 ms) and run 22 (overclocked: about 50 ms).
+me2_gc_pool_boost_mask = 0xD
+me2_gc_pool_boost_prio = 58
+me2_diag_stream_wait = false   # profile: off ("[stream-wait]" lines)
+# 2026-11-01 build: for 3 frames after a camera cut (cutscenes), UE3's own "hidden" occlusion answers count as visible,
+# so shadows and objects hidden from the previous camera do not pop in late. Default 3; 0 = off (A/B).
+me2_occlusion_cut_visible_frames = 3
+# 2026-11-01 (run 8 A/B: EASU 3.1 ms vs bilinear 0.2 ms of GPU a frame; the difference barely noticeable on the
+# console): the final pass upscales bilinearly. 0 = FSR 1 EASU again.
+# 2026-11-02 (user): FSR 1 EASU for the upscale to the HUD's resolution (docked: 720p scene -> 1080p; handheld
+# is native 720p in this profile, so nothing is upscaled there). 1 = bilinear.
+me2_renut_ui_upscale = 0
+me2_renut_ui_upscale_ab_s = 0
+
+# --- 2026-10-31 fourth build (14:08): native LZX decompression ------------------------------------------------------------
+# Texture / package blocks compressed with LZX are decoded by libmspack natively instead of the recompiled XDK decoder.
+# Self-checked: the first 256 blocks (then 1 in 4096) also run the original and are compared ("[hot] sub_8279B210: guard
+# OK" / "DIFFERENCE" in me2.log). For this run it alternates native / original every 60 s, so the "[lzx]" lines give
+# both speeds from the same session (and "[spike]" lines show LZX time per long frame).
+me2_hot_lzx = true
+# 2026-11-01: run 5 A/B: native 48 MB/s vs original 33 MB/s (1,655 vs 2,338 us a block): native only.
+me2_hot_lzx_ab_s = 0
+
+# --- 2026-10-31 asset pack ------------------------------------------------------------------------------------------------
+# game.nxpack + game.nxidx next to the game folder (/switch/me2-deko/game.nxpack, built on the PC, 9.4 GB: exFAT card):
+# every game file read from one open file, no per-file SD opens (run 3: 855 opens, 21 ms each). me2.log then says
+# "[pack] mounted ..."; the "[io]" lines measure the opens and reads as before. false = the game folder as before.
+asset_pack = true
+
+# --- 2026-10-31 audio occlusion radius ------------------------------------------------------------------------------------
+# me2_ini_override above now also sets WwiseAudioSettings:ObstructionOcclusionRadius=5000 (the game's 10000 = 100 m):
+# sounds farther than 50 m skip the line-of-sight (muffling) checks on the game thread. me2.log shows it as
+# "[ini] [WwiseAudioSettings] ObstructionOcclusionRadius: ... -> 5000". Remove that item to go back.
+
+# --- 2026-10-31 build 16:46: progressive texture uploads -----------------------------------------------------------------
+# A burst of new streamed textures was converted and uploaded inside one frame (run 3: 33 spikes, median 145 ms). Now a
+# large new texture gets its small mip levels at once and its large ones over the next frames, at most 4 MB of uploads
+# a frame; until then it is drawn from the levels it has (a little blurrier for a few frames). Small textures, content
+# changes and render targets are uploaded whole as before. "[tex-stream]" lines every 300 frames report the upload work
+# (also when this is 0), "[spike]" lines the texture upload ms per long frame. 0 = whole textures at once (the old way).
+me2_renut_upload_budget_kb = 4096
+# 2026-11-01: run 5 still uploaded 72 % of new texture bytes whole (textures under 256 KB); worst frame 123 ms = 226
+# small textures at once. Mipmapped textures from 64 KB now stream too (their smallest levels first).
+me2_renut_upload_stream_min_kb = 64
+
+# --- 2026-10-31 build 20:50: focused stack sampling + GC callers -----------------------------------------------------------
+# switch_profile_stacks (on above) samples only the 5 busiest threads of the last 10 s, each every 1 ms (run 4 had ~4
+# samples a thread per long frame); thread names are no longer cut to 15 characters ("X827BD330 (F80000CC)").
+# "[gc]" lines now also say which engine function called CollectGarbage ("called from sub_..."), the 60 s summary
+# counts them ("by direct caller").
+switch_profile_stacks_top = 2
+
+# 2026-10-31: lens flares back on. They were left out on 10-25 while every occlusion query was answered "visible" (flares
+# shone through walls and heads); since 10-27 UE3 reads real GPU occlusion results (one frame late), which scale and
+# hide the flares. Candidate for the galaxy map relay glow that is lit only when the ship faces the relay.
+me2_renut_lens_flares = true
+
+# --- Russian edition: this port's own texts ---------------------------------------------------------------------------
+# Options: the controller entry (the game's own is "Контроллер XBOX 360").
+me2_options_controller_label = "Контроллер"
+# Main menu, Cerberus: "" = the game's own Russian "connected" text.
+me2_cerberus_connected_text = ""
+# The Cerberus terminal's news item. Non-ASCII text goes into the script as a wide string constant (new in this
+# build); if the main menu misbehaves with these, replace them with plain ASCII text.
+me2_cerberus_news = "Добро пожаловать в «Lazarus»"
+me2_cerberus_news_text = "Неофициальный проект рекомпиляции Mass Effect 2"
+# Title screen: "Нажмите кнопку START" -> "Нажмите кнопку +" (talk-table string 168205), and "Кнопка Старт" ->
+# "Кнопка +" (174829); the English defaults are "Press +" and "+ Button". Format: "ID=text|ID=text".
+me2_tlk_overrides = "168205=Нажмите кнопку +|174829=Кнопка +"
+
+# ---- 2026-11-02 draw-count cuts (code defaults shown; values here override them) ----
+# Umbra levels: primitives small for their distance are answered "skip_instance" by Umbra's command 50 and drawn in no
+# pass (prepass, base, lights). Static meshes: me2_cull_small_factor (radius x factor < distance x LOD factor, radius
+# up to me2_cull_small_max_radius, never closer than me2_cull_small_min_distance); characters / movable props / effects:
+# me2_cull_dynamic_*. "[cull] Umbra" lines every 10 s count them.
+me2_cull_small_factor = 80   # 2026-11-02: emulator-tested 60/60/15, no visible pop-in except distant lights (accepted)
+me2_cull_dynamic_factor = 80   # 2026-11-02: emulator-tested 60/60/15, no visible pop-in except distant lights (accepted)
+# me2_cull_dynamic_max_radius = 512
+# me2_cull_dynamic_min_distance = 2000
+# Whole point / spot lights small for their distance are not drawn ("[light-cull] whole lights" lines).
+me2_light_whole_factor = 20   # 2026-11-02: emulator-tested 60/60/15, no visible pop-in except distant lights (accepted)
+# Per-object shadows below this resolution are not rendered (game default 32): distant characters lose their shadow.
+# (set in me2_ini_override above: SystemSettings:MinShadowResolution=64)
+
+# ME1 character import (2026-11-03): New Game -> Import ME1 Character lists the ME1 saves of this folder
+# (sdmc:/switch/me2-deko/ME1: Xbox 360 Char_* saves or PC .MassEffectSave files, converted on the fly).
+me2_menu_hide_import_me1 = false
+me2_me1_import_dir = "/switch/me2-deko/ME1"

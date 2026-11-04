@@ -1,0 +1,48 @@
+name: Bug report
+description: Something looks wrong, runs badly or crashes
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Never attach game files, keys or anything made from the game (shaders, generated code, NROs).
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where does it happen
+      options: [Switch (console), Ryujinx, PC build]
+    validations: {required: true}
+  - type: input
+    id: console
+    attributes:
+      label: Console, firmware and clocks
+      placeholder: "Switch OLED, firmware 19.0.1, Atmosphere 1.8.0, stock clocks / CPU 1785 GPU 998"
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      options: [Handheld, Docked, Not applicable]
+  - type: input
+    id: build
+    attributes:
+      label: NRO sha256 (first 8 characters) and profile
+      placeholder: "550ce67c, en/performance"
+    validations: {required: true}
+  - type: input
+    id: language
+    attributes:
+      label: Game language
+      placeholder: "English (TU2 0.0.2.1)"
+    validations: {required: true}
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and where in the game
+      description: The mission or place, and the steps that lead to it.
+    validations: {required: true}
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: me2.log from sdmc:/switch/me2-deko/ (for a crash in Ryujinx, also its Logs/Ryujinx_*.log).
+      render: text

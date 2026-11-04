@@ -1,0 +1,4 @@
+# The C runtime functions sa2-nx found by hand (app/src/cpu/sa2_hot_guest.cpp), for tools/crt_signatures.py make.
+827FF400 memcpy   CRT memcpy (forward copy; the native uses memmove semantics for overlap as the original loop does)
+827FECF8 memset   CRT memset
+827FE708 memmove  CRT memmove

@@ -1,0 +1,94 @@
+# Lazarus never contains anything made from the game: its files, the code generated from default.xex, the shaders
+# converted from it, or the binaries built from that code. Everyone makes them from their own copy (docs/building.md).
+
+# --- Game files and what is made from them -------------------------------------
+/assets/
+/app/generated/
+*.xex
+*.xexp
+*.iso
+*.xiso
+*.upk
+*.xxx
+*.tfc
+*.tlk
+*.bin
+*.ucode
+*.spv
+*.dksh
+*.mesp
+*.mesp.idx
+*.nxpack
+*.nxidx
+*.xbsav
+*.pcsav
+*.MassEffectSave
+
+# --- Keys: never commit these ----------------------------------------------------
+*.keys
+keys.dat
+keys.txt
+
+# --- Build output --------------------------------------------------------------
+/out/
+/build/
+/sdk/out/
+/app/out/
+/shaders/wasm/out/
+*.nro
+*.nacp
+*.nsp
+*.elf
+*.o
+*.obj
+*.a
+*.gcda
+*.stream
+
+# --- SDK third-party sources: tools/fetch_thirdparty.py fetches them; only the files this port changed are tracked --
+/sdk/thirdparty/*
+!/sdk/thirdparty/CMakeLists.txt
+!/sdk/thirdparty/FFmpeg
+/sdk/thirdparty/FFmpeg/*
+!/sdk/thirdparty/FFmpeg/config_switch_aarch64.h
+!/sdk/thirdparty/FFmpeg/config_masseffect_wmv3.h
+!/sdk/thirdparty/FFmpeg/libavcodec
+/sdk/thirdparty/FFmpeg/libavcodec/*
+!/sdk/thirdparty/FFmpeg/libavcodec/mdct_template.c
+!/sdk/thirdparty/FFmpeg/libavcodec/fft_template.c
+!/sdk/thirdparty/FFmpeg/libavcodec/decode.c
+!/sdk/thirdparty/FFmpeg/libavcodec/wmaprodec.c
+!/sdk/thirdparty/ffmpeg-overlay
+/sdk/thirdparty/ffmpeg-overlay/*
+!/sdk/thirdparty/ffmpeg-overlay/codec_list.c
+
+# --- Unmodified upstream libraries inside app/thirdparty: tools/fetch_app_thirdparty.py fetches them ------------
+# (the two files that differ from upstream stay tracked)
+/app/thirdparty/plume/contrib/volk/*
+!/app/thirdparty/plume/contrib/volk/volk.c
+/app/thirdparty/plume/contrib/Vulkan-Headers/
+/app/thirdparty/plume/contrib/VulkanMemoryAllocator/
+/app/thirdparty/reblue-XenosRecomp/thirdparty/*
+!/app/thirdparty/reblue-XenosRecomp/thirdparty/fmt
+/app/thirdparty/reblue-XenosRecomp/thirdparty/fmt/*
+!/app/thirdparty/reblue-XenosRecomp/thirdparty/fmt/include
+/app/thirdparty/reblue-XenosRecomp/thirdparty/fmt/include/*
+!/app/thirdparty/reblue-XenosRecomp/thirdparty/fmt/include/fmt
+/app/thirdparty/reblue-XenosRecomp/thirdparty/fmt/include/fmt/*
+!/app/thirdparty/reblue-XenosRecomp/thirdparty/fmt/include/fmt/format.h
+
+# --- Logs, dumps and run data ----------------------------------------------------
+*.log
+*.dmp
+*.err
+/cache/
+/logs/
+
+# --- Tools and editors -------------------------------------------------------------
+__pycache__/
+*.pyc
+.vs/
+.vscode/
+.claude/
+.DS_Store
+/tools/ext/

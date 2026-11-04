@@ -1,0 +1,17 @@
+{
+  "source": "Ryujinx Citadel trace, 2026-10-29 19:27:21-19:27:24 UTC, centre (-18320, 240, 5304), stationary camera (-2519, 501, -59)",
+  "scope": "Observed visibility transitions, not a complete GPU issue stream",
+  "transitions": [
+    {"frame": 5403, "age": 1, "pixels": 145404},
+    {"frame": 5419, "age": 8, "pixels": 0},
+    {"frame": 5421, "age": 1, "pixels": 145140},
+    {"frame": 5437, "age": 8, "pixels": 0},
+    {"frame": 5439, "age": 1, "pixels": 144540},
+    {"frame": 5455, "age": 8, "pixels": 0},
+    {"frame": 5457, "age": 1, "pixels": 144720},
+    {"frame": 5473, "age": 8, "pixels": 0},
+    {"frame": 5475, "age": 1, "pixels": 142140},
+    {"frame": 5491, "age": 8, "pixels": 0},
+    {"frame": 5493, "age": 1, "pixels": 141780}
+  ]
+}

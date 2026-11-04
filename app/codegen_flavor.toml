@@ -1,0 +1,448 @@
+# optimised codegen: written by tools\codegen.ps1 -Flavor optimised from perf_overrides.toml.
+# ME2 (2026-10-26): rebuilt for Mass Effect 2. The options below are game-independent; the per-function marks of
+# the MGR/SA2 file this came from (12k non_argument_as_local_keep addresses, [functions] share_registers) were MGR's
+# addresses and are gone (old file: perf_overrides.mgr.toml).
+# ME2 audit, code generated with these options and no marks (out/codegen_auditA.log):
+#   - tools/read_before_write.py: 417 reports, all false: 389 are `mfcr` expansions (the whole CR copied to extract
+#     one cr6 bit after fcmpu), one `subfe`-style carry trick (sub_82C596C0), 27 infeasible paths in functions with a
+#     full prologue (the D3DX HLSL compiler, 0x82ECFD10-0x82FBFDF0): a real entry never reads its caller's r14-r31.
+#     So no share_registers marks.
+#   - no guest setjmp/longjmp in ME2 (no function saves r14-r31/f14-f31 to a buffer; no C++ throw: RtlRaiseException
+#     is only reached through SetThreadName and an FP-exception helper), so the r14-r31 locals are safe.
+#   - non_argument_as_local (2026-10-26): set, with every function non_argument_audit.py reported in the keep list.
+#
+# --- The option notes below are from the MGR/SA2 file (masseffect-nx / sasrt-nx measurements). ---
+# Code generation options for speed: the "optimised codegen" flavour (tools\codegen.ps1 -Flavor optimised copies this
+# file to codegen_flavor.toml, which sa2_manifest.toml includes; -Flavor classic writes an empty one). Root keys: they
+# must stay outside any table. Build-time, so they come as an A/B NRO pair (docs/enhancements.md, "Build-time").
+#
+# The options only change how the C++ is written, so the compiler can keep guest state in host registers and drop dead
+# stores; the guest-visible result is the same. The set is the part of masseffect-nx's measured perf_overrides.toml
+# that needs no per-function marks in a game with SA2's setjmp/longjmp (the libjpeg error path):
+#   - cr0-cr7, ctr, xer and the lwarx reservation as C++ locals (UnleashedRecomp-NX and MarathonRecomp-NX ship the same);
+#   - skip_msr: no mfmsr/mtmsrd fences, ctx.msr stores or global lock around the guest atomic sequences (a stwcx. is
+#     already a compare-and-swap);
+#   - dform_disp_split: D-form loads/stores as base + zext(reg) + disp (differs only when reg + disp crosses 2^32, a
+#     guest fault either way);
+#   - fctiwz_inline: fctiwz as fcvtzs + NaN select.
+# Masseffect-nx measured skip_msr + reserved_as_local at -3.4 % total CPU and the "diet" (with elide_lr_stores, not used
+# here: SA2's hooks have not been audited for ctx.lr) at -10 % main thread.
+# Round 7 (2026-10-07): non_volatile_as_local and elide_lr_stores too (the other ports' measured "diet": SASRT went from
+# 669,839 ctx.r14-r31 uses to 1,586, 29,172 save/restore helper calls to 0 and 158,515 ctx.lr stores to 0;
+# masseffect-nx -10 % main thread). r14-r31, f14-f31 and v14-v31/v64-v127 become C++ locals, so the __savegprlr /
+# __restgprlr helpers (5.9 % of SA2's console main thread in round 4) and the guest-stack traffic for those registers
+# disappear, and `ctx.lr = <return address>` is no longer stored before every call.
+#   - tools\read_before_write.py on the generated code (--noreturn=828018E8, the C++ throw: the code after it is a catch
+#     funclet the discovery merged in): one real case, sub_825466FC (a fragment of sub_82545EE8 reached through a
+#     pointer table; it reads the parent's r31 frame pointer), marked share_registers in overrides.toml (not
+#     here: this file is also included by the stage DLL's module, where a [functions] entry makes a stub). The rest are the tool's
+#     known false alarms (xor rX,rX,rX in sub_82818CD0/sub_82819060, subfe rX,rX,rX in sub_828D7700), the guest setjmp
+#     (sub_82925920, as before) and, in the stage DLL, sub_88014440 (a loop body registered as a function that nothing
+#     calls; its parent runs the loop inline).
+#   - ctx.lr readers audited: only the d3d-trace diagnostic (sa2_d3d_trace, off) and the console profiler's caller
+#     attribution (switch_perf.cpp) read it; with the stores elided they see an older return address. A PIC `bl` to a
+#     local label keeps its store (the generator's rule).
+#   - setjmp/longjmp (the libjpeg error path, corrupt JPEG data only): after a longjmp, ReXGlue restores ctx; the setjmp
+#     caller's r14-r31 locals keep their values from the time of the failing call instead of setjmp's, the same class
+#     of risk as the CR locals above.
+# Round 7 too: fp_moves_modeless (sa2-nx's own generator option). On the A57 every host flush-mode switch is an
+# `msr fpcr` that costs as much as dozens of instructions, and the generator switched for every scalar float move:
+# lfd/stfd forms, stfiwx, fmr, fabs, fnabs and fneg only move bits and now switch nothing; in VMX code (flush on) the
+# lfs/stfs forms convert through rex::ppc::SingleToDoubleAnyMode / DoubleToSingleAnyMode (sdk/include/rex/ppc/
+# diet_ops.h), which give the flush-off result in either mode (denormal inputs and tiny results take a cold path that
+# clears the mode for that one conversion), instead of switching off and on again. Console profile (round 5): the
+# VMX-heavy game thread XThreadF43C2C0 spent 20-26 % of its samples right after an `msr fpcr`, its hottest function
+# 65 %; that function now keeps one conditional switch at its entry.
+# 2026-10-07 (after round 8): non_argument_as_local too: r0, r2, r11, r12, f0 and v32-v63 become C++ locals (MSVC
+# uses r11, r12 and f0 as scratch everywhere: 632,469 ctx.r11 uses, 87,592 ctx.f0, 65,368 ctx.r12, 9,708 ctx.v32-v63
+# before). tools\non_argument_audit.py (code generated without it) lists every value that crosses a call in those
+# registers (docs/enhancements.md, "non_argument_as_local", names the functions; this file does not, because
+# tools\direct_calls.py takes every address it mentions for a hooked function):
+#   - arguments in r12, read on entry: the SDK's __save*/__rest* helpers (their calls are elided; their bodies keep the
+#     registers in ctx), the MSVC EH/SEH funclets (535 in the game, 8 in the stage DLL; share_registers, marked by the
+#     generator from the EH tables: their owners hand r12 over with the other registers around the inline `bl`), the
+#     stack probe (frame size in r12) and the C++ EH dispatch: _CallSettingFrame (r12 = frame, then blrl to the
+#     funclet) and the continuation jumps of both modules (`mr r12,r5; bctr`). These four keep the registers in ctx
+#     (non_argument_as_local_keep below, in that order: SA2's own generator option), and a caller hands its localized
+#     ones over around a call to them and takes back what they leave.
+#   - one value returned in r11, by a __finally funclet that reloads r11 for its owner: the owner's copy-back after the
+#     funclet call takes it (share_registers). Every other read of r0/r11/r12/f0 after a call is a value the callee
+#     never writes (MSVC's interprocedural register allocation: 46 functions keep f0 across a call, 3 keep r12 across
+#     the stack probe), and a C++ local survives the call the same way.
+#   - three audio resamplers read v57-v63 before writing them: the unaligned-load shift registers of a
+#     software-pipelined loop, shifted out before any use (tools\vec_shiftout.py proves no entry byte reaches a store),
+#     so zero-initialized locals give the same results.
+#   - no hook, native or SDK runtime code reads or writes ctx.r0/r2/r11/r12/f0/v32-v63; the localized copies are made
+#     from the generated code and keep the same locals; guest exceptions are never dispatched (RtlUnwind and
+#     __C_specific_handler are stubs).
+#
+# 2026-10-12, sasrt-nx's CPU round (docs/enhancements.md, "The CPU round of 2026-10-12"): fp_compares_modeless (fcfid,
+# fctiwz, fctidz and fsel cannot be changed by the flush mode: no switch; fcmpu / fcmpo / frsp through any-mode helpers
+# while VMX mode is current), fp_mode_lookahead (before a scalar float instruction switches, the generator looks at the
+# next instruction that needs a mode: lfs / stfs / frsp / fcmpu and one or two fadds / fsubs / fmuls / fdivs in front
+# of vector code compute in whatever mode is current, rex::ppc::*AnyMode in sdk/include/rex/ppc/diet_ops.h, each
+# giving the bits the plain expression gives with the mode off: sdk/tests/fp_any_mode_test.cpp). SA2 switches the mode
+# about 1,400 times a frame in play (sasrt-nx: 60,800), most of it in six localized copies, which are made from this
+# code.
+# fp_mode_lookahead_past_branch = false (sa2-nx's addition to the generator): sasrt-nx's rule also gives a conversion
+# its any-mode form when nothing that needs a mode follows before the next branch, in every function with vector float
+# code and in small "mode-free" functions. SA2's float code is mostly scalar, and there that bet loses: with it the
+# PC census (sa2_diag_runtime_census) counted 4.5-8.7 million any-mode conversions a second, each a test of about
+# four instructions, for at most 180 switches saved per frame. Without it the any-mode forms stay where they replace
+# a switch for certain (a vector instruction comes next, or VMX mode is known to be current).
+# rotate_word_narrow (sasrt-nx's third option: rlwinm / rlwnm / rlwimi whose mask does not wrap as a 32-bit rotate and
+# mask; exact, sdk/tests/rotate_word_test.cpp, and SA2's PC build passed lockstep and verify mode with it) is NOT set:
+# the Switch compiler already folds the 64-bit form, and with the narrow one three recompiled files came out 0.07 to
+# 0.12 % larger (GCC turns the 64-bit form of an `srwi` into one `lsr`, the narrow one into `ror` + `and`).
+#
+# Post-codegen steps of the flavour (tools\post_codegen.py): tools\pch_no_volatile.py (guest memory without volatile;
+# masseffect-nx: +15-20 % fps), tools\loop_barriers.py, tools\direct_calls.py (calls between unhooked functions become
+# direct, so GCC can inline them), and sasrt-nx's of 2026-10-12: tools\guest_cas.py, tools\flush_mode_flow.py,
+# tools\vec_byteswap.py and tools\pch_neon_shuffles.py.
+#
+# The second CPU round of 2026-10-12 (docs/enhancements.md; sa2-nx's own additions to the generator):
+# fcti_inline: fctid / fctiw / fctidz through rex::ppc helpers (`fcvtzs`, after `frinti` for the two that round,
+# and a NaN select on the A57) instead of an isnan test, a range compare and simde's scalar conversion each. For
+# fctid and fctiw this also corrects the Switch build: simde's portable conversion rounds halves away from zero, the
+# Xbox 360 and the PC build round in the current mode (sdk/tests/fcti_copy_test.cpp).
+# fp_copy_pairs: a float copied through a register (lfs, then stfs of the same register: structure and matrix
+# copies) needs no flush mode: the store writes the loaded bits (a signalling NaN quieted, as the two conversions
+# did), the register gets its value without touching the mode. The store may follow its load at a distance and one
+# load may feed several stores, as long as nothing else writes the register in between (straight-line code only).
+# Used where VMX mode is known to be current (the plain forms would switch the mode, the any-mode helpers cost a
+# test and a conversion each).
+# fp_copy_only_functions (the same forms in every copy-only function, whatever the mode, so that function has no
+# mode statement at all) is NOT set: SA2's scalar matrix copies are entered from vector code one call in seven, and
+# the PC census counted 5.25 million copy forms a second to save 22,000 mode switches a second (235 tests per
+# switch saved). The cost of one switch on the A57 is the number that would decide it (the profiler's report now
+# measures it, "FPCR on this CPU").
+# dcbt_prefetch (dcbt / dcbtst as the host's prefetch) is NOT set: 217 sites, no measurement on the console yet.
+#
+# The third CPU round of 2026-10-12:
+# div_inline: divw / divwu / divd / divdu (1,934 sites) through rex::ppc helpers. The C expression needs guards
+# against a zero divisor and INT_MIN / -1 (undefined in C) and the compiler keeps them as a branch; AArch64's
+# sdiv / udiv define both cases, so there the helper is the instruction and, for the signed ones, one select.
+# Its post-codegen steps: tools\loop_locals.py (the ctx registers of call-free loops as locals for the length of
+# the loop), vector loads from read-only data as constants (tools\ro_constants.py) and the two- and three-target
+# sites of tools\indirect_calls.py.
+# Its post-codegen steps (tools\post_codegen.py): tools\indirect_calls.py, tools\ro_constants.py,
+# tools\float_loads.py, tools\leaf_locals.py, tools\pch_cold_traps.py and the entry modes of
+# tools\flush_mode_flow.py. tools\frame_traffic.py only marks its statements: its elisions are opt-in and OFF
+# (removing the dead prologue saves tinted SA2's characters: the game reads a stack word it never wrote).
+cr_as_local = true
+ctr_as_local = true
+xer_as_local = true
+reserved_as_local = true
+skip_msr = true
+dform_disp_split = true
+fctiwz_inline = true
+non_volatile_as_local = true
+elide_lr_stores = true
+fp_moves_modeless = true
+fp_compares_modeless = true
+fp_mode_lookahead = true
+fp_mode_lookahead_past_branch = false
+fcti_inline = true
+fp_copy_pairs = true
+div_inline = true
+non_argument_as_local = true
+# ME2 (2026-10-26): the functions tools/non_argument_audit.py (code generated without the option, out/naa_A.txt) lists
+# as taking a value in r0/r2/r11/r12/f0/v32-v63 on entry (ENTRY: stack probe, EH funclets, per-lane vector writes of
+# the Wwise/HLSL-compiler code) or reading one after a call (RET), with the callees those values come from. They keep
+# the registers in ctx and the generator hands them over around each call. Conservative: every reported name.
+non_argument_as_local_keep = [
+    0x82C49318,
+    0x82C581C4,
+    0x82C581EC,
+    0x82C584BC,
+    0x82C584E4,
+    0x82C58D80,
+    0x82C58DA0,
+    0x82C79818,
+    0x82C79A80,
+    0x82C79D50,
+    0x82C7B110,
+    0x82C7B428,
+    0x82C7B818,
+    0x82C7C7C0,
+    0x82C7CA48,
+    0x82C7CD30,
+    0x82C87758,
+    0x82C87830,
+    0x82C87908,
+    0x82C87AB8,
+    0x82C87B88,
+    0x82C87C58,
+    0x82C87DF8,
+    0x82C87ED0,
+    0x82C87FA8,
+    0x82D624A8,
+    0x82D624D4,
+    0x82D625DC,
+    0x82D625FC,
+    0x82D628B0,
+    0x82D628D0,
+    0x82D62D08,
+    0x82D62D28,
+    0x82D62F38,
+    0x82D632E8,
+    0x82D63308,
+    0x82D63618,
+    0x82D63638,
+    0x82D637E8,
+    0x82D63808,
+    0x82D639B0,
+    0x82D639D0,
+    0x82D6506C,
+    0x82D6508C,
+    0x82D66580,
+    0x82D67278,
+    0x82D67DA4,
+    0x82D67DC4,
+    0x82D68240,
+    0x82D68260,
+    0x82D68B84,
+    0x82D6F900,
+    0x82D6F920,
+    0x82D6FA8C,
+    0x82D6FAAC,
+    0x82D70AFC,
+    0x82D70B1C,
+    0x82D70D50,
+    0x82D70D70,
+    0x82D70FAC,
+    0x82D70FCC,
+    0x82D73EF0,
+    0x82D73F1C,
+    0x82D74638,
+    0x82D74658,
+    0x82D75DF4,
+    0x82D75E14,
+    0x82D786D4,
+    0x82D786F4,
+    0x82D789A8,
+    0x82D78A70,
+    0x82D79520,
+    0x82D79540,
+    0x82DDCD00,
+    0x82DDCDD4,
+    0x82DDCE78,
+    0x82DDCF08,
+    0x82DDD030,
+    0x82DDD058,
+    0x82DDD114,
+    0x82DDD5D0,
+    0x82DDD210,
+    0x82DDD35C,
+    0x82DDD434,
+    0x82DDD520,
+    0x82DDD714,
+    0x82DDD73C,
+    0x82DDD928,
+    0x82DDDA4C,
+    0x82DDDAE0,
+    0x82DDDBD8,
+    0x82DDDC70,
+    0x82DDDF50,
+    0x82DDDFD8,
+    0x82DDE0D0,
+    0x82DDE158,
+    0x82DDE35C,
+    0x82DDE3F4,
+    0x82DDE590,
+    0x82DDE680,
+    0x82DDE748,
+    0x82DDE8B0,
+    0x82DDEB38,
+    0x82DDEBDC,
+    0x82DE07F0,
+    0x82DE18C8,
+    0x82DE18F4,
+    0x82DE1920,
+    0x82DE194C,
+    0x82DE1978,
+    0x82DE1AFC,
+    0x82DE1B28,
+    0x82DE1B54,
+    0x82DE1B80,
+    0x82DE1BAC,
+    0x82DE27B0,
+    0x82DE27D8,
+    0x82DE2800,
+    0x82DE2828,
+    0x82DE2DF4,
+    0x82DE2E20,
+    0x82DE2E4C,
+    0x82DE2E78,
+    0x82DE2EA4,
+    0x82DE3508,
+    0x82DE370C,
+    0x82DE3734,
+    0x82DE3760,
+    0x82DE378C,
+    0x82DE37B4,
+    0x82DE3C00,
+    0x82DE3D20,
+    0x82DE3E70,
+    0x82DE8DAC,
+    0x82DE8DD8,
+    0x82DE8E04,
+    0x82DE8E30,
+    0x82DE8E5C,
+    0x82DEB2B8,
+    0x82DEB33C,
+    0x82DEB530,
+    0x82DEB5FC,
+    0x82DEC854,
+    0x82DECA70,
+    0x82DECA98,
+    0x82DECAC4,
+    0x82DECAF0,
+    0x82DECB1C,
+    0x82DECB48,
+    0x82DECB74,
+    0x82DECBA0,
+    0x82DECBCC,
+    0x82DECBF8,
+    0x82DEE348,
+    0x82DEE370,
+    0x82DEE39C,
+    0x82DEE3C8,
+    0x82DEE3F4,
+    0x82DEE420,
+    0x82DEE44C,
+    0x82DEE478,
+    0x82DEE4A4,
+    0x82DEE4D0,
+    0x82DEF470,
+    0x82DEF498,
+    0x82DEF4C0,
+    0x82DEF4E8,
+    0x82DEF510,
+    0x82DEFB68,
+    0x82DEFB90,
+    0x82DEFBB8,
+    0x82DEFBE0,
+    0x82DEFC08,
+    0x82DF0DEC,
+    0x82DF2E48,
+    0x82DF4DCC,
+    0x82DF4DF4,
+    0x82DF65BC,
+    0x82DF849C,
+    0x82DF84C8,
+    0x82DF84F4,
+    0x82DF8520,
+    0x82DF854C,
+    0x82DF8588,
+    0x82DF85B4,
+    0x82DF85E0,
+    0x82DF860C,
+    0x82DF8638,
+    0x82DF8664,
+    0x82DF8690,
+    0x82DF9C30,
+    0x82DF9C5C,
+    0x82DF9C88,
+    0x82DF9CB4,
+    0x82DF9CE0,
+    0x82DF9D1C,
+    0x82DF9D48,
+    0x82DF9D74,
+    0x82DF9DA0,
+    0x82DF9DCC,
+    0x82DF9DF8,
+    0x82DF9E24,
+    0x82DFB9A8,
+    0x82DFB9D0,
+    0x82DFBAA0,
+    0x82DFBAC8,
+    0x82DFCC0C,
+    0x82DFCC38,
+    0x82DFCC64,
+    0x82DFCEA4,
+    0x82DFCED0,
+    0x82DFCEFC,
+    0x82E094E8,
+    0x82E22A90,
+    0x82E38CF8,
+    0x82E46EE8,
+    0x82E478B0,
+    0x82E480F8,
+    0x82E488F8,
+    0x82E48EE8,
+    0x82E494F8,
+    0x82E495D8,
+    0x82E499F8,
+    0x82E49B48,
+    0x82E4A898,
+    0x82E4A9B0,
+    0x82E4ACE8,
+    0x82E4B928,
+    0x82E4BD08,
+    0x82E4C198,
+    0x82E4D1F8,
+    0x82E4D3B0,
+    0x82E53A88,
+    0x82E55AE0,
+    0x82E56FD8,
+    0x82E59428,
+    0x82E66638,
+    0x82E81FF8,
+    0x82EB7298,
+    0x82ECC020,
+    0x82EDCFF8,
+    0x82EF3B00,
+    0x82F22AE8,
+    0x82F2A4D8,
+    0x82F2C8C8,
+    0x82F2CDE8,
+    0x82F2E858,
+    0x82F2F8A8,
+    0x82F31FA0,
+    0x82F3F758,
+    0x82F42CD8,
+    0x82F455D8,
+    0x82F4E358,
+    0x82F50468,
+    0x82F50818,
+    0x82F51B10,
+    0x82F56190,
+    0x82F593F0,
+    0x82F5A490,
+    0x82F5AA98,
+    0x82F5C5A8,
+    0x82F5C7D8,
+    0x82F5CAC8,
+    0x82F5D7F8,
+    0x82F5E830,
+    0x82F5F1C8,
+    0x82F5F2F0,
+    0x82F6C720,
+    0x82F87130,
+    0x82F87D58,
+    0x82F88C28,
+    0x82F89058,
+    0x82F8D3D0,
+    0x82F8F3B0,
+    0x82FA15F0,
+    0x82FB6450,
+    0x830109C0,
+    0x83010D84,
+    0x83010E78,
+    0x83010EB0,
+    0x83010FA0,
+    0x83010FD0,
+    0x830116F0,
+    0x831C1C90,
+    0x831C1E98,
+    0x831C20A0,
+    0x831C2CE0,
+    0x831C3450,
+    0x831C35C0,
+    0x831C38E8,
+    0x831C3D78,
+    0x831C3EC0,
+    0x831C4360,
+    0x831FC158,
+]

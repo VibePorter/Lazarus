@@ -1,0 +1,1422 @@
+{
+  "source": "out/fixes/citadel_umbra_chain_20261029/wall_chain.log",
+  "scope": "All successful collection and answer events for one watched wall in a bounded run, in recorded order; camera epoch fixed for the acceptance-policy test",
+  "bounds": [
+    [
+      -18321.01,
+      -17436.941,
+      -4252.375
+    ],
+    [
+      -18318.99,
+      17916.941,
+      14852.375
+    ]
+  ],
+  "events": [
+    {
+      "stage": "answer",
+      "frame": 1450,
+      "pixels": 1048576
+    },
+    {
+      "stage": "collect",
+      "frame": 1451,
+      "issue_frame": 1450,
+      "seq": 8309,
+      "pixels": 0
+    },
+    {
+      "stage": "answer",
+      "frame": 1459,
+      "pixels": 1048576
+    },
+    {
+      "stage": "collect",
+      "frame": 1460,
+      "issue_frame": 1459,
+      "seq": 8921,
+      "pixels": 58140
+    },
+    {
+      "stage": "answer",
+      "frame": 1467,
+      "pixels": 58140
+    },
+    {
+      "stage": "collect",
+      "frame": 1468,
+      "issue_frame": 1467,
+      "seq": 9237,
+      "pixels": 65888
+    },
+    {
+      "stage": "answer",
+      "frame": 1474,
+      "pixels": 65888
+    },
+    {
+      "stage": "collect",
+      "frame": 1475,
+      "issue_frame": 1474,
+      "seq": 9341,
+      "pixels": 102572
+    },
+    {
+      "stage": "answer",
+      "frame": 1481,
+      "pixels": 102572
+    },
+    {
+      "stage": "collect",
+      "frame": 1482,
+      "issue_frame": 1481,
+      "seq": 9444,
+      "pixels": 102488
+    },
+    {
+      "stage": "answer",
+      "frame": 1488,
+      "pixels": 102488
+    },
+    {
+      "stage": "collect",
+      "frame": 1489,
+      "issue_frame": 1488,
+      "seq": 9571,
+      "pixels": 98872
+    },
+    {
+      "stage": "answer",
+      "frame": 1495,
+      "pixels": 98872
+    },
+    {
+      "stage": "collect",
+      "frame": 1496,
+      "issue_frame": 1495,
+      "seq": 9720,
+      "pixels": 96092
+    },
+    {
+      "stage": "answer",
+      "frame": 1502,
+      "pixels": 96092
+    },
+    {
+      "stage": "collect",
+      "frame": 1503,
+      "issue_frame": 1502,
+      "seq": 9856,
+      "pixels": 92688
+    },
+    {
+      "stage": "answer",
+      "frame": 1510,
+      "pixels": 92688
+    },
+    {
+      "stage": "collect",
+      "frame": 1511,
+      "issue_frame": 1510,
+      "seq": 10003,
+      "pixels": 0
+    },
+    {
+      "stage": "answer",
+      "frame": 1518,
+      "pixels": 1048576
+    },
+    {
+      "stage": "collect",
+      "frame": 1519,
+      "issue_frame": 1518,
+      "seq": 10156,
+      "pixels": 115028
+    },
+    {
+      "stage": "answer",
+      "frame": 1526,
+      "pixels": 115028
+    },
+    {
+      "stage": "collect",
+      "frame": 1527,
+      "issue_frame": 1526,
+      "seq": 10305,
+      "pixels": 130072
+    },
+    {
+      "stage": "answer",
+      "frame": 1534,
+      "pixels": 130072
+    },
+    {
+      "stage": "collect",
+      "frame": 1535,
+      "issue_frame": 1534,
+      "seq": 10461,
+      "pixels": 0
+    },
+    {
+      "stage": "answer",
+      "frame": 1542,
+      "pixels": 1048576
+    },
+    {
+      "stage": "collect",
+      "frame": 1543,
+      "issue_frame": 1542,
+      "seq": 10621,
+      "pixels": 112064
+    },
+    {
+      "stage": "answer",
+      "frame": 1550,
+      "pixels": 112064
+    },
+    {
+      "stage": "collect",
+      "frame": 1551,
+      "issue_frame": 1550,
+      "seq": 10776,
+      "pixels": 103280
+    },
+    {
+      "stage": "answer",
+      "frame": 1558,
+      "pixels": 103280
+    },
+    {
+      "stage": "collect",
+      "frame": 1559,
+      "issue_frame": 1558,
+      "seq": 10942,
+      "pixels": 142136
+    },
+    {
+      "stage": "answer",
+      "frame": 1566,
+      "pixels": 142136
+    },
+    {
+      "stage": "collect",
+      "frame": 1567,
+      "issue_frame": 1566,
+      "seq": 11115,
+      "pixels": 146884
+    },
+    {
+      "stage": "answer",
+      "frame": 1574,
+      "pixels": 146884
+    },
+    {
+      "stage": "collect",
+      "frame": 1575,
+      "issue_frame": 1574,
+      "seq": 11309,
+      "pixels": 146740
+    },
+    {
+      "stage": "answer",
+      "frame": 1582,
+      "pixels": 146740
+    },
+    {
+      "stage": "collect",
+      "frame": 1583,
+      "issue_frame": 1582,
+      "seq": 11519,
+      "pixels": 0
+    },
+    {
+      "stage": "answer",
+      "frame": 1589,
+      "pixels": 1048576
+    },
+    {
+      "stage": "collect",
+      "frame": 1590,
+      "issue_frame": 1589,
+      "seq": 11725,
+      "pixels": 0
+    },
+    {
+      "stage": "answer",
+      "frame": 1596,
+      "pixels": 0
+    },
+    {
+      "stage": "collect",
+      "frame": 1597,
+      "issue_frame": 1596,
+      "seq": 11931,
+      "pixels": 9204
+    },
+    {
+      "stage": "answer",
+      "frame": 1597,
+      "pixels": 9204
+    },
+    {
+      "stage": "collect",
+      "frame": 1598,
+      "issue_frame": 1597,
+      "seq": 11955,
+      "pixels": 146396
+    },
+    {
+      "stage": "answer",
+      "frame": 1604,
+      "pixels": 146396
+    },
+    {
+      "stage": "collect",
+      "frame": 1605,
+      "issue_frame": 1604,
+      "seq": 12166,
+      "pixels": 144472
+    },
+    {
+      "stage": "answer",
+      "frame": 1611,
+      "pixels": 144472
+    },
+    {
+      "stage": "collect",
+      "frame": 1612,
+      "issue_frame": 1611,
+      "seq": 12361,
+      "pixels": 144484
+    },
+    {
+      "stage": "answer",
+      "frame": 1619,
+      "pixels": 144484
+    },
+    {
+      "stage": "collect",
+      "frame": 1620,
+      "issue_frame": 1619,
+      "seq": 12601,
+      "pixels": 144484
+    },
+    {
+      "stage": "answer",
+      "frame": 1627,
+      "pixels": 144484
+    },
+    {
+      "stage": "collect",
+      "frame": 1628,
+      "issue_frame": 1627,
+      "seq": 12839,
+      "pixels": 144484
+    },
+    {
+      "stage": "answer",
+      "frame": 1635,
+      "pixels": 144484
+    },
+    {
+      "stage": "collect",
+      "frame": 1636,
+      "issue_frame": 1635,
+      "seq": 13084,
+      "pixels": 144484
+    },
+    {
+      "stage": "answer",
+      "frame": 1643,
+      "pixels": 144484
+    },
+    {
+      "stage": "collect",
+      "frame": 1644,
+      "issue_frame": 1643,
+      "seq": 13325,
+      "pixels": 144484
+    },
+    {
+      "stage": "answer",
+      "frame": 1651,
+      "pixels": 144484
+    },
+    {
+      "stage": "collect",
+      "frame": 1652,
+      "issue_frame": 1651,
+      "seq": 13568,
+      "pixels": 144484
+    },
+    {
+      "stage": "answer",
+      "frame": 1659,
+      "pixels": 144484
+    },
+    {
+      "stage": "collect",
+      "frame": 1660,
+      "issue_frame": 1659,
+      "seq": 13823,
+      "pixels": 144488
+    },
+    {
+      "stage": "answer",
+      "frame": 1667,
+      "pixels": 144488
+    },
+    {
+      "stage": "collect",
+      "frame": 1668,
+      "issue_frame": 1667,
+      "seq": 14070,
+      "pixels": 144488
+    },
+    {
+      "stage": "answer",
+      "frame": 1675,
+      "pixels": 144488
+    },
+    {
+      "stage": "collect",
+      "frame": 1676,
+      "issue_frame": 1675,
+      "seq": 14324,
+      "pixels": 144480
+    },
+    {
+      "stage": "answer",
+      "frame": 1683,
+      "pixels": 144480
+    },
+    {
+      "stage": "collect",
+      "frame": 1684,
+      "issue_frame": 1683,
+      "seq": 14575,
+      "pixels": 144480
+    },
+    {
+      "stage": "answer",
+      "frame": 1691,
+      "pixels": 144480
+    },
+    {
+      "stage": "collect",
+      "frame": 1692,
+      "issue_frame": 1691,
+      "seq": 14825,
+      "pixels": 144484
+    },
+    {
+      "stage": "answer",
+      "frame": 1699,
+      "pixels": 144484
+    },
+    {
+      "stage": "collect",
+      "frame": 1700,
+      "issue_frame": 1699,
+      "seq": 15075,
+      "pixels": 143760
+    },
+    {
+      "stage": "answer",
+      "frame": 1706,
+      "pixels": 143760
+    },
+    {
+      "stage": "collect",
+      "frame": 1707,
+      "issue_frame": 1706,
+      "seq": 15290,
+      "pixels": 142516
+    },
+    {
+      "stage": "answer",
+      "frame": 1713,
+      "pixels": 142516
+    },
+    {
+      "stage": "collect",
+      "frame": 1714,
+      "issue_frame": 1713,
+      "seq": 15472,
+      "pixels": 8048
+    },
+    {
+      "stage": "answer",
+      "frame": 1720,
+      "pixels": 8048
+    },
+    {
+      "stage": "collect",
+      "frame": 1721,
+      "issue_frame": 1720,
+      "seq": 15640,
+      "pixels": 16484
+    },
+    {
+      "stage": "answer",
+      "frame": 1727,
+      "pixels": 16484
+    },
+    {
+      "stage": "collect",
+      "frame": 1728,
+      "issue_frame": 1727,
+      "seq": 15808,
+      "pixels": 108332
+    },
+    {
+      "stage": "answer",
+      "frame": 1734,
+      "pixels": 108332
+    },
+    {
+      "stage": "collect",
+      "frame": 1735,
+      "issue_frame": 1734,
+      "seq": 15979,
+      "pixels": 108340
+    },
+    {
+      "stage": "answer",
+      "frame": 1742,
+      "pixels": 108340
+    },
+    {
+      "stage": "collect",
+      "frame": 1743,
+      "issue_frame": 1742,
+      "seq": 16172,
+      "pixels": 108344
+    },
+    {
+      "stage": "answer",
+      "frame": 1750,
+      "pixels": 108344
+    },
+    {
+      "stage": "collect",
+      "frame": 1751,
+      "issue_frame": 1750,
+      "seq": 16371,
+      "pixels": 108376
+    },
+    {
+      "stage": "answer",
+      "frame": 1758,
+      "pixels": 108376
+    },
+    {
+      "stage": "collect",
+      "frame": 1759,
+      "issue_frame": 1758,
+      "seq": 16570,
+      "pixels": 108352
+    },
+    {
+      "stage": "answer",
+      "frame": 1766,
+      "pixels": 108352
+    },
+    {
+      "stage": "collect",
+      "frame": 1767,
+      "issue_frame": 1766,
+      "seq": 16768,
+      "pixels": 108264
+    },
+    {
+      "stage": "answer",
+      "frame": 1774,
+      "pixels": 108264
+    },
+    {
+      "stage": "collect",
+      "frame": 1775,
+      "issue_frame": 1774,
+      "seq": 16971,
+      "pixels": 108312
+    },
+    {
+      "stage": "answer",
+      "frame": 1782,
+      "pixels": 108312
+    },
+    {
+      "stage": "collect",
+      "frame": 1783,
+      "issue_frame": 1782,
+      "seq": 17169,
+      "pixels": 108452
+    },
+    {
+      "stage": "answer",
+      "frame": 1790,
+      "pixels": 108452
+    },
+    {
+      "stage": "collect",
+      "frame": 1791,
+      "issue_frame": 1790,
+      "seq": 17373,
+      "pixels": 108528
+    },
+    {
+      "stage": "answer",
+      "frame": 1798,
+      "pixels": 108528
+    },
+    {
+      "stage": "collect",
+      "frame": 1799,
+      "issue_frame": 1798,
+      "seq": 17579,
+      "pixels": 108420
+    },
+    {
+      "stage": "answer",
+      "frame": 1806,
+      "pixels": 108420
+    },
+    {
+      "stage": "collect",
+      "frame": 1807,
+      "issue_frame": 1806,
+      "seq": 17796,
+      "pixels": 108344
+    },
+    {
+      "stage": "answer",
+      "frame": 1814,
+      "pixels": 108344
+    },
+    {
+      "stage": "collect",
+      "frame": 1815,
+      "issue_frame": 1814,
+      "seq": 18014,
+      "pixels": 108224
+    },
+    {
+      "stage": "answer",
+      "frame": 1822,
+      "pixels": 108224
+    },
+    {
+      "stage": "collect",
+      "frame": 1823,
+      "issue_frame": 1822,
+      "seq": 18228,
+      "pixels": 108188
+    },
+    {
+      "stage": "answer",
+      "frame": 1830,
+      "pixels": 108188
+    },
+    {
+      "stage": "collect",
+      "frame": 1831,
+      "issue_frame": 1830,
+      "seq": 18438,
+      "pixels": 119212
+    },
+    {
+      "stage": "answer",
+      "frame": 1838,
+      "pixels": 119212
+    },
+    {
+      "stage": "collect",
+      "frame": 1839,
+      "issue_frame": 1838,
+      "seq": 18639,
+      "pixels": 127372
+    },
+    {
+      "stage": "answer",
+      "frame": 1846,
+      "pixels": 127372
+    },
+    {
+      "stage": "collect",
+      "frame": 1847,
+      "issue_frame": 1846,
+      "seq": 18842,
+      "pixels": 0
+    },
+    {
+      "stage": "answer",
+      "frame": 1854,
+      "pixels": 1048576
+    },
+    {
+      "stage": "collect",
+      "frame": 1855,
+      "issue_frame": 1854,
+      "seq": 19033,
+      "pixels": 181416
+    },
+    {
+      "stage": "answer",
+      "frame": 1862,
+      "pixels": 181416
+    },
+    {
+      "stage": "collect",
+      "frame": 1863,
+      "issue_frame": 1862,
+      "seq": 19241,
+      "pixels": 181744
+    },
+    {
+      "stage": "answer",
+      "frame": 1871,
+      "pixels": 181744
+    },
+    {
+      "stage": "collect",
+      "frame": 1872,
+      "issue_frame": 1871,
+      "seq": 19526,
+      "pixels": 181404
+    },
+    {
+      "stage": "answer",
+      "frame": 1879,
+      "pixels": 181404
+    },
+    {
+      "stage": "collect",
+      "frame": 1880,
+      "issue_frame": 1879,
+      "seq": 19811,
+      "pixels": 180600
+    },
+    {
+      "stage": "answer",
+      "frame": 1887,
+      "pixels": 180600
+    },
+    {
+      "stage": "collect",
+      "frame": 1888,
+      "issue_frame": 1887,
+      "seq": 20084,
+      "pixels": 179404
+    },
+    {
+      "stage": "answer",
+      "frame": 1895,
+      "pixels": 179404
+    },
+    {
+      "stage": "collect",
+      "frame": 1896,
+      "issue_frame": 1895,
+      "seq": 20356,
+      "pixels": 178772
+    },
+    {
+      "stage": "answer",
+      "frame": 1903,
+      "pixels": 178772
+    },
+    {
+      "stage": "collect",
+      "frame": 1904,
+      "issue_frame": 1903,
+      "seq": 20628,
+      "pixels": 179292
+    },
+    {
+      "stage": "answer",
+      "frame": 1911,
+      "pixels": 179292
+    },
+    {
+      "stage": "collect",
+      "frame": 1912,
+      "issue_frame": 1911,
+      "seq": 20902,
+      "pixels": 180120
+    },
+    {
+      "stage": "answer",
+      "frame": 1919,
+      "pixels": 180120
+    },
+    {
+      "stage": "collect",
+      "frame": 1920,
+      "issue_frame": 1919,
+      "seq": 21188,
+      "pixels": 180552
+    },
+    {
+      "stage": "answer",
+      "frame": 1927,
+      "pixels": 180552
+    },
+    {
+      "stage": "collect",
+      "frame": 1928,
+      "issue_frame": 1927,
+      "seq": 21477,
+      "pixels": 180592
+    },
+    {
+      "stage": "answer",
+      "frame": 1935,
+      "pixels": 180592
+    },
+    {
+      "stage": "collect",
+      "frame": 1936,
+      "issue_frame": 1935,
+      "seq": 21773,
+      "pixels": 180388
+    },
+    {
+      "stage": "answer",
+      "frame": 1943,
+      "pixels": 180388
+    },
+    {
+      "stage": "collect",
+      "frame": 1944,
+      "issue_frame": 1943,
+      "seq": 22081,
+      "pixels": 179520
+    },
+    {
+      "stage": "answer",
+      "frame": 1951,
+      "pixels": 179520
+    },
+    {
+      "stage": "collect",
+      "frame": 1952,
+      "issue_frame": 1951,
+      "seq": 22390,
+      "pixels": 177700
+    },
+    {
+      "stage": "answer",
+      "frame": 1959,
+      "pixels": 177700
+    },
+    {
+      "stage": "collect",
+      "frame": 1960,
+      "issue_frame": 1959,
+      "seq": 22691,
+      "pixels": 176024
+    },
+    {
+      "stage": "answer",
+      "frame": 1967,
+      "pixels": 176024
+    },
+    {
+      "stage": "collect",
+      "frame": 1968,
+      "issue_frame": 1967,
+      "seq": 23003,
+      "pixels": 176224
+    },
+    {
+      "stage": "answer",
+      "frame": 1975,
+      "pixels": 176224
+    },
+    {
+      "stage": "collect",
+      "frame": 1976,
+      "issue_frame": 1975,
+      "seq": 23313,
+      "pixels": 177880
+    },
+    {
+      "stage": "answer",
+      "frame": 1983,
+      "pixels": 177880
+    },
+    {
+      "stage": "collect",
+      "frame": 1984,
+      "issue_frame": 1983,
+      "seq": 23626,
+      "pixels": 178936
+    },
+    {
+      "stage": "answer",
+      "frame": 1991,
+      "pixels": 178936
+    },
+    {
+      "stage": "collect",
+      "frame": 1992,
+      "issue_frame": 1991,
+      "seq": 23942,
+      "pixels": 180016
+    },
+    {
+      "stage": "answer",
+      "frame": 1999,
+      "pixels": 180016
+    },
+    {
+      "stage": "collect",
+      "frame": 2000,
+      "issue_frame": 1999,
+      "seq": 24260,
+      "pixels": 180300
+    },
+    {
+      "stage": "answer",
+      "frame": 2007,
+      "pixels": 180300
+    },
+    {
+      "stage": "collect",
+      "frame": 2008,
+      "issue_frame": 2007,
+      "seq": 24577,
+      "pixels": 179912
+    },
+    {
+      "stage": "answer",
+      "frame": 2015,
+      "pixels": 179912
+    },
+    {
+      "stage": "collect",
+      "frame": 2016,
+      "issue_frame": 2015,
+      "seq": 24891,
+      "pixels": 179328
+    },
+    {
+      "stage": "answer",
+      "frame": 2023,
+      "pixels": 179328
+    },
+    {
+      "stage": "collect",
+      "frame": 2024,
+      "issue_frame": 2023,
+      "seq": 25213,
+      "pixels": 179124
+    },
+    {
+      "stage": "answer",
+      "frame": 2031,
+      "pixels": 179124
+    },
+    {
+      "stage": "collect",
+      "frame": 2032,
+      "issue_frame": 2031,
+      "seq": 25542,
+      "pixels": 179284
+    },
+    {
+      "stage": "answer",
+      "frame": 2039,
+      "pixels": 179284
+    },
+    {
+      "stage": "collect",
+      "frame": 2040,
+      "issue_frame": 2039,
+      "seq": 25866,
+      "pixels": 179180
+    },
+    {
+      "stage": "answer",
+      "frame": 2047,
+      "pixels": 179180
+    },
+    {
+      "stage": "collect",
+      "frame": 2048,
+      "issue_frame": 2047,
+      "seq": 26195,
+      "pixels": 178572
+    },
+    {
+      "stage": "answer",
+      "frame": 2055,
+      "pixels": 178572
+    },
+    {
+      "stage": "collect",
+      "frame": 2056,
+      "issue_frame": 2055,
+      "seq": 26520,
+      "pixels": 178344
+    },
+    {
+      "stage": "answer",
+      "frame": 2063,
+      "pixels": 178344
+    },
+    {
+      "stage": "collect",
+      "frame": 2064,
+      "issue_frame": 2063,
+      "seq": 26846,
+      "pixels": 178176
+    },
+    {
+      "stage": "answer",
+      "frame": 2071,
+      "pixels": 178176
+    },
+    {
+      "stage": "collect",
+      "frame": 2072,
+      "issue_frame": 2071,
+      "seq": 27167,
+      "pixels": 178416
+    },
+    {
+      "stage": "answer",
+      "frame": 2079,
+      "pixels": 178416
+    },
+    {
+      "stage": "collect",
+      "frame": 2080,
+      "issue_frame": 2079,
+      "seq": 27481,
+      "pixels": 181756
+    },
+    {
+      "stage": "answer",
+      "frame": 2087,
+      "pixels": 181756
+    },
+    {
+      "stage": "collect",
+      "frame": 2088,
+      "issue_frame": 2087,
+      "seq": 27735,
+      "pixels": 64088
+    },
+    {
+      "stage": "answer",
+      "frame": 2094,
+      "pixels": 64088
+    },
+    {
+      "stage": "collect",
+      "frame": 2095,
+      "issue_frame": 2094,
+      "seq": 27925,
+      "pixels": 148912
+    },
+    {
+      "stage": "answer",
+      "frame": 2102,
+      "pixels": 148912
+    },
+    {
+      "stage": "collect",
+      "frame": 2103,
+      "issue_frame": 2102,
+      "seq": 28129,
+      "pixels": 111684
+    },
+    {
+      "stage": "answer",
+      "frame": 2110,
+      "pixels": 111684
+    },
+    {
+      "stage": "collect",
+      "frame": 2111,
+      "issue_frame": 2110,
+      "seq": 28340,
+      "pixels": 112448
+    },
+    {
+      "stage": "answer",
+      "frame": 2118,
+      "pixels": 112448
+    },
+    {
+      "stage": "collect",
+      "frame": 2119,
+      "issue_frame": 2118,
+      "seq": 28559,
+      "pixels": 112716
+    },
+    {
+      "stage": "answer",
+      "frame": 2126,
+      "pixels": 112716
+    },
+    {
+      "stage": "collect",
+      "frame": 2127,
+      "issue_frame": 2126,
+      "seq": 28824,
+      "pixels": 112984
+    },
+    {
+      "stage": "answer",
+      "frame": 2134,
+      "pixels": 112984
+    },
+    {
+      "stage": "collect",
+      "frame": 2135,
+      "issue_frame": 2134,
+      "seq": 29085,
+      "pixels": 112872
+    },
+    {
+      "stage": "answer",
+      "frame": 2142,
+      "pixels": 112872
+    },
+    {
+      "stage": "collect",
+      "frame": 2143,
+      "issue_frame": 2142,
+      "seq": 29349,
+      "pixels": 112448
+    },
+    {
+      "stage": "answer",
+      "frame": 2150,
+      "pixels": 112448
+    },
+    {
+      "stage": "collect",
+      "frame": 2151,
+      "issue_frame": 2150,
+      "seq": 29608,
+      "pixels": 111800
+    },
+    {
+      "stage": "answer",
+      "frame": 2158,
+      "pixels": 111800
+    },
+    {
+      "stage": "collect",
+      "frame": 2159,
+      "issue_frame": 2158,
+      "seq": 29876,
+      "pixels": 111840
+    },
+    {
+      "stage": "answer",
+      "frame": 2165,
+      "pixels": 111840
+    },
+    {
+      "stage": "collect",
+      "frame": 2166,
+      "issue_frame": 2165,
+      "seq": 30117,
+      "pixels": 112060
+    },
+    {
+      "stage": "answer",
+      "frame": 2173,
+      "pixels": 112060
+    },
+    {
+      "stage": "collect",
+      "frame": 2174,
+      "issue_frame": 2173,
+      "seq": 30388,
+      "pixels": 112136
+    },
+    {
+      "stage": "answer",
+      "frame": 2181,
+      "pixels": 112136
+    },
+    {
+      "stage": "collect",
+      "frame": 2182,
+      "issue_frame": 2181,
+      "seq": 30669,
+      "pixels": 112196
+    },
+    {
+      "stage": "answer",
+      "frame": 2189,
+      "pixels": 112196
+    },
+    {
+      "stage": "collect",
+      "frame": 2190,
+      "issue_frame": 2189,
+      "seq": 30960,
+      "pixels": 112124
+    },
+    {
+      "stage": "answer",
+      "frame": 2197,
+      "pixels": 112124
+    },
+    {
+      "stage": "collect",
+      "frame": 2198,
+      "issue_frame": 2197,
+      "seq": 31241,
+      "pixels": 112392
+    },
+    {
+      "stage": "answer",
+      "frame": 2204,
+      "pixels": 112392
+    },
+    {
+      "stage": "collect",
+      "frame": 2205,
+      "issue_frame": 2204,
+      "seq": 31489,
+      "pixels": 112432
+    },
+    {
+      "stage": "answer",
+      "frame": 2212,
+      "pixels": 112432
+    },
+    {
+      "stage": "collect",
+      "frame": 2213,
+      "issue_frame": 2212,
+      "seq": 31766,
+      "pixels": 112444
+    },
+    {
+      "stage": "answer",
+      "frame": 2219,
+      "pixels": 112444
+    },
+    {
+      "stage": "collect",
+      "frame": 2220,
+      "issue_frame": 2219,
+      "seq": 32027,
+      "pixels": 112368
+    },
+    {
+      "stage": "answer",
+      "frame": 2226,
+      "pixels": 112368
+    },
+    {
+      "stage": "collect",
+      "frame": 2227,
+      "issue_frame": 2226,
+      "seq": 32279,
+      "pixels": 112188
+    },
+    {
+      "stage": "answer",
+      "frame": 2233,
+      "pixels": 112188
+    },
+    {
+      "stage": "collect",
+      "frame": 2234,
+      "issue_frame": 2233,
+      "seq": 32530,
+      "pixels": 111836
+    },
+    {
+      "stage": "answer",
+      "frame": 2240,
+      "pixels": 111836
+    },
+    {
+      "stage": "collect",
+      "frame": 2241,
+      "issue_frame": 2240,
+      "seq": 32781,
+      "pixels": 111040
+    },
+    {
+      "stage": "answer",
+      "frame": 2247,
+      "pixels": 111040
+    },
+    {
+      "stage": "collect",
+      "frame": 2248,
+      "issue_frame": 2247,
+      "seq": 33026,
+      "pixels": 110728
+    },
+    {
+      "stage": "answer",
+      "frame": 2255,
+      "pixels": 110728
+    },
+    {
+      "stage": "collect",
+      "frame": 2256,
+      "issue_frame": 2255,
+      "seq": 33303,
+      "pixels": 109916
+    },
+    {
+      "stage": "answer",
+      "frame": 2263,
+      "pixels": 109916
+    },
+    {
+      "stage": "collect",
+      "frame": 2264,
+      "issue_frame": 2263,
+      "seq": 33592,
+      "pixels": 108908
+    },
+    {
+      "stage": "answer",
+      "frame": 2271,
+      "pixels": 108908
+    },
+    {
+      "stage": "collect",
+      "frame": 2272,
+      "issue_frame": 2271,
+      "seq": 33876,
+      "pixels": 108612
+    },
+    {
+      "stage": "answer",
+      "frame": 2279,
+      "pixels": 108612
+    },
+    {
+      "stage": "collect",
+      "frame": 2280,
+      "issue_frame": 2279,
+      "seq": 34160,
+      "pixels": 109088
+    },
+    {
+      "stage": "answer",
+      "frame": 2287,
+      "pixels": 109088
+    },
+    {
+      "stage": "collect",
+      "frame": 2288,
+      "issue_frame": 2287,
+      "seq": 34448,
+      "pixels": 110948
+    },
+    {
+      "stage": "answer",
+      "frame": 2295,
+      "pixels": 110948
+    },
+    {
+      "stage": "collect",
+      "frame": 2296,
+      "issue_frame": 2295,
+      "seq": 34734,
+      "pixels": 111828
+    },
+    {
+      "stage": "answer",
+      "frame": 2303,
+      "pixels": 111828
+    },
+    {
+      "stage": "collect",
+      "frame": 2304,
+      "issue_frame": 2303,
+      "seq": 35014,
+      "pixels": 111212
+    },
+    {
+      "stage": "answer",
+      "frame": 2310,
+      "pixels": 111212
+    },
+    {
+      "stage": "collect",
+      "frame": 2311,
+      "issue_frame": 2310,
+      "seq": 35269,
+      "pixels": 110660
+    },
+    {
+      "stage": "answer",
+      "frame": 2317,
+      "pixels": 110660
+    },
+    {
+      "stage": "collect",
+      "frame": 2318,
+      "issue_frame": 2317,
+      "seq": 35516,
+      "pixels": 110360
+    },
+    {
+      "stage": "answer",
+      "frame": 2324,
+      "pixels": 110360
+    },
+    {
+      "stage": "collect",
+      "frame": 2325,
+      "issue_frame": 2324,
+      "seq": 35766,
+      "pixels": 110424
+    },
+    {
+      "stage": "answer",
+      "frame": 2331,
+      "pixels": 110424
+    },
+    {
+      "stage": "collect",
+      "frame": 2332,
+      "issue_frame": 2331,
+      "seq": 36018,
+      "pixels": 111120
+    },
+    {
+      "stage": "answer",
+      "frame": 2338,
+      "pixels": 111120
+    },
+    {
+      "stage": "collect",
+      "frame": 2339,
+      "issue_frame": 2338,
+      "seq": 36272,
+      "pixels": 111304
+    },
+    {
+      "stage": "answer",
+      "frame": 2345,
+      "pixels": 111304
+    },
+    {
+      "stage": "collect",
+      "frame": 2346,
+      "issue_frame": 2345,
+      "seq": 36519,
+      "pixels": 111728
+    }
+  ]
+}

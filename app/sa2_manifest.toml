@@ -1,0 +1,15 @@
+# ReXGlue recompilation manifest for Mass Effect 2 (Xbox 360, title 454108CE, default.xex + Title Update 2 default.xexp, v0.0.2.1).
+#
+# The project keeps the name "sa2" (the prefix of the generated files) like mgr-nx-deko: the CMake files and the
+# renderer read those names.
+
+[project]
+name = "sa2"
+sdk_version = "0.10.0"
+game_root = "../assets/game_root"
+
+[entrypoint]
+file_path = "../assets/game_root/default.xex"
+out_directory_path = "generated/default"
+
+includes = ["overrides.toml", "codegen_flavor.toml"]

@@ -1,0 +1,39 @@
+# ME2 Renut/deko3d Switch settings (sdmc:/switch/me2-deko/me2.toml). Paths without "sdmc:" (newlib's default device).
+sa2_renderer = "renut"
+renut_gpu_backend = "deko3d"
+# Restart after changing these. Unlock removes the game's cap; display VSync still applies.
+me2_unlock_framerate = false
+# Skip the BioWare/EA startup logos; story cinematics and loading movies still play.
+me2_skip_intro_videos = false
+license_mask = 0xFFFFFFFF
+me2_shared_input = true
+input_xbox_layout = true
+sa2_render_height_handheld = 360
+sa2_render_height_docked = 360
+banjo_renut_store_cards = false
+banjo_deko3d_alpha_spec = false
+user_data_root = "/switch/me2-deko/userdata"
+log_file = "/switch/me2-deko/me2.log"
+log_level = "info"
+# As mgr-nx-deko: the log written by its own thread (the game and render threads only enqueue).
+log_async = true
+log_flush_interval = 2
+
+# UE3 streams 128 KB chunks; admit them to the existing bounded read-only range cache.
+sa2_io_ranges_min_kb = 128
+
+# --- Profiling (2026-10-26): logs/rex/rex_profile.log every 10 s (per-thread CPU, cores, audio counters). Add
+# switch_profile_stacks = true for a diagnostic run (1 ms stack samples: hottest functions per thread; lowers fps).
+switch_profile_report = true
+
+# --- A/B switches of the ME2 optimisations (all on by default; uncomment a line to turn one off) ----------------------
+# me2_core_layout = 0                # 1 = UE3 render thread alone on core 0 (default), 2 = game thread, 0 = off
+# me2_guest_skip_prepass = false      # the game does not build the scene depth prepass
+# me2_cull_small_factor = 0           # draw distance of small static meshes (100 = default; 0 = off)
+# me2_dle_visible_every = 1           # character lighting updated every 2nd frame (1 = every frame)
+# me2_physx_no_warnings = false       # PhysX warnings not formatted
+# me2_hot_lzo = false                 # native LZO decompressor (self-checked)
+# me2_hot_frustum_sphere = false      # exact native sphere/frustum test (self-checked)
+# banjo_deko3d_record_worker = false  # Renut's command recording on a second core
+# me2_ini_override = ""               # engine settings: shadows 256, GC 60 s, VFX budget 50, corpses, Wwise updates
+# audio_switch_frames_in_queue = 10   # audio output cushion in 5.33 ms frames (16 = 85 ms default)

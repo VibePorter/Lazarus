@@ -1,0 +1,48 @@
+# rexinput - Input system library
+# Input system and drivers for Xbox 360 controller emulation
+
+add_library(rexinput OBJECT
+    input_system.cpp
+    device_assignment.cpp
+    state_merge.cpp
+    mnk/mnk_input_driver.cpp
+    nop/nop_input_driver.cpp
+)
+add_library(rex::input ALIAS rexinput)
+
+rex_target_pch(rexinput
+    <mutex>
+    <rex/math.h>
+    <rex/string.h>
+    <rex/memory.h>
+    <rex/filesystem.h>
+    <rex/thread.h>
+    <rex/thread/mutex.h>
+    <rex/ppc/context.h>
+    <rex/system/kernel_state.h>
+    <rex/system/xthread.h>
+    <rex/ui/window.h>
+    <rex/ui/presenter.h>
+)
+
+target_include_directories(rexinput PUBLIC
+    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
+if(REXGLUE_PLATFORM_SWITCH)
+    target_sources(rexinput PRIVATE switch/switch_input_driver.cpp)
+    option(REX_SWITCH_INPUT_DIAGNOSTICS "Compile opt-in local file controller commands for unattended Switch tests" OFF)
+    if(REX_SWITCH_INPUT_DIAGNOSTICS)
+        set_property(SOURCE switch/switch_input_driver.cpp APPEND PROPERTY
+            COMPILE_DEFINITIONS REX_SWITCH_INPUT_DIAGNOSTICS=1)
+    endif()
+elseif(WIN32)
+    target_sources(rexinput PRIVATE sdl/sdl_input_driver.cpp xinput/xinput_input_driver.cpp)
+else()
+    target_sources(rexinput PRIVATE sdl/sdl_input_driver.cpp)
+endif()
+
+target_link_libraries(rexinput PUBLIC rexcore rexui)
+if(NOT REXGLUE_PLATFORM_SWITCH)
+    target_link_libraries(rexinput PUBLIC SDL3::SDL3)
+endif()

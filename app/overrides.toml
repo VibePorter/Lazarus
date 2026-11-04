@@ -1,0 +1,364 @@
+﻿# me2 - ReXGlue codegen config (Mass Effect 2, X360, title 454108CE, base XEX)
+#
+# Entries are added as codegen and runtime runs surface them:
+#   [functions]      - entry points static discovery missed
+#   [[switch_tables]] - jump tables it could not resolve
+#   [[midasm_hook]]  - game patches (FPS, resolution, ...)
+
+[functions]
+
+# Codegen pass 1: tail-branch targets not covered by any discovered function.
+"0x82E43460" = { name = "sub_82E43460" }  # b from 0x82E38814
+"0x82FCE6E0" = { name = "sub_82FCE6E0" }  # b from 0x82FCE6EC
+"0x82C74370" = { name = "sub_82C74370" }  # b from 0x82C7473C
+"0x82FE7488" = { name = "sub_82FE7488" }  # b from 0x82FD6E8C
+"0x82DA8300" = { name = "sub_82DA8300" }  # b from 0x83019F48
+
+# Codegen pass 2: 0x82E47884 was split off as its own function (starts with
+# addi r11,r11,8 on an unset r11) and branches back to 0x82E4787C. The real
+# entry is in the undiscovered gap after sub_82E47800.
+"0x82E47850" = { name = "sub_82E47850" }
+
+# Batch from tools/find_missing_funcs.py (image dump + generated coverage):
+# pointers in .rdata/.data/.pdata to uncovered code (vtables, static
+# initializer table, callbacks) and real code in uncovered gaps. Excluded by
+# hand: jump tables inside .text, import thunks, SEH scope-table __except
+# targets (.rdata 82249xxx-8224Axxx, they point mid-function), unreachable
+# blocks inside functions (83057184, 830571BC, 8305804C), dead tail branch
+# 82ECBD98.
+"0x822BE160" = { name = "sub_822BE160" }  # ptr in .rdata @ 820CE244
+"0x822D7488" = { name = "sub_822D7488" }  # ptr in .rdata @ 820D13AC
+"0x82354E80" = { name = "sub_82354E80" }  # ptr in .rdata @ 820ED870
+"0x82369B70" = { name = "sub_82369B70" }  # gap 82369B70-82369B90
+"0x8236DB28" = { name = "sub_8236DB28" }  # ptr in .rdata @ 820F00BC
+"0x824588A8" = { name = "sub_824588A8" }  # ptr in .rdata @ 82133F44
+"0x8249F898" = { name = "sub_8249F898" }  # ptr in .rdata @ 820F0E54
+"0x825461D0" = { name = "sub_825461D0" }  # ptr in .rdata @ 82156FAC
+"0x825A4C50" = { name = "sub_825A4C50" }  # ptr in .rdata @ 8215D3B0
+"0x825ED3E0" = { name = "sub_825ED3E0" }  # ptr in .rdata @ 82057BE0
+"0x825F4640" = { name = "sub_825F4640" }  # ptr in .rdata @ 8216436C
+"0x826BEEE0" = { name = "sub_826BEEE0" }  # ptr in .rdata @ 8217FB68
+"0x82708FC8" = { name = "sub_82708FC8" }  # gap 82708FC8-82708FE0
+"0x82770320" = { name = "sub_82770320" }  # ptr in .data @ 8337B2CC
+"0x8277EC18" = { name = "sub_8277EC18" }  # ptr in .data @ 8337B670
+# TU2: unresolved, left to the scanner: "0x827A1A30" = { name = "sub_827A1A30" }  # ptr in .rdata @ 820CCC88
+"0x827A1CC8" = { name = "sub_827A1CC8" }  # ptr in .rdata @ 820CCCA0
+"0x827F6F78" = { name = "sub_827F6F78" }  # gap 827F6F78-827F6FB0
+"0x828060A0" = { name = "sub_828060A0" }  # ptr in .rdata @ 821A80BC
+"0x8282B688" = { name = "sub_8282B688" }  # ptr in .rdata @ 821A9E38
+"0x82831390" = { name = "sub_82831390" }  # ptr in .rdata @ 821AFB58
+"0x828313C0" = { name = "sub_828313C0" }  # gap 828313C0-828313D8
+"0x828322B8" = { name = "sub_828322B8" }  # ptr in .rdata @ 821B882C
+"0x8285B340" = { name = "sub_8285B340" }  # ptr in .rdata @ 821BD5E8
+"0x8285B360" = { name = "sub_8285B360" }  # ptr in .rdata @ 821BD5EC
+"0x8285B380" = { name = "sub_8285B380" }  # ptr in .rdata @ 821BD5F0
+"0x8285B3D0" = { name = "sub_8285B3D0" }  # ptr in .rdata @ 821BD5FC
+"0x8285B438" = { name = "sub_8285B438" }  # ptr in .rdata @ 820CEB58
+"0x8288D4F8" = { name = "sub_8288D4F8" }  # ptr in .rdata @ 821C47F0
+"0x82918FC0" = { name = "sub_82918FC0" }  # ptr in .rdata @ 821CAEEC
+"0x82919FC0" = { name = "sub_82919FC0" }  # ptr in .rdata @ 821CBB48
+"0x82871380" = { name = "sub_82871380" }  # ptr in .data @ 8336A044
+# TU2: unresolved, left to the scanner: "0x828BCDC8" = { name = "sub_828BCDC8" }  # ptr in .rdata @ 821A5E10
+# TU2: duplicate (functions folded in TU2): "0x82871380" = { name = "sub_82871380" }  # ptr in .data @ 8336A03C
+"0x82899A60" = { name = "sub_82899A60" }  # ptr in .data @ 8336A034
+# TU2: unresolved, left to the scanner: "0x8292AFD8" = { name = "sub_8292AFD8" }  # ptr in .rdata @ 820AA4A0
+"0x82958030" = { name = "sub_82958030" }  # ptr in .rdata @ 821F07D8
+"0x82A74278" = { name = "sub_82A74278" }  # ptr in .rdata @ 821C4950
+"0x828CE078" = { name = "sub_828CE078" }  # ptr in .rdata @ 821F3F60
+"0x8298B6D0" = { name = "sub_8298B6D0" }  # ptr in .rdata @ 821F86DC
+"0x82945038" = { name = "sub_82945038" }  # ptr in .rdata @ 82239450
+"0x82A838D0" = { name = "sub_82A838D0" }  # ptr in .rdata @ 82245DEC
+"0x82A83900" = { name = "sub_82A83900" }  # ptr in .rdata @ 8224658C
+"0x82AB61B0" = { name = "sub_82AB61B0" }  # ptr in .rdata @ 8200090C
+"0x82AB61C8" = { name = "sub_82AB61C8" }  # ptr in .rdata @ 82000910
+"0x82AD2A10" = { name = "sub_82AD2A10" }  # ptr in .rdata @ 820015D0
+"0x82AD2AD0" = { name = "sub_82AD2AD0" }  # ptr in .rdata @ 820015D8
+"0x82AD2AE8" = { name = "sub_82AD2AE8" }  # ptr in .rdata @ 820015DC
+"0x82ADC028" = { name = "sub_82ADC028" }  # ptr in .rdata @ 82001C90
+# TU2: unresolved, left to the scanner: "0x82ACBEE0" = { name = "sub_82ACBEE0" }  # ptr in .rdata @ 82001CA0
+"0x82AEEF50" = { name = "sub_82AEEF50" }  # ptr in .rdata @ 820028C8
+"0x82AFBE40" = { name = "sub_82AFBE40" }  # ptr in .rdata @ 82003510
+"0x82B0DCA8" = { name = "sub_82B0DCA8" }  # ptr in .rdata @ 82003EC8
+"0x82B169A0" = { name = "sub_82B169A0" }  # ptr in .rdata @ 820047B8
+"0x82B21AF0" = { name = "sub_82B21AF0" }  # ptr in .rdata @ 82004474
+"0x82B32F90" = { name = "sub_82B32F90" }  # ptr in .rdata @ 82005094
+"0x82B36F88" = { name = "sub_82B36F88" }  # ptr in .rdata @ 8200527C
+"0x82B40420" = { name = "sub_82B40420" }  # ptr in .rdata @ 82005CB0
+"0x82B40438" = { name = "sub_82B40438" }  # ptr in .rdata @ 82005C98
+"0x82B40450" = { name = "sub_82B40450" }  # ptr in .rdata @ 82005CB4
+"0x82B40468" = { name = "sub_82B40468" }  # ptr in .rdata @ 82005C9C
+"0x82B40480" = { name = "sub_82B40480" }  # ptr in .rdata @ 82005CA0
+"0x82B40498" = { name = "sub_82B40498" }  # ptr in .rdata @ 82005CA4
+"0x82B404B0" = { name = "sub_82B404B0" }  # ptr in .rdata @ 82005CA8
+"0x82B404C8" = { name = "sub_82B404C8" }  # ptr in .rdata @ 82005CAC
+"0x82B52C78" = { name = "sub_82B52C78" }  # ptr in .rdata @ 8200653C
+"0x82B65BF8" = { name = "sub_82B65BF8" }  # ptr in .rdata @ 82006F5C
+"0x82B8DA60" = { name = "sub_82B8DA60" }  # ptr in .rdata @ 82009594
+"0x82B91900" = { name = "sub_82B91900" }  # ptr in .rdata @ 82009750
+"0x82B92058" = { name = "sub_82B92058" }  # ptr in .rdata @ 8200989C
+# TU2: unresolved, left to the scanner: "0x82BD7950" = { name = "sub_82BD7950" }  # ptr in .rdata @ 8200F074
+"0x82BEF5C8" = { name = "sub_82BEF5C8" }  # ptr in .rdata @ 8200F660
+"0x82BEF5F8" = { name = "sub_82BEF5F8" }  # ptr in .rdata @ 8200F65C
+"0x82BEF628" = { name = "sub_82BEF628" }  # ptr in .rdata @ 8200F654
+"0x82BEF688" = { name = "sub_82BEF688" }  # ptr in .rdata @ 8200F650
+# TU2: duplicate (functions folded in TU2): "0x82BEF688" = { name = "sub_82BEF688" }  # ptr in .rdata @ 8200F64C
+"0x82BEF6E8" = { name = "sub_82BEF6E8" }  # ptr in .rdata @ 8200F644
+# TU2: unresolved, left to the scanner: "0x82BE1050" = { name = "sub_82BE1050" }  # ptr in .rdata @ 8200F684
+"0x82BFB2C0" = { name = "sub_82BFB2C0" }  # ptr in .rdata @ 8201D3F4
+"0x82BFB7A0" = { name = "sub_82BFB7A0" }  # ptr in .rdata @ 8201D454
+"0x82C12340" = { name = "sub_82C12340" }  # ptr in .rdata @ 820201C8
+"0x82C12E88" = { name = "sub_82C12E88" }  # gap 82C12E88-82C12F98
+"0x82C15AD0" = { name = "sub_82C15AD0" }  # ptr in .rdata @ 8202068C
+"0x82C2D768" = { name = "sub_82C2D768" }  # gap 82C2D768-82C2D770
+# TU2: unresolved, left to the scanner: "0x82C59638" = { name = "sub_82C59638" }  # ptr in .rdata @ 82023408
+# TU2: unresolved, left to the scanner: "0x82C5E410" = { name = "sub_82C5E410" }  # ptr in .rdata @ 82023594
+"0x82C74350" = { name = "sub_82C74350" }  # ptr in .rdata @ 82024450
+"0x82C74358" = { name = "sub_82C74358" }  # ptr in .rdata @ 820233EC
+"0x82C74360" = { name = "sub_82C74360" }  # ptr in .rdata @ 820233DC
+"0x82C74368" = { name = "sub_82C74368" }  # ptr in .rdata @ 8202447C
+"0x82C73A00" = { name = "sub_82C73A00" }  # TU2: adjustor thunk target, b from 0x82C74364
+"0x82C765D8" = { name = "sub_82C765D8" }  # ptr in .rdata @ 82024588
+"0x82C765F0" = { name = "sub_82C765F0" }  # ptr in .rdata @ 82024558
+"0x82C765F8" = { name = "sub_82C765F8" }  # ptr in .rdata @ 82024590
+"0x82C76628" = { name = "sub_82C76628" }  # ptr in .rdata @ 820244C4
+"0x82C76630" = { name = "sub_82C76630" }  # ptr in .rdata @ 82024550
+"0x82C76638" = { name = "sub_82C76638" }  # ptr in .rdata @ 82024458
+"0x82C78BC0" = { name = "sub_82C78BC0" }  # ptr in .rdata @ 820235B8
+"0x82C78C08" = { name = "sub_82C78C08" }  # ptr in .rdata @ 820235AC
+"0x82CD92C8" = { name = "sub_82CD92C8" }  # ptr in .rdata @ 8202BDF4
+"0x82CD9470" = { name = "sub_82CD9470" }  # ptr in .rdata @ 8202BFC4
+# TU2: duplicate (functions folded in TU2): "0x82CD9470" = { name = "sub_82CD9470" }  # ptr in .rdata @ 8202BFC8
+# TU2: duplicate (functions folded in TU2): "0x82CD9470" = { name = "sub_82CD9470" }  # ptr in .rdata @ 8202BFCC
+# TU2: duplicate (functions folded in TU2): "0x82CD9470" = { name = "sub_82CD9470" }  # ptr in .rdata @ 8202BFD0
+"0x82CD9940" = { name = "sub_82CD9940" }  # ptr in .rdata @ 8202C004
+# TU2: unresolved, left to the scanner: "0x82CC96D0" = { name = "sub_82CC96D0" }  # ptr in .rdata @ 8202BE18
+"0x82CD9970" = { name = "sub_82CD9970" }  # gap 82CD9970-82CD9A00
+"0x82D68B80" = { name = "sub_82D68B80" }  # gap 82D68B80-82D68B84
+"0x82D79DB0" = { name = "sub_82D79DB0" }  # ptr in .rdata @ 820577BC
+"0x82DA29A8" = { name = "sub_82DA29A8" }  # ptr in .rdata @ 82058814
+"0x82DB3988" = { name = "sub_82DB3988" }  # ptr in .rdata @ 82058BC0
+"0x82DC1F38" = { name = "sub_82DC1F38" }  # ptr in .rdata @ 820591E8
+"0x82DC2088" = { name = "sub_82DC2088" }  # ptr in .rdata @ 820591F4
+"0x82DC2110" = { name = "sub_82DC2110" }  # ptr in .rdata @ 820591F0
+"0x82E000F8" = { name = "sub_82E000F8" }  # gap 82E000F8-82E00120
+"0x82E2A330" = { name = "sub_82E2A330" }  # ptr in .rdata @ 8205D008
+"0x82E38560" = { name = "sub_82E38560" }  # ptr in .rdata @ 8205CFC8
+"0x82E76100" = { name = "sub_82E76100" }  # ptr in .rdata @ 8205F874
+"0x82F01488" = { name = "sub_82F01488" }  # gap 82F01488-82F014FC
+"0x82F80AD0" = { name = "sub_82F80AD0" }  # ptr in .rdata @ 8207B410
+"0x82FB05E8" = { name = "sub_82FB05E8" }  # ptr in .rdata @ 8207F988
+"0x82FBB118" = { name = "sub_82FBB118" }  # ptr in .rdata @ 8207FDEC
+"0x82FD1D08" = { name = "sub_82FD1D08" }  # ptr in .rdata @ 82088858
+"0x82FD1D10" = { name = "sub_82FD1D10" }  # ptr in .rdata @ 82088854
+"0x82FD1D18" = { name = "sub_82FD1D18" }  # ptr in .rdata @ 82088874
+"0x82FD1D20" = { name = "sub_82FD1D20" }  # ptr in .rdata @ 82088850
+"0x82FD1D28" = { name = "sub_82FD1D28" }  # ptr in .rdata @ 82088884
+# TU2: duplicate (functions folded in TU2): "0x82FD1D28" = { name = "sub_82FD1D28" }  # ptr in .rdata @ 8208885C
+"0x82FD1D30" = { name = "sub_82FD1D30" }  # ptr in .rdata @ 82088840
+"0x82FD6880" = { name = "sub_82FD6880" }  # ptr in .rdata @ 82088844
+# TU2: duplicate (functions folded in TU2): "0x82FD6880" = { name = "sub_82FD6880" }  # ptr in .rdata @ 82088864
+# TU2: duplicate (functions folded in TU2): "0x82FD6880" = { name = "sub_82FD6880" }  # ptr in .rdata @ 82088CBC
+"0x82FD6890" = { name = "sub_82FD6890" }  # ptr in .rdata @ 82088880
+"0x82FD6898" = { name = "sub_82FD6898" }  # ptr in .rdata @ 82088BB8
+"0x82FD6AD8" = { name = "sub_82FD6AD8" }  # ptr in .rdata @ 82088D24
+"0x82FD6B30" = { name = "sub_82FD6B30" }  # ptr in .rdata @ 82088CA0
+"0x82FD6B38" = { name = "sub_82FD6B38" }  # ptr in .rdata @ 82088878
+"0x82FD7218" = { name = "sub_82FD7218" }  # ptr in .rdata @ 82088D74
+"0x82FD7FE8" = { name = "sub_82FD7FE8" }  # ptr in .rdata @ 82088D0C
+# TU2: unresolved, left to the scanner: "0x82FCA978" = { name = "sub_82FCA978" }  # ptr in .rdata @ 82088E8C
+"0x82FDB898" = { name = "sub_82FDB898" }  # ptr in .rdata @ 82088F94
+"0x82FE91A8" = { name = "sub_82FE91A8" }  # ptr in .rdata @ 8208CE20
+"0x830128E8" = { name = "sub_830128E8" }  # ptr in .rdata @ 820A9AF0
+"0x83012948" = { name = "sub_83012948" }  # ptr in .rdata @ 820A9B10
+"0x83012978" = { name = "sub_83012978" }  # ptr in .rdata @ 820A9B20
+"0x830129A0" = { name = "sub_830129A0" }  # ptr in .rdata @ 820A9B48
+"0x830129A8" = { name = "sub_830129A8" }  # ptr in .rdata @ 820A9B4C
+"0x830129B0" = { name = "sub_830129B0" }  # ptr in .rdata @ 820A9B50
+"0x830129C0" = { name = "sub_830129C0" }  # ptr in .rdata @ 820A9B54
+"0x830129D0" = { name = "sub_830129D0" }  # ptr in .rdata @ 820A9B58
+"0x830129E0" = { name = "sub_830129E0" }  # ptr in .rdata @ 820A9B5C
+"0x830129F0" = { name = "sub_830129F0" }  # ptr in .rdata @ 820A9B60
+"0x83012A00" = { name = "sub_83012A00" }  # ptr in .rdata @ 820A9B64
+"0x83012A10" = { name = "sub_83012A10" }  # ptr in .rdata @ 820A9B68
+"0x83012A20" = { name = "sub_83012A20" }  # ptr in .rdata @ 820A9B6C
+"0x83012A30" = { name = "sub_83012A30" }  # ptr in .rdata @ 820A9B70
+"0x83012A70" = { name = "sub_83012A70" }  # ptr in .rdata @ 820A9B84
+"0x83012A78" = { name = "sub_83012A78" }  # ptr in .rdata @ 820A9B88
+"0x83012A80" = { name = "sub_83012A80" }  # ptr in .rdata @ 820A9B8C
+"0x83012A88" = { name = "sub_83012A88" }  # ptr in .rdata @ 820A9B90
+"0x83012AB0" = { name = "sub_83012AB0" }  # ptr in .rdata @ 820A9BA4
+"0x83012B00" = { name = "sub_83012B00" }  # ptr in .rdata @ 820A9BB4
+"0x83012B18" = { name = "sub_83012B18" }  # ptr in .rdata @ 820A9BB8
+"0x83012B50" = { name = "sub_83012B50" }  # ptr in .rdata @ 820A9BC0
+"0x83012B80" = { name = "sub_83012B80" }  # ptr in .rdata @ 820A9BC8
+"0x83012B98" = { name = "sub_83012B98" }  # ptr in .rdata @ 820A9BCC
+"0x83012BB0" = { name = "sub_83012BB0" }  # ptr in .rdata @ 820A9BD0
+"0x83012BE8" = { name = "sub_83012BE8" }  # ptr in .rdata @ 820A9BD8
+"0x83012C00" = { name = "sub_83012C00" }  # ptr in .rdata @ 820A9BDC
+"0x83012CB0" = { name = "sub_83012CB0" }  # ptr in .rdata @ 820A9BF0
+"0x8303DED8" = { name = "sub_8303DED8" }  # gap 8303DED8-8303DF30
+# TU2: unresolved, left to the scanner: "0x83076CF0" = { name = "sub_83076CF0" }  # ptr in .rdata @ 820B2F60
+"0x83094270" = { name = "sub_83094270" }  # ptr in .rdata @ 820B7194
+"0x83094C20" = { name = "sub_83094C20" }  # ptr in .rdata @ 820B735C
+"0x83094C28" = { name = "sub_83094C28" }  # ptr in .rdata @ 820B7168
+"0x830951F0" = { name = "sub_830951F0" }  # ptr in .rdata @ 820B7370
+"0x830B5F70" = { name = "sub_830B5F70" }  # ptr in .rdata @ 820B7BD8
+"0x830B5F78" = { name = "sub_830B5F78" }  # ptr in .rdata @ 820B7D64
+"0x830B5F88" = { name = "sub_830B5F88" }  # ptr in .rdata @ 820B7C78
+"0x830B9690" = { name = "sub_830B9690" }  # gap 830B9690-830B96A0
+"0x830B9E50" = { name = "sub_830B9E50" }  # ptr in .rdata @ 820B817C
+"0x830B9E68" = { name = "sub_830B9E68" }  # ptr in .rdata @ 820B8188
+"0x830B9E80" = { name = "sub_830B9E80" }  # ptr in .rdata @ 820B8180
+"0x830B9E98" = { name = "sub_830B9E98" }  # ptr in .rdata @ 820B8184
+"0x830B9EB0" = { name = "sub_830B9EB0" }  # ptr in .rdata @ 820B7338
+"0x830DACB8" = { name = "sub_830DACB8" }  # ptr in .rdata @ 820BB01C
+"0x830EA6D8" = { name = "sub_830EA6D8" }  # ptr in .rdata @ 820BBA24
+"0x830EAE48" = { name = "sub_830EAE48" }  # ptr in .rdata @ 820BBA40
+"0x830F8558" = { name = "sub_830F8558" }  # ptr in .rdata @ 820BC114
+"0x83115CB0" = { name = "sub_83115CB0" }  # ptr in .rdata @ 820BD1CC
+"0x8311F2B8" = { name = "sub_8311F2B8" }  # ptr in .rdata @ 820BE188
+"0x8311F318" = { name = "sub_8311F318" }  # ptr in .rdata @ 820BE190
+"0x83124180" = { name = "sub_83124180" }  # ptr in .rdata @ 820BE760
+"0x83126588" = { name = "sub_83126588" }  # ptr in .rdata @ 820BEA08
+"0x831265A8" = { name = "sub_831265A8" }  # ptr in .rdata @ 820BEA0C
+"0x831266F8" = { name = "sub_831266F8" }  # ptr in .rdata @ 820BEA24
+"0x83126728" = { name = "sub_83126728" }  # ptr in .rdata @ 820BEA28
+"0x83126758" = { name = "sub_83126758" }  # ptr in .rdata @ 820BE988
+"0x83169368" = { name = "sub_83169368" }  # ptr in .rdata @ 820BF3F0
+"0x831693A0" = { name = "sub_831693A0" }  # ptr in .rdata @ 820BF3F8
+# TU2: unresolved, left to the scanner: "0x83186E00" = { name = "sub_83186E00" }  # ptr in .rdata @ 820C01B8
+# TU2: unresolved, left to the scanner: "0x83186E08" = { name = "sub_83186E08" }  # ptr in .rdata @ 820C01BC
+"0x83196240" = { name = "sub_83196240" }  # ptr in .rdata @ 820C01DC
+"0x83254EB8" = { name = "sub_83254EB8" }  # ptr in .data @ 83270064
+"0x83254ED0" = { name = "sub_83254ED0" }  # ptr in .data @ 83270068
+"0x83254EE8" = { name = "sub_83254EE8" }  # ptr in .data @ 8327006C
+"0x83254F00" = { name = "sub_83254F00" }  # ptr in .data @ 83270070
+"0x83254F18" = { name = "sub_83254F18" }  # ptr in .data @ 83270074
+"0x83254F30" = { name = "sub_83254F30" }  # ptr in .data @ 83270078
+"0x83254F48" = { name = "sub_83254F48" }  # ptr in .data @ 8327007C
+"0x83254F60" = { name = "sub_83254F60" }  # ptr in .data @ 83270080
+"0x83254F78" = { name = "sub_83254F78" }  # ptr in .data @ 83270084
+"0x83254F90" = { name = "sub_83254F90" }  # ptr in .data @ 83270088
+"0x83254FA8" = { name = "sub_83254FA8" }  # ptr in .data @ 8327008C
+"0x83254FC0" = { name = "sub_83254FC0" }  # ptr in .data @ 83270090
+"0x83254FD8" = { name = "sub_83254FD8" }  # ptr in .data @ 83270094
+"0x83254FF0" = { name = "sub_83254FF0" }  # ptr in .data @ 83270098
+"0x83255008" = { name = "sub_83255008" }  # ptr in .data @ 8327009C
+"0x83255020" = { name = "sub_83255020" }  # ptr in .data @ 832700A0
+"0x83255038" = { name = "sub_83255038" }  # ptr in .data @ 832700A4
+"0x83255050" = { name = "sub_83255050" }  # ptr in .data @ 832700A8
+"0x83255068" = { name = "sub_83255068" }  # ptr in .data @ 832700AC
+"0x83255080" = { name = "sub_83255080" }  # ptr in .data @ 832700B0
+"0x83255098" = { name = "sub_83255098" }  # ptr in .data @ 832700B4
+"0x832550B0" = { name = "sub_832550B0" }  # ptr in .data @ 832700B8
+
+# Scanner pass 2 (gaps split at terminators): vtable call thunks and a
+# GMalloc wrapper after a tail bctr (runtime miss 0x8303DF08).
+# TU2: duplicate (functions folded in TU2): "0x82C12E88" = { name = "sub_82C12E88" }  # gap 82C12E88-82C12F98
+# TU2: duplicate (functions folded in TU2): "0x82C12E88" = { name = "sub_82C12E88" }  # gap 82C12E88-82C12F98
+# TU2: duplicate (functions folded in TU2): "0x82C12E88" = { name = "sub_82C12E88" }  # gap 82C12E88-82C12F98
+# TU2: duplicate (functions folded in TU2): "0x82C12E88" = { name = "sub_82C12E88" }  # gap 82C12E88-82C12F98
+# TU2: duplicate (functions folded in TU2): "0x82C12E88" = { name = "sub_82C12E88" }  # gap 82C12E88-82C12F98
+"0x82C12E98" = { name = "sub_82C12E98" }  # gap 82C12E88-82C12F98
+"0x82C12EA8" = { name = "sub_82C12EA8" }  # gap 82C12E88-82C12F98
+"0x82C12EB8" = { name = "sub_82C12EB8" }  # gap 82C12E88-82C12F98
+"0x82C12EC8" = { name = "sub_82C12EC8" }  # gap 82C12E88-82C12F98
+"0x82C12ED8" = { name = "sub_82C12ED8" }  # gap 82C12E88-82C12F98
+"0x82C12EE8" = { name = "sub_82C12EE8" }  # gap 82C12E88-82C12F98
+"0x82C12EF8" = { name = "sub_82C12EF8" }  # gap 82C12E88-82C12F98
+"0x82C12F08" = { name = "sub_82C12F08" }  # gap 82C12E88-82C12F98
+"0x82C12F18" = { name = "sub_82C12F18" }  # gap 82C12E88-82C12F98
+"0x82C12F88" = { name = "sub_82C12F88" }  # gap 82C12E88-82C12F98
+"0x82CD9980" = { name = "sub_82CD9980" }  # gap 82CD9980-82CD9A00
+"0x82CD9990" = { name = "sub_82CD9990" }  # gap 82CD9980-82CD9A00
+"0x82CD99A0" = { name = "sub_82CD99A0" }  # gap 82CD9980-82CD9A00
+"0x82CD99B0" = { name = "sub_82CD99B0" }  # gap 82CD9980-82CD9A00
+"0x82CD99C0" = { name = "sub_82CD99C0" }  # gap 82CD9980-82CD9A00
+"0x82CD99D0" = { name = "sub_82CD99D0" }  # gap 82CD9980-82CD9A00
+"0x82CD99E0" = { name = "sub_82CD99E0" }  # gap 82CD9980-82CD9A00
+"0x82CD99F0" = { name = "sub_82CD99F0" }  # gap 82CD9980-82CD9A00
+"0x8303DF08" = { name = "sub_8303DF08" }  # gap 8303DF08-8303DF30
+
+# TU2 (2026-11-03): base functions the TU2 discovery missed (located by code signature) and pointers in data to
+# uncovered code (find_missing_funcs.py on the TU2 image; SEH scope tables and import thunks left out).
+"0x823562B0" = { name = "sub_823562B0" }  # TU2: base sub_82356528 (8-insn signature)
+"0x82356470" = { name = "sub_82356470" }  # TU2: base sub_823566D8 (8-insn signature)
+"0x823A4EC0" = { name = "sub_823A4EC0" }  # TU2: base sub_823A50A0 (8-insn signature)
+"0x825286E8" = { name = "sub_825286E8" }  # TU2: base sub_82528DD0 (8-insn signature)
+"0x82647B78" = { name = "sub_82647B78" }  # TU2: base sub_82648008 (8-insn signature)
+"0x82723ED8" = { name = "sub_82723ED8" }  # TU2: base sub_827245F8 (8-insn signature)
+"0x82746E18" = { name = "sub_82746E18" }  # TU2: base sub_82747308 (8-insn signature)
+"0x8274C768" = { name = "sub_8274C768" }  # TU2: base sub_8274CC80 (8-insn signature)
+"0x827FF61C" = { name = "sub_827FF61C" }  # TU2: base sub_827F075C (8-insn signature)
+"0x8282B2D8" = { name = "sub_8282B2D8" }  # TU2: base sub_8281CCF8 (8-insn signature)
+"0x828322A8" = { name = "sub_828322A8" }  # TU2 scanner: ptr in .rdata @ 821B882C
+"0x8284D7C0" = { name = "sub_8284D7C0" }  # TU2: base sub_8283EC80 (8-insn signature)
+"0x8285B3A0" = { name = "sub_8285B3A0" }  # TU2 scanner: ptr in .rdata @ 8215BDE0
+"0x8285B3F0" = { name = "sub_8285B3F0" }  # TU2 scanner: ptr in .rdata @ 8215BDF4
+"0x8285B4D0" = { name = "sub_8285B4D0" }  # TU2: base sub_8284C980 (8-insn signature)
+"0x82867D90" = { name = "sub_82867D90" }  # TU2: base sub_828D3628 (8-insn signature)
+"0x828FC590" = { name = "sub_828FC590" }  # TU2: base sub_829AE708 (8-insn signature)
+"0x829489D8" = { name = "sub_829489D8" }  # TU2: base sub_8292D4E8 (8-insn signature)
+"0x82977AA0" = { name = "sub_82977AA0" }  # TU2 scanner: ptr in .data @ 8337A028
+"0x829F5E30" = { name = "sub_829F5E30" }  # TU2 scanner: ptr in .rdata @ 8222ADE4
+"0x82A85550" = { name = "sub_82A85550" }  # TU2: base sub_829655C8 (8-insn signature)
+"0x82AC6028" = { name = "sub_82AC6028" }  # TU2: base sub_82AB6020 (8-insn signature)
+"0x82ADC038" = { name = "sub_82ADC038" }  # TU2 scanner: ptr in .rdata @ 82001CA0
+"0x82ADC768" = { name = "sub_82ADC768" }  # TU2: base sub_82ACC680 (8-insn signature)
+"0x82B32F88" = { name = "sub_82B32F88" }  # TU2 scanner: ptr in .rdata @ 820026F4
+"0x82BD4A30" = { name = "sub_82BD4A30" }  # TU2: base sub_82BC48F8 (8-insn signature)
+"0x82BE7A00" = { name = "sub_82BE7A00" }  # TU2 scanner: ptr in .rdata @ 8200F050
+"0x82BEF658" = { name = "sub_82BEF658" }  # TU2 scanner: ptr in .rdata @ 8200F654
+"0x82BEF6B8" = { name = "sub_82BEF6B8" }  # TU2 scanner: ptr in .rdata @ 8200F64C
+"0x82BF1138" = { name = "sub_82BF1138" }  # TU2 scanner: ptr in .rdata @ 8200F558
+"0x82C00F68" = { name = "sub_82C00F68" }  # TU2 scanner: ptr in .rdata @ 8201E41C
+"0x82C12330" = { name = "sub_82C12330" }  # TU2: base sub_82C01FD8 (8-insn signature)
+"0x82C14280" = { name = "sub_82C14280" }  # TU2 scanner: ptr in .rdata @ 82020218
+"0x82C6E560" = { name = "sub_82C6E560" }  # TU2: base sub_82C5E428 (8-insn signature)
+"0x82C74328" = { name = "sub_82C74328" }  # TU2: base sub_82C642F8 (8-insn signature)
+"0x82C765D0" = { name = "sub_82C765D0" }  # TU2: base sub_82C664A0 (8-insn signature)
+"0x82C76608" = { name = "sub_82C76608" }  # TU2: base sub_82C664D8 (8-insn signature)
+"0x82C76610" = { name = "sub_82C76610" }  # TU2 scanner: ptr in .rdata @ 82024558
+"0x82C76618" = { name = "sub_82C76618" }  # TU2 scanner: ptr in .rdata @ 82024590
+"0x82CD9498" = { name = "sub_82CD9498" }  # TU2 scanner: ptr in .rdata @ 8202BFC4
+"0x82CD94C0" = { name = "sub_82CD94C0" }  # TU2 scanner: ptr in .rdata @ 8202BFC8
+"0x82CD94E8" = { name = "sub_82CD94E8" }  # TU2 scanner: ptr in .rdata @ 8202BFCC
+"0x82CD9510" = { name = "sub_82CD9510" }  # TU2 scanner: ptr in .rdata @ 8202BFD0
+"0x82CD9960" = { name = "sub_82CD9960" }  # TU2: base sub_82CC96D8 (8-insn signature)
+"0x82D79D80" = { name = "sub_82D79D80" }  # TU2 scanner: ptr in .rdata @ 820577C0
+"0x82F55A58" = { name = "sub_82F55A58" }  # TU2: base sub_82F45DC0 (8-insn signature)
+"0x82FD1D00" = { name = "sub_82FD1D00" }  # TU2: base sub_82FC1E08 (8-insn signature)
+"0x82FD6888" = { name = "sub_82FD6888" }  # TU2: base sub_82FC6B20 (8-insn signature)
+"0x82FD6B00" = { name = "sub_82FD6B00" }  # TU2 scanner: ptr in .rdata @ 82088CAC
+"0x82FD6B10" = { name = "sub_82FD6B10" }  # TU2 scanner: ptr in .rdata @ 82088BE0
+"0x82FD6B20" = { name = "sub_82FD6B20" }  # TU2 scanner: ptr in .rdata @ 82088860
+"0x82FD6B28" = { name = "sub_82FD6B28" }  # TU2: base sub_82FC6D78 (8-insn signature)
+"0x82FDA820" = { name = "sub_82FDA820" }  # TU2 scanner: ptr in .rdata @ 82088E8C
+"0x82FEA890" = { name = "sub_82FEA890" }  # TU2: base sub_82FDAA00 (8-insn signature)
+"0x830B97E4" = { name = "sub_830B97E4" }  # TU2: base sub_830AA71C (8-insn signature)
+"0x83196228" = { name = "sub_83196228" }  # TU2 scanner: ptr in .rdata @ 820C00D8
+"0x83196230" = { name = "sub_83196230" }  # TU2 scanner: ptr in .rdata @ 820C00DC
+"0x83196238" = { name = "sub_83196238" }  # TU2 scanner: ptr in .rdata @ 820AA490
+"0x8323B358" = { name = "sub_8323B358" }  # TU2: base sub_8322B188 (8-insn signature)
+"0x8325E2D0" = { name = "sub_8325E2D0" }  # TU2: base sub_8324E1C8 (8-insn signature)
+
+# me2-nx-deko-tu2 (2026-11-03): the gyro rows' current values into the Options movie (me2_gyro_menu.cpp): before
+# UBioSFHandler_Options::SetOptionsOnGUI's movie->Invoke("...SetOptions", 27 arguments).
+[[midasm_hook]]
+name = "Me2GyroSetOptionsArgs"
+address = 0x8293E370
+registers = ["r6", "r7"]
+
+# me2-nx-deko-tu2 (2026-11-04): subtitle size (me2_subtitles.cpp): each line wrapped in <font size> before UBioSubtitles'
+# movie->Invoke("setSubtitle", result, args, 5) in sub_8273EB20.
+[[midasm_hook]]
+name = "Me2SubtitleInvokeArgs"
+address = 0x8273EF4C
+registers = ["r4", "r6", "r7"]
+
+# 2026-11-04: the conversation's subtitles come from script (BioSFHandler_Conversation -> UBioSFPanel.InvokeMethodArgs,
+# sub_8273C7E0: movie->Invoke(name r4, result r5, args r6, count r7) at 0x8273C934); the same wrapping.
+[[midasm_hook]]
+name = "Me2SubtitleInvokeArgs"
+address = 0x8273C934
+registers = ["r4", "r6", "r7"]
