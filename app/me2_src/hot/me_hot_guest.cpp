@@ -39,6 +39,7 @@
 #include "n/n_82993E40.h"  // ME2: TMap<FName,V>::Find, material parameters (2 functions)
 #include "n/n_825464E0.h"  // ME2: bone records <-> skeletal mesh bone data swap
 #include "n/n_82A92C50.h"  // ME2: XDK SetVertex/PixelShaderConstantF fast paths (2 functions)
+#include "n/n_822EB710.h"  // ME2: UE3 pixel shader parameter setters (2 functions, constant setter inlined)
 #include "n/n_827DB288.h"  // ME2: UE3 texture + sampler setter with XDK SetTexture / filter setters inlined
 #include "n/n_822CDFF0.h"  // ME2: grouped sphere/frustum test (InitViews)
 #include "n/n_8279B210.h"  // ME2: LZX of appDecompressMemory (libmspack lzxd)
@@ -272,11 +273,49 @@ ME_HOT_CVAR(me2_hot_vs_consts, "Native sub_82A92C50 (XDK SetVertexShaderConstant
 ME_HOT_HOOK(82A92C50, me2_hot_vs_consts, me::hot::n_82A92C50)
 ME_HOT_CVAR(me2_hot_ps_consts, "Native sub_82A92D28 (XDK SetPixelShaderConstantF fast path), self-checked");
 ME_HOT_HOOK(82A92D28, me2_hot_ps_consts, me::hot::n_82A92D28)
+// ME2 (2026-11-06): UE3's pixel shader parameter setters with the scratch padding and the XDK constant setter inlined
+// (n_822EB710.h): 2.3 % + 2.2 % of the UE3 render thread in the console stacks of 2026-11-05 23:5x.
+ME_HOT_CVAR(me2_hot_ps_value, "Native sub_822EB710 (UE3 SetPixelShaderValue, one float), self-checked");
+ME_HOT_HOOK(822EB710, me2_hot_ps_value, me::hot::n_822EB710)
+ME_HOT_CVAR(me2_hot_ps_values, "Native sub_822C8C10 (UE3 SetPixelShaderValues, a float4 array element), self-checked");
+ME_HOT_HOOK(822C8C10, me2_hot_ps_values, me::hot::n_822C8C10)
 // ME2 (2026-10-27): UE3's texture + sampler setter of the material parameters with the XDK SetTexture and the two
 // filter setters inlined (n_827DB288.h): 827DB288 + 82A9AF70 + 82A9D268/82A9D0C0 ~5.5 % of the UE3 render thread in the
 // console stacks of 22:2x / 22:5x.
 ME_HOT_CVAR(me2_hot_texture_sampler, "Native sub_827DB288 (UE3 texture + sampler setter, XDK SetTexture inlined), self-checked");
-ME_HOT_HOOK(827DB288, me2_hot_texture_sampler, me::hot::n_827DB288)
+// Expanded ME_HOT_HOOK with the me2_texbind_diag bracket (me2_shadow_diag.cpp; returns false when the diag is off).
+extern "C" bool Me2TexBindBegin(const uint8_t* base, uint32_t s);
+extern "C" void Me2TexBindEnd(const uint8_t* base);
+namespace me::hot::n_827DB288 {
+bool ShadowNative(PPCContext&, uint8_t*);
+}
+REX_EXTERN(__imp__sub_827DB288);
+static void Hot827DB288(PPCContext& ctx, uint8_t* base) {
+  static thread_local uint32_t n_calls;
+  static me::hot::Hook h{"sub_827DB288", &__imp__sub_827DB288, &me::hot::NativeB<&me::hot::n_827DB288::Native>,
+                         &me::hot::n_827DB288::ShadowNative, &me::hot::n_827DB288::Writes, me::hot::n_827DB288::kCmp};
+  const uint8_t st = h.state.load(std::memory_order_relaxed);
+  if (st == me::hot::kOn) [[likely]] {
+    me::hot::Dispatch<&me::hot::n_827DB288::Native>(h, n_calls, ctx, base);
+    return;
+  }
+  if (st == me::hot::kUninit) [[unlikely]] {
+    me::hot::InitHook(h, REXCVAR_GET(me2_hot_texture_sampler), true);
+    if (h.state.load(std::memory_order_relaxed) == me::hot::kOn) {
+      me::hot::Dispatch<&me::hot::n_827DB288::Native>(h, n_calls, ctx, base);
+      return;
+    }
+  }
+  __imp__sub_827DB288(ctx, base);
+}
+REX_HOOK_RAW(sub_827DB288) {
+  if (!Me2TexBindBegin(base, ctx.r3.u32)) [[likely]] {
+    Hot827DB288(ctx, base);
+    return;
+  }
+  Hot827DB288(ctx, base);
+  Me2TexBindEnd(base);
+}
 
 // Same visibility decisions with less VMX register marshalling on complex levels.
 ME_HOT_CVAR(me2_hot_frustum_sphere, "Native sub_822CDFF0 (sphere vs plane groups in InitViews), self-checked");

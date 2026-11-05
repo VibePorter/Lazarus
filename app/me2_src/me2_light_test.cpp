@@ -21,6 +21,11 @@
 // Self-checked like the hot natives: the first me2_light_test_checks early answers and then one in
 // me2_light_test_check_every also run the original; a different answer logs "[light-test] DIFFERENCE" and turns the
 // early answer off for the session.
+//
+// 2026-11-05 (console stacks, Omega standing, build 19:15): ~20k calls a frame, and 6.2 % of the UE3 render thread sat
+// on this hook's two shared atomic counters (ldxr/stxr on a cache line next to globals other cores write) plus the
+// function-local static guards (ldar each call) - more than the test itself. The counters are now per thread, added
+// to the shared ones once every 4096 calls; the cvars are read once into plain values.
 #include <rex/cvar.h>
 #include <rex/hook.h>
 #include <rex/logging.h>
@@ -47,9 +52,28 @@ REXCVAR_DEFINE_INT32(me2_light_test_check_every, 1024, "ME2",
 
 namespace {
 
-std::atomic<bool> g_off{false};
-std::atomic<uint64_t> g_calls{0}, g_early{0}, g_checked{0};
+alignas(64) std::atomic<bool> g_off{false};  // read every call: own cache line, away from written globals
+alignas(64) std::atomic<uint64_t> g_calls{0}, g_early{0}, g_checked{0};
 std::atomic<int64_t> g_last_report{0};
+
+// Per-thread counts (UE3 calls this from its render thread), added to g_calls / g_early every 4096 calls.
+thread_local uint32_t t_calls = 0, t_early = 0;
+thread_local uint64_t t_early_total = 0;  // this thread's early answers (picks the ones to check)
+
+// The cvars, read once (relaxed atomics: plain loads, no static-guard barrier on every call).
+alignas(64) std::atomic<int> g_cfg{0};  // 0 not read, 1 on, 2 off
+uint64_t g_checks = 0, g_every = 0;
+[[maybe_unused]] alignas(64) char g_pad_after_cfg = 0;  // keeps the next globals off g_cfg's cache line
+inline bool Enabled() {
+  int c = g_cfg.load(std::memory_order_relaxed);
+  if (c == 0) [[unlikely]] {
+    g_checks = uint64_t(REXCVAR_GET(me2_light_test_checks));
+    g_every = uint64_t(REXCVAR_GET(me2_light_test_check_every));
+    c = REXCVAR_GET(me2_light_test_fast) ? 1 : 2;
+    g_cfg.store(c, std::memory_order_release);
+  }
+  return c == 1;
+}
 
 inline float LoadF(const uint8_t* base, uint32_t ea) {
   uint32_t bits;
@@ -94,19 +118,21 @@ void Report() {
 
 REX_EXTERN(__imp__sub_82688188);
 REX_HOOK_RAW(sub_82688188) {
-  static const bool enabled = REXCVAR_GET(me2_light_test_fast);
-  if (!enabled) {
+  if (!Enabled()) {
     __imp__sub_82688188(ctx, base);
     return;
   }
-  if (((g_calls.fetch_add(1, std::memory_order_relaxed) + 1) & 4095) == 0)
+  if (++t_calls == 4096) [[unlikely]] {
+    g_calls.fetch_add(t_calls, std::memory_order_relaxed);
+    g_early.fetch_add(t_early, std::memory_order_relaxed);
+    t_calls = t_early = 0;
     Report();
+  }
   if (ctx.r5.u32 != 0 && !g_off.load(std::memory_order_relaxed) &&
       ClearlyApart(base, ctx.r3.u32, ctx.r4.u32)) {
-    const uint64_t n = g_early.fetch_add(1, std::memory_order_relaxed) + 1;
-    static const uint64_t checks = uint64_t(REXCVAR_GET(me2_light_test_checks));
-    static const uint64_t every = uint64_t(REXCVAR_GET(me2_light_test_check_every));
-    if (n <= checks || (every && n % every == 0)) {
+    ++t_early;
+    const uint64_t n = ++t_early_total;
+    if (n <= g_checks || (g_every && n % g_every == 0)) [[unlikely]] {
       const uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32, r5 = ctx.r5.u32;
       __imp__sub_82688188(ctx, base);
       g_checked.fetch_add(1, std::memory_order_relaxed);

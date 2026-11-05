@@ -116,6 +116,8 @@ add_library(mgr_renut_gpu OBJECT
     "${CMAKE_SOURCE_DIR}/src/renut_engine/gpu/sa2_renut_pacing.cpp"
     # ME2 (2026-10-27): the guest occlusion queries' hooks need Renut's renderer headers (plume), so they build here.
     "${CMAKE_SOURCE_DIR}/me2_src/me2_occlusion.cpp"
+    # ME2 (2026-11-05): the occlusion rasterizer (me2_occlusion_cpu_source 1).
+    "${CMAKE_SOURCE_DIR}/me2_src/me2_occlusion_raster.cpp"
     # ME2 (2026-10-31): frame diagnostics (GC timing, frame spikes; reads plume's deko3d counters).
     "${CMAKE_SOURCE_DIR}/me2_src/me2_frame_diag.cpp")
 target_include_directories(mgr_renut_gpu PRIVATE

@@ -31,9 +31,33 @@ REXCVAR_DEFINE_BOOL(me2_guest_skip_prepass, true, "ME2",
                     "drawing): fewer draws for the UE3 render thread, Renut and the GPU; the base pass writes depth")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+// 2026-11-05: with the occlusion rasterizer answering Umbra (me2_occlusion_umbra_cpu 2, me2_occlusion_cpu_source 1),
+// Umbra draws no test boxes, so nothing of the frame reads the prepass depth for Umbra; the prepass is then skipped
+// frame by frame (also in the "raster" A/B rotation: the GPU slots keep it, their latent answers need it).
+REXCVAR_DEFINE_BOOL(me2_prepass_skip_with_raster, true, "ME2",
+                    "Skip the scene depth prepass in frames whose Umbra view the occlusion rasterizer answers (no GPU "
+                    "test boxes need its depth); levels without Umbra and the GPU path keep it")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+extern "C" bool Me2OcclusionRasterAnswersFrame();  // me2_occlusion.cpp
+
 namespace {
 std::atomic<int> g_skip{-1};  // -1 = not read yet (no function-local static guard on a per-frame path)
 std::atomic<uint64_t> g_skipped{0};
+std::atomic<int> g_skip_raster{-1};
+std::atomic<uint64_t> g_skipped_raster{0};
+// The rasterizer answers this frame: the prepass goes. Logged as "[occlusion-prepass]" (the console quiets "[prepass]").
+bool SkipForRaster(const char* which) {
+  int on = g_skip_raster.load(std::memory_order_relaxed);
+  if (on < 0) {
+    on = REXCVAR_GET(me2_prepass_skip_with_raster) ? 1 : 0;
+    g_skip_raster.store(on, std::memory_order_relaxed);
+  }
+  if (!on || !Me2OcclusionRasterAnswersFrame()) return false;
+  const uint64_t n = g_skipped_raster.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (n == 1 || (n & 0xFFF) == 0)
+    REXLOG_INFO("[occlusion-prepass] depth prepass skipped in rasterizer frames ({} calls so far, last {})", n, which);
+  return true;
+}
 }  // namespace
 
 #if defined(ME2_WRITE_CENSUS)
@@ -46,6 +70,10 @@ REX_HOOK_RAW(sub_82748018) {
   if (skip < 0) {
     skip = REXCVAR_GET(me2_guest_skip_prepass) ? 1 : 0;
     g_skip.store(skip, std::memory_order_relaxed);
+  }
+  if (!skip && SkipForRaster("RenderDPGPrePass")) {
+    ctx.r3.u64 = 0;
+    return;
   }
   if (!skip) {
 #if defined(ME2_WRITE_CENSUS)
@@ -84,11 +112,17 @@ REXCVAR_DEFINE_BOOL(me2_prepass_static_only, false, "ME2",
 REX_EXTERN(__imp__sub_8269F3E8);  // static draw list (DPG +48)
 REX_EXTERN(__imp__sub_8269F540);  // static draw lists (DPG +76, +104)
 REX_EXTERN(__imp__sub_8269D6A0);
+extern "C" void Me2RasterNotePrepassScene(uint32_t scene);  // me2_occlusion_raster.cpp: [renderer +0] = its FScene?
 REX_HOOK_RAW(sub_8269D6A0) {
+  Me2RasterNotePrepassScene(__builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + ctx.r3.u32)));
   int skip = g_skip.load(std::memory_order_relaxed);
   if (skip < 0) {
     skip = REXCVAR_GET(me2_guest_skip_prepass) ? 1 : 0;
     g_skip.store(skip, std::memory_order_relaxed);
+  }
+  if (!skip && SkipForRaster("sub_8269D6A0")) {
+    ctx.r3.u64 = 0;
+    return;
   }
   if (!skip) {
     static const bool static_only = REXCVAR_GET(me2_prepass_static_only);

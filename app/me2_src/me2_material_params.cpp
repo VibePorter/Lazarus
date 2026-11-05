@@ -36,6 +36,16 @@
 // (so not a parameter update between commands: its value depends on something outside the key). Since 2026-11-01 such a
 // material is evaluated on every call from then on and the cache stays on for the others (up to 64 materials, then the
 // cache is off for the session; before, the first difference turned it off).
+//
+// 2026-11-05: the cache above keys on the shader's parameter list (params), so an object's base pass and its light
+// passes (other shaders, same material) never share it, and the console's stacks put 20 % of the UE3 render thread in
+// this function (the per-object draws of 8254AD38 -> 8267F140 -> 82675940 -> 8267A668 most). me2_material_params_expr
+// (default on) keys the evaluated values by the uniform expression itself instead: (expression, material render proxy,
+// time, real time, view, render command), so every pass and every object with the same material instance reuses them;
+// the params-level cache is then not used. Self-checked per expression (an expression that ever differs is evaluated
+// on every call from then on). me2_material_params_prefetch (default on): the textures are found first and the memory
+// the binds read (the texture parameter, its sampler state, the D3D texture's header) is prefetched while the vector
+// parameters are set. "material" in me2_ab_cycle turns the whole native off in its slots (fps A/B).
 #include <rex/cvar.h>
 #include <rex/hook.h>
 #include <rex/logging.h>
@@ -51,10 +61,18 @@
 #include <vector>
 
 #include "hot/me_hot_common.h"
+#include "me2_ab_cycle.h"
 
 REXCVAR_DEFINE_BOOL(me2_material_params, false, "ME2",
                     "Native sub_825DCDA0 (UE3's material shader parameter setup) with the evaluated values kept for "
                     "the rest of the frame on the render thread, self-checked")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(me2_material_params_expr, true, "ME2",
+                    "me2_material_params: keep the evaluated values per uniform expression (shared by every pass and "
+                    "object with the same material instance) instead of per shader parameter list")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(me2_material_params_prefetch, true, "ME2",
+                    "me2_material_params: find the textures first and prefetch what their binds read")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(me2_material_params_ab_s, 0, "ME2",
                      "A/B: me2_material_params on and off in turn every this many seconds; 0 = always on")
@@ -163,6 +181,7 @@ std::chrono::steady_clock::time_point g_report = std::chrono::steady_clock::now(
 bool On() {
   static const bool on = REXCVAR_GET(me2_material_params);
   if (!on || g_disabled.load(std::memory_order_relaxed)) return false;
+  if (Me2AbOff(Me2Ab::kMaterial)) return false;
   static const int32_t ab_s = REXCVAR_GET(me2_material_params_ab_s);
   if (ab_s > 0) {
     static const auto start = std::chrono::steady_clock::now();
@@ -192,6 +211,86 @@ bool On() {
   return true;
 }
 
+// The expression-level cache (me2_material_params_expr): one value per (expression, proxy, time, real time, view,
+// render command, kind). Owner thread only, like the rest.
+struct XEntry {
+  uint64_t epoch = 0;  // Me2RenderCommandEpoch (0 = empty)
+  uint32_t expr = 0, proxy = 0, time = 0, real_time = 0, view = 0, kind = 0;
+  uint32_t w[4] = {};
+};
+constexpr uint32_t kXEntries = 16384;
+XEntry g_xcache[kXEntries];
+uint64_t g_xepoch = 0;  // the render command of the current setup
+struct XStats {
+  uint64_t lookups = 0, hits = 0, setups = 0, checked = 0, frames0 = 0;
+} g_x;
+std::vector<uint32_t> g_x_excluded;
+bool g_x_off = false;
+int64_t g_x_checks_left = -1;
+uint32_t g_x_since_check = 0;
+bool XOn() {
+  static const bool on = REXCVAR_GET(me2_material_params_expr);
+  return on && !g_x_off;
+}
+XEntry& XSlot(uint32_t expr, uint32_t proxy, uint32_t time, uint32_t view, uint32_t kind) {
+  uint64_t h = uint64_t(expr) * 0x9E3779B97F4A7C15ull ^ uint64_t(proxy) * 0xC2B2AE3D27D4EB4Full ^
+               uint64_t(view) * 0x165667B19E3779F9ull ^ (uint64_t(time) << 29) ^ kind;
+  h ^= h >> 29;
+  return g_xcache[h & (kXEntries - 1)];
+}
+// 0: not cached (evaluate, then XStore), 1: a hit (value in w), 2: a hit to check (evaluate, then XCheck).
+int XFind(uint32_t expr, uint32_t context, const uint8_t* base, uint32_t kind, uint32_t w[4], XEntry** slot) {
+  const uint32_t proxy = Ld32(base, context), time = Ld32(base, context + 4), real_time = Ld32(base, context + 8),
+                 view = Ld32(base, context + 12);
+  XEntry& e = XSlot(expr, proxy, time, view, kind);
+  *slot = &e;
+  ++g_x.lookups;
+  if (e.epoch != g_xepoch || e.expr != expr || e.proxy != proxy || e.time != time || e.real_time != real_time ||
+      e.view != view || e.kind != kind)
+    return 0;
+  if (!g_x_excluded.empty() && std::find(g_x_excluded.begin(), g_x_excluded.end(), expr) != g_x_excluded.end())
+    return 0;
+  ++g_x.hits;
+  std::memcpy(w, e.w, 16);
+  if (g_x_checks_left < 0) g_x_checks_left = REXCVAR_GET(me2_material_params_checks);
+  static const int32_t every = REXCVAR_GET(me2_material_params_check_every);
+  if (g_x_checks_left > 0) {
+    --g_x_checks_left;
+    ++g_x.checked;
+    return 2;
+  }
+  if (every > 0 && ++g_x_since_check >= uint32_t(every)) {
+    g_x_since_check = 0;
+    ++g_x.checked;
+    return 2;
+  }
+  return 1;
+}
+void XStore(XEntry* e, uint32_t expr, uint32_t context, const uint8_t* base, uint32_t kind, const uint32_t w[4]) {
+  e->epoch = g_xepoch;
+  e->expr = expr;
+  e->proxy = Ld32(base, context);
+  e->time = Ld32(base, context + 4);
+  e->real_time = Ld32(base, context + 8);
+  e->view = Ld32(base, context + 12);
+  e->kind = kind;
+  std::memcpy(e->w, w, 16);
+}
+// A checked hit: the fresh value against the kept one.
+void XCheck(XEntry* e, uint32_t expr, uint32_t kind, const uint32_t fresh[4], const uint32_t kept[4]) {
+  if (std::memcmp(fresh, kept, kind == 2 ? 4 : 16) == 0) return;
+  REXLOG_ERROR("[material-params] DIFFERENCE: expression {:08X} (kind {}) proxy {:08X}: {:08X} {:08X} {:08X} {:08X}, "
+               "kept {:08X} {:08X} {:08X} {:08X}; evaluated on every call from now on",
+               expr, kind, e->proxy, fresh[0], fresh[1], fresh[2], fresh[3], kept[0], kept[1], kept[2], kept[3]);
+  e->epoch = 0;
+  if (g_x_excluded.size() >= 256) {
+    g_x_off = true;
+    REXLOG_ERROR("[material-params] 256 expressions excluded: the expression cache is off for this session");
+    return;
+  }
+  g_x_excluded.push_back(expr);
+}
+
 void Report() {
   const auto now = std::chrono::steady_clock::now();
   if (now - g_report < std::chrono::seconds(10)) return;
@@ -199,6 +298,15 @@ void Report() {
               "{} by the original (no material); {} hits checked so far; {} owner thread(s) so far{}",
               g_hits, g_misses, g_hits + g_misses ? 100.0 * double(g_hits) / double(g_hits + g_misses) : 0.0,
               g_original, g_checked, g_owners, g_disabled.load(std::memory_order_relaxed) ? " (OFF after a difference)" : "");
+  if (g_x.lookups)
+    REXLOG_INFO("[material-params] expressions last ~10 s: {} setups ({:.0f} a frame), {} expression values: {} from "
+                "the command's values ({:.0f} %), {} evaluated; {} hits checked so far, {} expression(s) excluded{}",
+                g_x.setups,
+                double(g_x.setups) / std::max<double>(1.0, double(g_sa2_game_frames.load() - g_x.frames0)),
+                g_x.lookups, g_x.hits, 100.0 * double(g_x.hits) / double(g_x.lookups), g_x.lookups - g_x.hits,
+                g_x.checked, g_x_excluded.size(), g_x_off ? " (expression cache OFF)" : "");
+  g_x.lookups = g_x.hits = g_x.setups = 0;
+  g_x.frames0 = g_sa2_game_frames.load();
   g_hits = g_misses = g_original = 0;
   g_report = now;
 }
@@ -219,11 +327,20 @@ void EvalVector(PPCContext& ctx, uint8_t* base, uint32_t frame, uint32_t entry, 
   const uint32_t data_off = type == 15 ? 72 : 60;
   if (material && int32_t(index) < int32_t(Ld32(base, material + data_off + 4))) {
     const uint32_t expr = Ld32(base, Ld32(base, material + data_off) + (index << 2));
+    XEntry* slot = nullptr;
+    uint32_t kept[4];
+    const int found = XOn() ? XFind(expr, context, base, 1, kept, &slot) : 0;
+    if (found == 1) {
+      std::memcpy(w, kept, 16);
+      return;  // SetVector stores it into buf before the setter, as the evaluation would have left it
+    }
     ctx.r3.u64 = expr;
     ctx.r4.u64 = context;
     ctx.r5.u64 = buf;
     CallVirtual(ctx, base, expr, 12);
     Load4(base, buf, w);
+    if (found == 2) XCheck(slot, expr, 1, w, kept);
+    else if (slot) XStore(slot, expr, context, base, 1, w);
     return;
   }
   if (type == 15) {
@@ -247,11 +364,23 @@ uint32_t EvalTexture(PPCContext& ctx, uint8_t* base, uint32_t frame, uint32_t en
     // (the original then evaluates anyway: same below)
   }
   const uint32_t expr = Ld32(base, Ld32(base, material + data_off) + (index << 2));
-  ctx.r3.u64 = expr;
-  ctx.r4.u64 = context;
-  ctx.r5.u64 = frame + 80;
-  CallVirtual(ctx, base, expr, 16);
-  uint32_t tex = Ld32(base, frame + 80);
+  XEntry* slot = nullptr;
+  uint32_t kept[4] = {};
+  const int found = XOn() ? XFind(expr, context, base, 2, kept, &slot) : 0;
+  uint32_t tex;
+  if (found == 1) {
+    tex = kept[0];
+    St32(base, frame + 80, tex);
+  } else {
+    ctx.r3.u64 = expr;
+    ctx.r4.u64 = context;
+    ctx.r5.u64 = frame + 80;
+    CallVirtual(ctx, base, expr, 16);
+    tex = Ld32(base, frame + 80);
+    const uint32_t fresh[4] = {tex, 0, 0, 0};
+    if (found == 2) XCheck(slot, expr, 2, fresh, kept);
+    else if (slot) XStore(slot, expr, context, base, 2, fresh);
+  }
   if (!tex) {
     tex = Ld32(base, fallback);
     St32(base, frame + 80, tex);
@@ -344,7 +473,11 @@ void Native(PPCContext& ctx, uint8_t* base) {
     g_take_over = false;
     for (Entry& entry : g_cache) entry.frame = 0;
     g_values_frame = 0;
+    for (XEntry& x : g_xcache) x.epoch = 0;
   }
+  g_xepoch = now_frame;
+  ++g_x.setups;
+  const bool xmode = XOn();
   if (g_values_frame != now_frame) {
     g_values.clear();
     g_values_frame = now_frame;
@@ -353,7 +486,7 @@ void Native(PPCContext& ctx, uint8_t* base) {
                uint64_t(view) * 0x165667B19E3779F9ull ^ uint64_t(material) ^ (uint64_t(time) << 32);
   h ^= h >> 31;
   Entry& e = g_cache[h & (kEntries - 1)];
-  const bool excluded = Excluded(material);
+  const bool excluded = xmode || Excluded(material);  // the expression cache replaces the params-level one
   const bool hit = !excluded && e.frame == now_frame && e.params == params && e.proxy == proxy && e.material == material &&
                    e.time == time && e.real_time == real_time && e.view == view && e.vectors == vec_count &&
                    e.textures == tex_count && e.first + vec_count + tex_count <= g_values.size();
@@ -381,6 +514,22 @@ void Native(PPCContext& ctx, uint8_t* base) {
   uint32_t first = uint32_t(g_values.size());
   if (record) g_values.resize(g_values.size() + vec_count + tex_count);
 
+  // me2_material_params_prefetch: the textures first (their evaluation only reads), the texture parameter's line
+  // prefetched; after the vectors the sampler state and the D3D texture; the D3D texture's header one bind ahead.
+  static const bool prefetch = REXCVAR_GET(me2_material_params_prefetch);
+  constexpr uint32_t kMaxPre = 32;
+  uint32_t pre_tex[kMaxPre];
+  const bool pre = prefetch && xmode && !hit && tex_count <= kMaxPre;
+  if (pre) {
+    for (uint32_t j = 0; j < tex_count; ++j) {
+      const uint32_t entry = tex_data + 16u * j;
+      const uint32_t type = Ld8(base, entry);
+      pre_tex[j] = 0;
+      if (type != 16 && type != 32) continue;
+      pre_tex[j] = EvalTexture(ctx, base, frame, entry, type, material, context);
+      if (GuestOk(pre_tex[j]) && Ld16(base, entry + 10)) __builtin_prefetch(base + pre_tex[j] + 20);
+    }
+  }
   for (uint32_t i = 0; i < vec_count; ++i) {
     const uint32_t entry = vec_data + 16u * i;
     const uint32_t type = Ld8(base, entry);
@@ -401,10 +550,33 @@ void Native(PPCContext& ctx, uint8_t* base) {
     }
     SetVector(ctx, base, frame, entry, type, w);
   }
+  if (pre) {
+    for (uint32_t j = 0; j < tex_count; ++j) {
+      const uint32_t tex = pre_tex[j];
+      if (!GuestOk(tex) || !Ld16(base, tex_data + 16u * j + 10)) continue;
+      const uint32_t t = Ld32(base, tex + 20), p = Ld32(base, tex + 24);
+      if (GuestOk(t)) __builtin_prefetch(base + t + 8);
+      if (GuestOk(p)) __builtin_prefetch(base + p);
+    }
+  }
   for (uint32_t j = 0; j < tex_count; ++j) {
     const uint32_t entry = tex_data + 16u * j;
     const uint32_t type = Ld8(base, entry);
     if (type != 16 && type != 32) continue;
+    if (pre) {
+      // the next bound texture's D3D header (the line of its +8 pointer was prefetched above)
+      for (uint32_t k = j + 1; k < tex_count; ++k) {
+        const uint32_t nt = pre_tex[k];
+        if (!GuestOk(nt) || !Ld16(base, tex_data + 16u * k + 10)) continue;
+        const uint32_t t = Ld32(base, nt + 20);
+        const uint32_t dt = GuestOk(t) ? Ld32(base, t + 8) : 0;
+        if (GuestOk(dt)) __builtin_prefetch(base + dt + 28);
+        break;
+      }
+      St32(base, frame + 80, pre_tex[j]);
+      SetTexture(ctx, base, entry, pre_tex[j]);
+      continue;
+    }
     uint32_t tex;
     if (hit && !check) {
       tex = g_values[e.first + vec_count + j].w[0];
@@ -443,11 +615,16 @@ void Native(PPCContext& ctx, uint8_t* base) {
 
 }  // namespace
 
+extern "C" uint64_t Me2ElemTimeBegin();     // me2_shadow_diag.cpp (me2_element_timing)
+extern "C" void Me2ElemTimeEnd(uint64_t t0);
 REX_HOOK_RAW(sub_825DCDA0) {
+  const uint64_t timed = Me2ElemTimeBegin();
   if (!On() || !GuestOk(ctx.r3.u32) || !GuestOk(ctx.r4.u32)) {
     __imp__sub_825DCDA0(ctx, base);
+    Me2ElemTimeEnd(timed);
     return;
   }
   Native(ctx, base);
+  Me2ElemTimeEnd(timed);
   Report();
 }

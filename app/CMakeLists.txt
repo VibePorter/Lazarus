@@ -60,6 +60,14 @@ if(REXGLUE_PLATFORM_SWITCH)
 else()
     rexglue_setup_target(sa2 GPU_PLUGINS xenos)
 endif()
+# me2-nx-deko (2026-11-03): diagnostic write census of UE3 render-thread phases (app/me2_src/me2_write_census.cpp):
+# every guest store also checks a flag. Never for a release build. 2026-11-04: also on PC (me2_census_device, the
+# device census for tools/watch_marks.py).
+option(ME2_WRITE_CENSUS "Diagnostic: write census of guest stores (slower guest stores)" OFF)
+if(ME2_WRITE_CENSUS)
+    target_compile_definitions(sa2_recomp PRIVATE ME2_WRITE_CENSUS)
+    target_compile_definitions(sa2 PRIVATE ME2_WRITE_CENSUS)
+endif()
 
 # The app includes xxhash.h (and later the renderer renderdoc_app.h) directly; when the SDK is built from source they
 # are private to its libraries (the same block as CMakeLists.sa2.txt).
@@ -178,6 +186,10 @@ if(MGR_RENUT_RENDERER)
             me2_src/me2_material_params.cpp
             me2_src/me2_light_test.cpp
             me2_src/me2_write_census.cpp
+            me2_src/me2_ab_cycle.cpp
+            me2_src/me2_shadow_diag.cpp
+            me2_src/me2_drawlist_diag.cpp
+            me2_src/me2_relink.cpp
             me2_src/me2_crowd_cpu.cpp
             me2_src/me2_anim_lod.cpp
             me2_src/me2_cerberus.cpp
@@ -291,13 +303,6 @@ if(REXGLUE_PLATFORM_SWITCH)
     option(ME2_GEN_FLOAT_FORMS "Float forms of guest sign and single-precision operations" ON)
     if(NOT ME2_GEN_FLOAT_FORMS)
         target_compile_definitions(sa2_recomp PRIVATE REX_FP_SIGN_INTEGER REX_SINGLE_FLOATS_OFF)
-    endif()
-    # me2-nx-deko (2026-11-03): diagnostic write census of UE3 render-thread phases (app/me2_src/me2_write_census.cpp):
-    # every guest store also checks a flag. Never for the release NRO.
-    option(ME2_WRITE_CENSUS "Diagnostic: write census of UE3 render-thread phases (slower guest stores)" OFF)
-    if(ME2_WRITE_CENSUS)
-        target_compile_definitions(sa2_recomp PRIVATE ME2_WRITE_CENSUS)
-        target_compile_definitions(sa2 PRIVATE ME2_WRITE_CENSUS)
     endif()
     # One startup-only function registers ~85k guest functions. GCC's -O3
     # optimization of that single basic block consumed >7 GB on the host.

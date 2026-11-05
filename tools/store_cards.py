@@ -59,9 +59,20 @@ MACROS = MARKER + '''
 #elif defined(ME2_WRITE_CENSUS)
 // me2-nx-deko (2026-11-03, diagnostic builds only: CMake ME2_WRITE_CENSUS): every guest store outside the stack is
 // also offered to the write census (app/me2_src/me2_write_census.cpp) while one is running.
+// me2-nx-deko (2026-11-04): with the store's source line (me2_census_device: which guest functions write the device).
+// g_me2_census_on: bit 0 the phase census (every store), bit 1 the device census (stores into g_me2_watch's range).
 extern "C" volatile unsigned char g_me2_census_on;
-extern "C" void Me2CensusNote(unsigned ea);
-#define REX_CARD(ea) ((void)(*(u8*)(base + ((u32)(ea) >> 12)) = 0),                       (__builtin_expect(g_me2_census_on, 0) ? Me2CensusNote((u32)(ea)) : (void)0))
+extern "C" void Me2CensusNoteAt(unsigned ea, const char* file, unsigned line);
+#ifndef REX_WATCHED_RANGE_DEFINED
+#define REX_WATCHED_RANGE_DEFINED
+struct RexWatchedRange {
+  uint32_t lo;
+  uint32_t span;
+  uint64_t dirty[4];
+};
+#endif
+extern "C" RexWatchedRange g_me2_watch;
+#define REX_CARD(ea) ((void)(*(u8*)(base + ((u32)(ea) >> 12)) = 0),                       ((__builtin_expect(g_me2_census_on, 0) &&                         ((g_me2_census_on & 1) || (u32)(ea) - g_me2_watch.lo < g_me2_watch.span))                            ? Me2CensusNoteAt((u32)(ea), __FILE__, __LINE__) : (void)0))
 #else
 #define REX_CARD(ea) ((void)(*(u8*)(base + ((u32)(ea) >> 12)) = 0))
 #endif

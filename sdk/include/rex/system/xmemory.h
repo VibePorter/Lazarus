@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -69,6 +70,32 @@ class Memory;
 // Memory::Initialize.
 extern u8* g_store_cards;
 
+// ME2 (2026-11-04): the watched range. Finer than the cards: one dirty bit per 64-byte chunk of a single guest range of
+// at most 256 chunks (16 KB), set by the stores of the guest functions tools/watch_marks.py instruments and by the host
+// writers (the CRT memory hooks through MarkStoreCardsHost, the app's natives and hooks). Renut watches the D3D device
+// with it, so a draw's capture compares only the chunks written since the previous draw. The object is the app's (the
+// generated code reaches it without crossing the runtime DLL on Windows); the runtime keeps a pointer to it.
+struct WatchedRange {
+  uint32_t lo = 0;
+  uint32_t span = 0;  // bytes; 0: nothing is watched
+  uint64_t dirty[4] = {};
+};
+// Registers the app's range (nullptr: none). Before it, MarkWatchedHost does nothing.
+void SetWatchedRange(WatchedRange* range);
+// The registered range (the runtime's own variable: the app passes its object to SetWatchedRange).
+extern WatchedRange* g_watched_range;
+// Marks the watched chunks that [guest_address, guest_address + length) overlaps.
+inline void MarkWatchedAt(WatchedRange* w, u32 guest_address, u32 length) noexcept {
+  if (!w || !length) return;
+  const uint64_t lo = w->lo, span = w->span, end = uint64_t(guest_address) + length;
+  if (!span || end <= lo || guest_address >= lo + span) return;
+  const u32 first = guest_address > lo ? u32(guest_address - lo) : 0u;
+  const u32 last = u32(std::min<uint64_t>(end - lo, span) - 1);
+  for (u32 chunk = first >> 6; chunk <= (last >> 6); ++chunk) w->dirty[chunk >> 6] |= uint64_t(1) << (chunk & 63);
+}
+// The same for a host pointer into the guest window, through the registered range (a call into the runtime).
+void MarkWatchedHost(const void* host, size_t length);
+
 inline void MarkStoreCardsAt(u8* cards, u32 guest_address, u32 length) noexcept {
   if (!cards || !length) return;
   const uint64_t end = uint64_t(guest_address) + length - 1;
@@ -88,6 +115,7 @@ inline void MarkStoreCardsHost(const void* host, size_t length) noexcept {
   if (offset >= 0x100000000ull) return;
   u32 guest = u32(offset);
   if (detail::PhysicalHostOffset(guest) && guest >= 0xE0001000u) guest -= 0x1000u;
+  MarkWatchedAt(g_watched_range, guest, length > 0xFFFFFFFFull ? 0xFFFFFFFFu : u32(length));  // ME2 (2026-11-04)
   MarkStoreCards(guest, length > 0xFFFFFFFFull ? 0xFFFFFFFFu : u32(length));
 }
 

@@ -43,6 +43,15 @@ struct Me2OcclusionBounds {
     return corners == 0xFF ? box : Me2OcclusionBounds{};
   }
 
+  // me2-nx-deko (2026-11-04): the very same box (both valid): level geometry's nodes test the same box every frame;
+  // an animated character's box moves a little each frame.
+  bool Same(const Me2OcclusionBounds& current) const {
+    if (!Valid() || !current.Valid()) return false;
+    for (int c = 0; c < 3; ++c)
+      if (current.lo[c] != lo[c] || current.hi[c] != hi[c]) return false;
+    return true;
+  }
+
   bool Contains(const Me2OcclusionBounds& current) const {
     if (!Valid() || !current.Valid()) return false;
     for (int c = 0; c < 3; ++c)

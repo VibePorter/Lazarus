@@ -160,6 +160,11 @@ def main():
     # (banjo_renut_store_cards). Idempotent; REX_STORE_CARDS_OFF compiles the cards out. No branch is added (a byte
     # store per guest store), so the functions' control flow, and the PGO profile made on it, stay as they were.
     run(tool('store_cards.py'), '--gen', os.path.join(gen, 'default'), '--hot', '-')
+    # ME2 (2026-11-04): the watch marks, after the cards: the card stores of the functions that write the D3D device
+    # also mark its 64-byte chunk, so Renut's draw capture compares only those (me2_renut_watch_chunks). Branch-free.
+    watch_list = os.path.join(APP, 'watch_writers.txt')
+    if os.path.exists(watch_list):
+        run(tool('watch_marks.py'), '--gen', os.path.join(gen, 'default'), '--list', watch_list)
     if scratch:
         print(f'post_codegen: {flavor} codegen steps done on {gen}')
         return

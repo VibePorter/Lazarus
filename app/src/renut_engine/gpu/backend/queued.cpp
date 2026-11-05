@@ -48,6 +48,17 @@ inline void CopyUnits64(unsigned char *to, const unsigned char *from, unsigned u
 #include "renut_engine/gpu/backend/render_thread.h"
 #include "renut_engine/gpu/banjo_renut_tuning.h"
 #include "renut_engine/gpu/sa2_line_compare.h"
+#include "rex/system/xmemory.h"
+
+#include "../../../../me2_src/me2_watch.h"
+
+// me2-nx-deko (2026-11-04): the watched range (me2_watch.h, tools/watch_marks.py), defined here. The runtime's host
+// writers (the CRT memory hooks) reach it through rex::memory::SetWatchedRange.
+RexWatchedRange g_me2_watch = {};
+static_assert(sizeof(RexWatchedRange) == sizeof(rex::memory::WatchedRange) &&
+              offsetof(RexWatchedRange, dirty) == offsetof(rex::memory::WatchedRange, dirty));
+extern "C" void Me2CensusDeviceStart();  // me2_write_census.cpp (diagnostic builds; a no-op otherwise)
+extern "C" void Me2CensusDeviceTick();
 
 // sa2-nx (2026-10-20): see SnapshotKind below.
 REXCVAR_DEFINE_BOOL(sa2_renut_snapshot_deltas, true, "SA2/Renderer",
@@ -102,6 +113,19 @@ REXCVAR_DEFINE_BOOL(sa2_renut_neon_compare, true, "SA2/Renderer",
                     "Renut's renderer on the Switch: the device chunks of the delta chain and the pushed shared "
                     "constants' lines are compared 64 bytes at a time with NEON (four 128-bit loads a side) instead of "
                     "eight 64-bit words, which GCC left scalar. Off: the 64-bit words")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// me2-nx-deko (2026-11-04): the watch marks (tools/watch_marks.py). The functions that write the D3D device (app/
+// watch_writers.txt, from the device census) mark the 64-byte chunks they write; a delta compares only those instead
+// of all 39 (CaptureDelta was ~7 % of UE3's render thread on the console, mostly misses on the device and shadow lines).
+// On by default since the PC verify of 2026-11-04 (10.7 M draws of menus, fights and conversations: 0 changed chunks
+// left unmarked; ~9 chunks compared a delta instead of 39).
+REXCVAR_DEFINE_BOOL(me2_renut_watch_chunks, true, "ME2/Renderer",
+                    "A draw's device delta compares only the chunks the instrumented D3D writers marked "
+                    "(tools/watch_marks.py; needs a build with app/watch_writers.txt)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(me2_renut_watch_verify, false, "ME2/Renderer",
+                    "Tests (me2_renut_watch_chunks): every delta also compares the unmarked chunks, takes those that "
+                    "changed anyway and reports them ([watch] unmarked lines; counts in the 10 s device snapshot line)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(sa2_renut_snapshot_deltas_verify, false, "SA2/Renderer",
                     "Tests (sa2_renut_snapshot_deltas): every draw also keeps the whole copy, and the render thread "
@@ -355,6 +379,34 @@ constexpr bool DeltaByteRead(u32 at) {
   return !(at < kDeltaUnreadEnd || (at >= kDeltaPrivateUnreadBegin && at < kDeltaPrivateUnreadEnd));
 }
 
+// me2-nx-deko (2026-11-04, me2_renut_watch_chunks): the watched range's chunk b (device bytes 64 b..) is the delta's
+// chunk b below the float constants and b - 128 from the bool constants on (the float constants go by m_Pending).
+constexpr u32 kWatchTailFirst = kDeltaTailBegin / kDeltaUnitBytes;  // 158
+static_assert(kDeltaTailBegin % kDeltaUnitBytes == 0 && kWatchTailFirst - kDeltaHeadChunks == 128);
+static_assert(kDeltaHeadChunks == 30 && kDeltaChunks == 71 && d3d::kDeviceSnapshotSize <= 256 * kDeltaUnitBytes);
+// The delta chunks a list compares, as a mask (bit i % 64 of word i / 64).
+struct DeltaChunkMask {
+  uint64_t w[2] = {};
+};
+constexpr DeltaChunkMask MaskOf(const DeltaChunkList &l) {
+  DeltaChunkMask m{};
+  for (u32 k = 0; k < l.count; ++k)
+    m.w[l.index[k] / 64] |= uint64_t(1) << (l.index[k] % 64);
+  return m;
+}
+constexpr DeltaChunkMask kDeltaReadMask = MaskOf(kDeltaReadChunks), kDeltaAllMask = MaskOf(kDeltaAllChunks);
+// The watched chunks marked since the last call, as delta chunks (and clears the marks).
+inline DeltaChunkMask TakeWatchMarks() {
+  uint64_t (&d)[4] = g_me2_watch.dirty;
+  constexpr uint64_t kHead = (uint64_t(1) << kDeltaHeadChunks) - 1;
+  // Device chunks 158..191 (word 2 bits 30..63) -> delta 30..63; 192..198 (word 3 bits 0..6) -> delta 64..70.
+  DeltaChunkMask m;
+  m.w[0] = (d[0] & kHead) | (d[2] & ~kHead);
+  m.w[1] = d[3] & ((uint64_t(1) << (kDeltaChunks - 64)) - 1);
+  d[0] = d[1] = d[2] = d[3] = 0;
+  return m;
+}
+
 struct DeltaHeader {
   uint64_t chunks[2];  // chunk i follows: bit i % 64 of word i / 64
   uint64_t vs, ps;     // the float constant groups that follow (bit 63 - group), the vertex shader's first
@@ -432,6 +484,16 @@ bool DeltasNarrowOn() {
   static const bool on = REXCVAR_GET(sa2_renut_snapshot_deltas_narrow);
   return on;
 }
+bool WatchChunksOn() {
+  static const bool on = DeltasOn() && REXCVAR_GET(me2_renut_watch_chunks);
+  return on;
+}
+bool WatchVerifyOn() {
+  static const bool on = WatchChunksOn() && REXCVAR_GET(me2_renut_watch_verify);
+  return on;
+}
+// The watch marks' 10 s counts (under g_delta.mutex): deltas, marked chunks, chunks the verify found changed unmarked.
+uint64_t g_watch_deltas = 0, g_watch_marked = 0, g_watch_unmarked = 0;
 bool DeltasVerifyOn() {
   static const bool on = DeltasOn() && REXCVAR_GET(sa2_renut_snapshot_deltas_verify);
   return on;
@@ -723,6 +785,15 @@ DrawCapture *CaptureDelta(u32 device_va, const DrawCall &call) {
     capture->state.assign(bytes, bytes + d3d::kDeviceSnapshotSize);
     std::memcpy(c.shadow, bytes, d3d::kDeviceSnapshotSize);
     c.device = device;
+    // me2-nx-deko (2026-11-04): the watched range follows the chain's device; the shadow is whole again, so the marks
+    // start over.
+    if (g_me2_watch.lo != device_va || g_me2_watch.span != d3d::kDeviceSnapshotSize) {
+      g_me2_watch.lo = device_va;
+      g_me2_watch.span = d3d::kDeviceSnapshotSize;
+      rex::memory::SetWatchedRange(reinterpret_cast<rex::memory::WatchedRange *>(&g_me2_watch));
+      Me2CensusDeviceStart();
+    }
+    TakeWatchMarks();
     c.vs = c.ps = 0;
     capture->snapshot = SnapshotKind::Rebase;
     ++c.rebases;
@@ -766,8 +837,50 @@ DrawCapture *CaptureDelta(u32 device_va, const DrawCall &call) {
       ++chunks;
     };
     u32 k = 0;
+    if (WatchChunksOn()) {
+      // me2-nx-deko (2026-11-04): only the marked chunks, compared (a mark means written, maybe with the same value).
+      const DeltaChunkMask &read = DeltasNarrowOn() ? kDeltaReadMask : kDeltaAllMask;
+      const DeltaChunkMask marked = TakeWatchMarks();
+      DeltaChunkMask look{{marked.w[0] & read.w[0], marked.w[1] & read.w[1]}};
+      ++g_watch_deltas;
+      g_watch_marked += uint64_t(std::popcount(look.w[0]) + std::popcount(look.w[1]));
+      if (WatchVerifyOn()) {
+        // Every read chunk: the unmarked ones that changed are counted, reported and taken (the picture stays right).
+        for (u32 word = 0; word < 2; ++word) {
+          for (uint64_t bits = read.w[word] & ~look.w[word]; bits; bits &= bits - 1) {
+            const u32 i = word * 64 + u32(std::countr_zero(bits));
+            const u32 at = DeltaChunkOffset(i), size = DeltaChunkSize(i);
+            if (std::memcmp(bytes + at, c.shadow + at, size) == 0)
+              continue;
+            ++g_watch_unmarked;
+            look.w[word] |= uint64_t(1) << (i % 64);
+            static uint32_t logged = 0;
+            if (logged < 64) {
+              ++logged;
+              u32 first = 0;
+              while (first < size && bytes[at + first] == c.shadow[at + first])
+                ++first;
+              RGPU_WARN("[watch] unmarked: device chunk +{:X} changed at +{:X} ({:02X} -> {:02X}) with no mark",
+                        at, at + first, c.shadow[at + first], bytes[at + first]);
+            }
+          }
+        }
+      }
+      // Increasing i: the order DeviceForDraw reads them back.
+      for (u32 word = 0; word < 2; ++word) {
+        for (uint64_t bits = look.w[word]; bits; bits &= bits - 1) {
+          const u32 i = word * 64 + u32(std::countr_zero(bits));
+          const u32 at = DeltaChunkOffset(i), size = DeltaChunkSize(i);
+          const bool differs = size == kDeltaUnitBytes ? sa2::renut::Line64Differs(bytes + at, c.shadow + at, neon)
+                                                       : std::memcmp(bytes + at, c.shadow + at, size) != 0;
+          if (differs)
+            take(i);
+        }
+      }
+      k = list.count;  // nothing left for the full compare below
+    }
 #if defined(__aarch64__)
-    if (neon) {
+    if (neon && k < list.whole) {
       // me2-nx-deko (2026-10-27): the whole chunks 16 at a time, one mask each (Lines64DiffMask16).
       for (; k < list.whole; k += 16) {
         for (u32 m = sa2::renut::Lines64DiffMask16(bytes, c.shadow, list.offset + k, std::min(16u, list.whole - k)); m;
@@ -813,6 +926,7 @@ DrawCapture *CaptureDelta(u32 device_va, const DrawCall &call) {
 } // namespace
 
 void SnapshotDeltasNewFrame() {
+  Me2CensusDeviceTick();  // me2-nx-deko (2026-11-04): the device census' reports (diagnostic builds)
   if (!DeltasOn())
     return;
   std::lock_guard lock(g_delta.mutex);
@@ -851,6 +965,19 @@ std::string SnapshotDeltaReport() {
       "Begin*Vertices draws as whole copies",
       draws, double(bytes) / double(draws), d3d::kDeviceSnapshotSize, double(chunks) / per_delta,
       double(groups) / per_delta, rebases, whole);
+  if (WatchChunksOn()) {
+    uint64_t wd, wm, wu;
+    {
+      std::lock_guard lock(g_delta.mutex);
+      wd = g_watch_deltas;
+      wm = g_watch_marked;
+      wu = g_watch_unmarked;
+      g_watch_deltas = g_watch_marked = g_watch_unmarked = 0;
+    }
+    line += fmt::format("; watch: {:.1f} marked chunks a delta", double(wm) / double(std::max<uint64_t>(wd, 1)));
+    if (WatchVerifyOn())
+      line += fmt::format(", {} changed unmarked", wu);
+  }
   if (DeltasVerifyOn()) {
     line += fmt::format("; verify: {} draws checked, {} differ", g_delta_verified.exchange(0, std::memory_order_relaxed),
                         g_delta_differ.exchange(0, std::memory_order_relaxed));

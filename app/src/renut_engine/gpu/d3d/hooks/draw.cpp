@@ -27,6 +27,7 @@
 #include <rex/cvar.h>
 #include <rex/hook.h>
 
+#include "../../../../../me2_src/me2_watch.h"
 #include "renut_engine/gpu/banjo_renut_select.h"
 #include <rex/types.h>
 
@@ -207,6 +208,15 @@ bool DrawCallersOn() {
 // me2-nx-deko (2026-11-01): every draw, for the frame diagnostics' "[stream-wait]" (app/me2_src/me2_frame_diag.cpp:
 // frames with almost no draws while the game waits for level streaming).
 std::atomic<uint64_t> g_me2_draws_total{0};
+// me2-nx-deko (2026-11-04): Begin*Vertices draws (Umbra's occlusion test boxes, immediate-mode UI), for the draw-count
+// rotation (me2_ab_cycle.cpp): g_me2_draws_total counts only DrawVertices / DrawIndexedVertices.
+std::atomic<uint64_t> g_me2_begin_draws_total{0};
+// me2-nx-deko (2026-11-05): an observer of every DrawVertices / DrawIndexedVertices (device, primitive, start, count,
+// indexed), set by app/me2_src/me2_shadow_diag.cpp while it measures the shadow depth passes; null = none.
+void (*g_me2_draw_observer)(uint32_t device, uint32_t primitive, uint32_t start, uint32_t count,
+                            uint32_t indexed) = nullptr;
+// ... and after the draw was queued (me2_element_timing: the draw's own cost).
+void (*g_me2_draw_post)() = nullptr;
 namespace {
 
 // void D3DDevice_DrawVertices(D3DDevice*, D3DPRIMITIVETYPE, UINT StartVertex,
@@ -215,6 +225,8 @@ void D3DDevice_DrawVertices_hook(u32 device, u32 primitive, u32 start_vertex, u3
   if (!Active())
     return;
   g_me2_draws_total.fetch_add(1, std::memory_order_relaxed);
+  if (g_me2_draw_observer)
+    g_me2_draw_observer(device, primitive, start_vertex, vertex_count, 0);
   if (DrawCallersOn())
     NoteDrawCaller(device);
   DrawCall call;
@@ -225,6 +237,8 @@ void D3DDevice_DrawVertices_hook(u32 device, u32 primitive, u32 start_vertex, u3
     RecordDraw(device, call, 0, 0);
   else
     QueueDraw(device, call, 0, 0);
+  if (g_me2_draw_post)
+    g_me2_draw_post();
 }
 
 // void D3DDevice_DrawIndexedVertices(D3DDevice*, D3DPRIMITIVETYPE, INT BaseVertexIndex,
@@ -234,6 +248,8 @@ void D3DDevice_DrawIndexedVertices_hook(u32 device, u32 primitive, u32 base_vert
   if (!Active())
     return;
   g_me2_draws_total.fetch_add(1, std::memory_order_relaxed);
+  if (g_me2_draw_observer)
+    g_me2_draw_observer(device, primitive, start_index, index_count, 1u | (base_vertex << 1));
   if (DrawCallersOn())
     NoteDrawCaller(device);
   DrawCall call;
@@ -246,6 +262,8 @@ void D3DDevice_DrawIndexedVertices_hook(u32 device, u32 primitive, u32 base_vert
     RecordDraw(device, call, 0, 0);
   else
     QueueDraw(device, call, 0, 0);
+  if (g_me2_draw_post)
+    g_me2_draw_post();
 }
 
 // void D3DDevice_DrawIndexedTessellatedVertices(D3DDevice*, D3DTESSPRIMITIVETYPE,
@@ -269,6 +287,8 @@ void D3DDevice_DrawIndexedTessellatedVertices_hook(u32 device, u32 primitive, u3
     RecordDraw(device, call, 0, 0);
   else
     QueueDraw(device, call, 0, 0);
+  if (g_me2_draw_post)
+    g_me2_draw_post();
 }
 
 // void D3DDevice_DrawVerticesUP(D3DDevice*, D3DPRIMITIVETYPE, UINT VertexCount,
@@ -320,6 +340,7 @@ void D3DDevice_DrawIndexedVerticesUP_hook(u32 device, u32 primitive, u32 min_ver
 // device, so the draw's state is captured now and its vertices copied at the
 // device's next hook (FlushDeferredVertices).
 u32 D3DDevice_BeginVertices_hook(u32 device, u32 primitive, u32 vertex_count, u32 stride) {
+  g_me2_begin_draws_total.fetch_add(1, std::memory_order_relaxed);
   const u64 bytes = u64(vertex_count) * stride;
   if (!bytes || bytes > kVerticesScratchSize)
     return 0;
@@ -749,6 +770,7 @@ u32 IndicesScratch(u32 device) {
 
 u32 Me2BeginIndexedVertices(u32 device, u32 primitive, u32 base_vertex, u32 num_vertices, u32 index_count,
                             u32 index_format, u32 stride, u32 out_indices, u32 out_vertices) {
+  g_me2_begin_draws_total.fetch_add(1, std::memory_order_relaxed);
   const bool is32 = (index_format & 4) != 0;  // D3DFMT_INDEX32 (ME2 tests bit 2)
   const u64 vertex_bytes = u64(num_vertices) * stride;
   const u64 index_bytes = u64(index_count) * (is32 ? 4 : 2);
@@ -807,8 +829,10 @@ BANJO_RENUT_HOOK_RAW(sub_82A9B2A8) {
   const u32 words[] = {0u,
       ((ctx.r5.u32 << 16) & 0x3FFF0000u) | (ctx.r4.u32 & 0x3FFFu),
       ((ctx.r7.u32 << 16) & 0x3FFF0000u) | (ctx.r6.u32 & 0x3FFFu)};
-  if (auto *packet = GuestPtr<be_u32>(device + native::off::WindowOffset))
+  if (auto *packet = GuestPtr<be_u32>(device + native::off::WindowOffset)) {
     for (u32 i = 0; i < 3; ++i) packet[i] = words[i];
+    Me2WatchMark(device + native::off::WindowOffset, 12);  // me2-nx-deko (2026-11-04): the watched device chunks
+  }
   __imp__sub_82A9B2A8(ctx, base);
 }
 

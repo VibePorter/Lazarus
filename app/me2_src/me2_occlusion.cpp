@@ -26,6 +26,7 @@
 // me2_occlusion_queries (default on): the above. Off: every occlusion query "visible" (the 2026-10-25 behaviour).
 
 #include <algorithm>
+#include "me2_ab_cycle.h"  // me2-nx-deko (2026-11-04): the draw-count rotation
 #include <cstdio>
 #include <array>
 #include <atomic>
@@ -47,6 +48,8 @@
 #include <rex/logging.h>
 #include <rex/ppc.h>
 
+#include <fmt/format.h>
+
 #include "renut_engine/gpu/banjo_renut_select.h"
 #include "renut_engine/gpu/backend/backend.h"
 #include "renut_engine/gpu/backend/queued.h"
@@ -61,6 +64,18 @@
 // me2_cull_distance.cpp (2026-11-02): command 50's size-based "skip_instance"; true = answered.
 extern "C" bool me2_umbra_size_cull(PPCContext& ctx, uint8_t* base);
 extern "C" void me2_lod_distance_scale_view(PPCContext& ctx, uint8_t* base);  // me2_cull_distance.cpp
+extern "C" void me2_lod_distance_scale_umbra(PPCContext& ctx, uint8_t* base);   // me2_cull_distance.cpp
+// me2_occlusion_raster.cpp (2026-11-05): the occlusion rasterizer (me2_occlusion_cpu_source 1).
+extern "C" void Me2RasterFrame(const uint8_t* base, uint32_t scene, const float* vp, const float* cam, uint64_t frame,
+                               uint32_t renderer);
+extern "C" uint8_t Me2RasterTestBox(const float* mn, const float* mx, uint64_t frame);
+extern "C" bool Me2RasterBoxPass(uint64_t frame, const uint8_t** boxes, const uint32_t** wraps, const uint8_t** codes,
+                                 uint32_t* count, uint64_t* worker_ns);
+extern "C" uint8_t Me2RasterTest(const uint8_t* base, uint32_t verts_va, uint32_t count, uint32_t idx_va,
+                                 uint32_t ntris, uint64_t frame, uint8_t* alt);
+extern "C" void Me2RasterReport();
+extern "C" uint32_t Me2RasterTakeToken();
+extern "C" void Me2RasterTraceFalse(uint32_t token, uint32_t count, uint64_t now);
 #include "me2_occlusion_view.h"
 
 #if defined(PLUME_DEKO3D)
@@ -76,6 +91,10 @@ REXCVAR_DEFINE_BOOL(me2_occlusion_umbra_wall_trace, false, "ME2",
 REXCVAR_DEFINE_BOOL(me2_occlusion_queries, true, "ME2",
                     "Real occlusion queries for UE3's occlusion culling (host queries around the query's draws); off = "
                     "every occlusion query answers visible")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(me2_occlusion_reader_raster, false, "ME2",
+                    "A per-primitive occlusion read (sub_82696410) whose GPU result is not ready is answered from the "
+                    "CPU depth buffer instead of waiting for the GPU")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(me2_occlusion_wait_us, 30000, "ME2",
                      "How long GetData waits for an occlusion query's GPU result before it answers visible (us)")
@@ -187,6 +206,25 @@ REXCVAR_DEFINE_BOOL(me2_occlusion_umbra_defer_trace, false, "ME2",
 REXCVAR_DEFINE_DOUBLE(me2_occlusion_umbra_latent_rot, 0.03, "ME2",
                       "me2_occlusion_umbra_latent: an 'occluded' count is used only if no element of the view "
                       "rotation changed by more than this since its issue (0.03 ~ 2 degrees)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// me2-nx-deko (2026-11-04, console: Kasumi's party 23 fps looking at a wall, 5 fps turning the stick).
+REXCVAR_DEFINE_DOUBLE(me2_occlusion_cut_rot, 1.0, "ME2",
+                      "Camera cut detection: a view rotation element changing by more than this in ONE frame is a cut "
+                      "(every occlusion answer thrown away); 1.0 ~ 60 degrees a frame (was a fixed 0.2 ~ 12 degrees)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(me2_occlusion_umbra_latent_turn, true, "ME2",
+                    "me2_occlusion_umbra_latent: an 'occluded' count stays valid while the camera only turned (moved "
+                    "at most me2_occlusion_umbra_latent_move) if the node's box was wholly on screen at the count: "
+                    "occlusion depends on where the camera is, not where it looks")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// me2-nx-deko (2026-11-04, PC at 15 fps, Kasumi's party: spinning the stick made ~100-170 node reads a frame "too old ->
+// visible": what comes back into view was counted a whole turn ago, beyond me2_occlusion_umbra_latent_frames).
+REXCVAR_DEFINE_INT32(me2_occlusion_umbra_latent_turn_frames, 150, "ME2",
+                     "me2_occlusion_umbra_latent_turn: an 'occluded' count older than latent_frames stays valid up to "
+                     "this many frames when the camera has not moved, the box was wholly on screen at the count and "
+                     "has been off screen since (the camera turned away and back); 0 = off. A box that stayed on screen "
+                     "(a door opening in front of a still camera) keeps the latent_frames limit")
+    .range(0, 250)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_DOUBLE(me2_occlusion_umbra_latent_move, 64.0, "ME2",
                       "me2_occlusion_umbra_latent: ... and the camera moved less than this (world units) since then")
@@ -403,6 +441,15 @@ constexpr const char* kTagNames[kTags] = {"other", "82695EE0", "82696410", "8269
 thread_local int t_tag = 0;
 thread_local int t_outcome = 0;
 thread_local bool t_umbra_nowait = false;  // inside Umbra's opcode 130 with the record's wait byte 0
+// me2_occlusion_reader_raster (2026-11-05): console stacks put 9.2 % of the UE3 render thread in sub_82696410 (UE3's
+// per-primitive occlusion history read from Umbra's op 48: ~80-530 reads per 10 s, i.e. 1-2 ms each), nearly all of it
+// waiting for the previous frame's GPU query results (polling occlusionResults + sleeping): the render thread and the
+// GPU took turns. With this on, a read whose GPU result is not ready at the first poll is answered from this frame's CPU
+// depth buffer instead (the primitive's box, from its compact scene entry r4: +16 origin, +28 box extent): occluded =
+// 0 pixels, else visible. A ready GPU result is still used. "reader_raster" in me2_ab_cycle turns it off in its slots.
+thread_local bool t_reader_box = false;
+thread_local float t_reader_mn[3], t_reader_mx[3];
+std::atomic<uint64_t> st_reader_raster_occ{0}, st_reader_raster_vis{0}, st_reader_ready_first{0};
 std::atomic<uint64_t> st_tag[kTags][5];  // outcomes: unanswerable, not ready age 0, not ready age 1+, visible, occluded
 std::atomic<uint64_t> st_init_views{0}, st_frames_seen{0};
 
@@ -569,6 +616,10 @@ void Report() {
   }
   const uint64_t frames = g_sa2_game_frames.load(std::memory_order_relaxed);
   const uint64_t prev_frames = st_frames_seen.exchange(frames);
+  if (REXCVAR_GET(me2_occlusion_reader_raster))
+    REXLOG_INFO("[occlusion] reader raster (sub_82696410 reads not ready at once): {} answered occluded, {} visible "
+                "from the CPU depth buffer instead of waiting", st_reader_raster_occ.exchange(0),
+                st_reader_raster_vis.exchange(0));
   REXLOG_INFO("[occlusion] readers:{} InitViews (sub_8269B220) {} calls in {} Swap counts", tags,
               st_init_views.exchange(0), frames - prev_frames);
   Me2UmbraLatentReport(now - prev);
@@ -740,6 +791,22 @@ uint32_t Answer(uint32_t query, bool can_wait_later = false) {
       t_outcome = 1;
       return kNotReady;
     }
+    if (t_reader_box && age >= 1 && !waiting) {
+      static const bool reader_raster = REXCVAR_GET(me2_occlusion_reader_raster);
+      if (reader_raster && !Me2AbOff(Me2Ab::kReaderRaster)) {
+        const uint8_t code = Me2RasterTestBox(t_reader_mn, t_reader_mx, g_sa2_game_frames.load(std::memory_order_relaxed));
+        if (code == 2) {
+          st_reader_raster_occ.fetch_add(1, std::memory_order_relaxed);
+          t_outcome = 4;
+          return 0;
+        }
+        if (code != 0) {
+          st_reader_raster_vis.fetch_add(1, std::memory_order_relaxed);
+          t_outcome = 3;
+          return kVisible;
+        }
+      }
+    }
     if (wait_us <= 0 || age == 0) {
       st_not_ready.fetch_add(1, std::memory_order_relaxed);
       st_age_late[age_slot].fetch_add(1, std::memory_order_relaxed);
@@ -777,11 +844,14 @@ struct LatentIssue {
   uint8_t cpu = 0;  // me2_occlusion_umbra_cpu: the CPU's answer to the same test (1 visible, 2 occluded), 0 = none
   Me2OcclusionBounds bounds;
   uint64_t epoch = 1;  // camera at the geometry issue, never the later collection/read
+  uint8_t cpu_alt = 0;  // me2_occlusion_raster_dual: the other winding's answer (codes as cpu)
+  uint32_t raster_token = 0;  // me2_occlusion_raster_trace: the rasterizer's record of an occluded answer
 };
 // me2_occlusion_umbra_cpu: CPU answers against the GPU counts of the same tests, [CPU occluded][GPU visible]; and
 // the tests the GPU found occluded but the CPU not, by the CPU's reason (CpuTest's codes).
 std::atomic<uint64_t> st_cpu_cmp[2][2];
 std::atomic<uint64_t> st_cpu_miss[9];
+std::atomic<uint64_t> st_raster_alt_cmp[2][2];  // me2_occlusion_raster_dual: the other winding, [occluded][GPU visible]
 struct LatentResult {
   uint32_t pixels = 0;  // the answer: the count that last changed it or agreed with it
   uint64_t frame = 0;  // the frame of the newest issue counted
@@ -865,10 +935,13 @@ Me2OcclusionBounds CurrentLatentBounds();  // uses the existing opcode-130 index
 std::atomic<uint64_t> st_lat_bounds_rejected{0};
 std::atomic<uint64_t> st_retest_skipped{0}, st_retest_cancelled{0};  // me2_occlusion_umbra_retest_frames
 std::atomic<uint64_t> st_retest_occ_skipped{0}, st_retest_occ_tested{0};  // me2_occlusion_umbra_retest_occluded
+std::atomic<uint64_t> st_retest_occ_moved{0};  // ... re-tested because the node's box is not the counted one
 // me2_occlusion_umbra_retest_occluded with its A/B half.
 uint64_t RetestOccludedFrames() {
   static const uint64_t n = uint64_t(REXCVAR_GET(me2_occlusion_umbra_retest_occluded));
   static const int32_t ab_s = REXCVAR_GET(me2_occlusion_umbra_retest_occluded_ab_s);
+  if (n > 1 && Me2AbOff(Me2Ab::kRetestOccluded))
+    return 1;
   if (n <= 1 || ab_s <= 0)
     return n;
   static const auto start = std::chrono::steady_clock::now();
@@ -1096,6 +1169,10 @@ void LatentCollect(uint64_t frame) {
         if (!occ && count == 0 && i.cpu < 9)
           st_cpu_miss[i.cpu].fetch_add(1, std::memory_order_relaxed);
       }
+      if (i.cpu_alt)
+        st_raster_alt_cmp[i.cpu_alt == 2][count != 0].fetch_add(1, std::memory_order_relaxed);
+      if (i.raster_token && count != 0)
+        Me2RasterTraceFalse(i.raster_token, count, frame);
       if (ls.probe && i.frame >= ls.probe_frame) {
         const uint32_t b = ls.probe - 1;
         st_stale_check[b / 3][b % 3][count != 0].fetch_add(1, std::memory_order_relaxed);
@@ -1130,10 +1207,48 @@ void LatentCollect(uint64_t frame) {
 struct ViewAt {
   uint64_t frame = ~uint64_t(0);
   float m[16];
+  float p[16];  // me2-nx-deko (2026-11-04): the projection too (BoxOnScreenAt)
 };
 constexpr uint32_t kViewHist = 256;  // frames of view matrices kept (latent_still_frames reaches back this far)
 ViewAt g_view_hist[kViewHist];
 std::atomic<uint64_t> st_lat_moved{0};
+std::atomic<uint64_t> st_lat_turn_kept{0};  // me2_occlusion_umbra_latent_turn: occluded answers kept through a turn
+std::atomic<uint64_t> st_lat_turn_old{0};   // ... older than latent_frames (me2_occlusion_umbra_latent_turn_frames)
+
+bool BoxOnScreenAt(const Me2OcclusionBounds& b, uint64_t f);
+// Whether the box left the screen at some frame after 'then' and before 'now' (8 frames sampled; a frame no longer kept
+// counts as not known: false).
+bool BoxLeftScreenSince(const Me2OcclusionBounds& b, uint64_t then, uint64_t now) {
+  if (now <= then + 1) return false;
+  for (uint64_t k = 1; k <= 8; ++k) {
+    const uint64_t f = then + (now - then) * k / 9;
+    if (f <= then || f >= now) continue;
+    const auto& v = g_view_hist[f & (kViewHist - 1)];
+    if (v.frame != f) continue;
+    if (!BoxOnScreenAt(b, f)) return true;
+  }
+  return false;
+}
+
+// Whether the box was wholly inside the view of frame 'f' (row vectors: clip = (p, 1) x View x Projection). Its GPU count
+// then covered all of it: turning the camera cannot reveal a part the test did not see. False when 'f' is not kept.
+bool BoxOnScreenAt(const Me2OcclusionBounds& b, uint64_t f) {
+  if (!b.Valid()) return false;
+  const ViewAt& v = g_view_hist[f & (kViewHist - 1)];
+  if (v.frame != f) return false;
+  for (unsigned corner = 0; corner < 8; ++corner) {
+    const float p[3] = {(corner & 1) ? b.hi[0] : b.lo[0], (corner & 2) ? b.hi[1] : b.lo[1],
+                        (corner & 4) ? b.hi[2] : b.lo[2]};
+    float e[4];
+    for (int j = 0; j < 4; ++j)
+      e[j] = p[0] * v.m[0 * 4 + j] + p[1] * v.m[1 * 4 + j] + p[2] * v.m[2 * 4 + j] + v.m[3 * 4 + j];
+    float c[4];
+    for (int j = 0; j < 4; ++j)
+      c[j] = e[0] * v.p[0 * 4 + j] + e[1] * v.p[1 * 4 + j] + e[2] * v.p[2 * 4 + j] + e[3] * v.p[3 * 4 + j];
+    if (!(c[3] > 0.0f) || std::fabs(c[0]) > c[3] || std::fabs(c[1]) > c[3]) return false;
+  }
+  return true;
+}
 
 // The age in frames of the 'occluded' answers given (1-2, 3-5, 6-10, 11-20, 21+): the delay with which a node behind an
 // occluder that moved away (a door, a character; the camera still) comes back, bounded by
@@ -1303,6 +1418,8 @@ void TraceFlip(LatentSlot* slot, uint64_t key, uint64_t frame, bool visible, Why
 std::string (*g_cpu_info_text)() = nullptr;
 
 uint32_t LatentAnswer(uint64_t key) {
+  if (Me2AbOff(Me2Ab::kOcclusion))
+    return kVisible;  // me2-nx-deko (2026-11-04): the draw-count rotation's reference slot (no occlusion culling)
   static const uint64_t max_age = uint64_t(REXCVAR_GET(me2_occlusion_umbra_latent_frames));
   static const uint64_t still_age = uint64_t(REXCVAR_GET(me2_occlusion_umbra_latent_still_frames));
   static const float still_rot = float(REXCVAR_GET(me2_occlusion_umbra_latent_still_rot));
@@ -1334,7 +1451,23 @@ uint32_t LatentAnswer(uint64_t key) {
     slot->probe = uint8_t(1 + r * 3 + m);
     slot->probe_frame = frame;
   }
-  if (age > max_age) {
+  // me2-nx-deko (2026-11-04, me2_occlusion_umbra_latent_turn_frames): an old 'occluded' of a box the camera turned away
+  // from and back to, the camera in place: still right (occlusion depends on where the camera is).
+  bool turn_old = false;
+  if (age > max_age && res.pixels == 0) {
+    static const bool turn = REXCVAR_GET(me2_occlusion_umbra_latent_turn);
+    static const uint64_t turn_age = uint64_t(REXCVAR_GET(me2_occlusion_umbra_latent_turn_frames));
+    static const float move_max = float(REXCVAR_GET(me2_occlusion_umbra_latent_move));
+    float d_rot = 0.0f, d_move = 1e9f;
+    if (turn && age <= turn_age && CameraDelta(res.frame, frame, d_rot, d_move) && d_move <= move_max &&
+        BoxOnScreenAt(res.bounds, res.frame) && BoxLeftScreenSince(res.bounds, res.frame, frame)) {
+      turn_old = true;
+      st_lat_turn_old.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  if (turn_old) {
+    why = Why::kStill;
+  } else if (age > max_age) {
     // me2_occlusion_umbra_latent_still_frames: an old 'occluded' stays while the camera has not moved since.
     if (!(res.pixels == 0 && age <= still_age && CameraNear(res.frame, frame, still_rot, still_move))) {
       st_lat_none.fetch_add(1, std::memory_order_relaxed);
@@ -1345,10 +1478,19 @@ uint32_t LatentAnswer(uint64_t key) {
     st_lat_still.fetch_add(1, std::memory_order_relaxed);
     why = Why::kStill;
   } else if (res.pixels == 0 && !CameraStill(res.frame, frame)) {
-    st_lat_moved.fetch_add(1, std::memory_order_relaxed);  // occluded from a view the camera has left: visible
-    if (trace)
-      TraceFlip(slot, key, frame, true, Why::kMoved, age, 0, cpu);
-    return kVisible;
+    // me2-nx-deko (2026-11-04, me2_occlusion_umbra_latent_turn): a camera that only turned keeps the answer of a box
+    // that was wholly on screen at its count.
+    static const bool turn = REXCVAR_GET(me2_occlusion_umbra_latent_turn);
+    static const float move_max = float(REXCVAR_GET(me2_occlusion_umbra_latent_move));
+    float d_rot = 0.0f, d_move = 1e9f;
+    if (turn && CameraDelta(res.frame, frame, d_rot, d_move) && d_move <= move_max && BoxOnScreenAt(res.bounds, res.frame)) {
+      st_lat_turn_kept.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      st_lat_moved.fetch_add(1, std::memory_order_relaxed);  // occluded from a view the camera has left: visible
+      if (trace)
+        TraceFlip(slot, key, frame, true, Why::kMoved, age, 0, cpu);
+      return kVisible;
+    }
   }
   (res.pixels ? st_lat_visible : st_lat_hidden).fetch_add(1, std::memory_order_relaxed);
   if (res.pixels == 0)
@@ -1472,6 +1614,32 @@ int CpuMode() {
   static const int mode = UmbraLatent() ? REXCVAR_GET(me2_occlusion_umbra_cpu) : 0;
   return mode;
 }
+
+// Mode 2: the CPU answers Umbra (no box drawn for a decided test). The draw-count rotation's "raster" cut (2026-11-05,
+// me2_ab_cycle = "raster") turns the CPU side OFF for its slot: no rasterizer walk / drawing / tests, boxes drawn, the
+// latent GPU answers used = the plain GPU path (mode 0) with its own cost (the first console A/B kept the CPU tests
+// running in the GPU slots: ~7 ms a frame on the UE3 render thread counted against the GPU path). Latched once a view
+// before Umbra's traversal (sub_8274AA38 hook), so a test and its read in that traversal agree.
+std::atomic<bool> g_cpu_slot_on{true};
+bool CpuSlotOn() { return g_cpu_slot_on.load(std::memory_order_relaxed); }
+bool CpuAnswers() { return CpuMode() == 2 && CpuSlotOn(); }
+std::atomic<uint64_t> g_raster_view_frame{~uint64_t(0)};  // the frame whose Umbra view the rasterizer answers
+
+// me2-nx-deko (2026-11-05): where the CPU tests' depth comes from. 0 = the GPU's scene depth of an earlier frame,
+// reprojected (Oct 28; holes where that frame did not look); 1 = the occlusion rasterizer (me2_occlusion_raster.cpp:
+// the static depth draw lists' meshes drawn on the CPU with this frame's camera before Umbra's traversal).
+REXCVAR_DEFINE_INT32(me2_occlusion_cpu_source, 0, "ME2",
+                     "me2_occlusion_umbra_cpu: 0 = the reprojected GPU depth of an earlier frame, 1 = the occlusion "
+                     "rasterizer (occluders drawn on the CPU with the current camera)")
+    .range(0, 1)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+int CpuSource() {
+  static const int source = REXCVAR_GET(me2_occlusion_cpu_source);
+  return source;
+}
+thread_local uint8_t t_raster_alt = 0;  // me2_occlusion_raster_dual: the other winding's answer to the last test
+uint8_t g_raster_alt[kIndexKeys];       // ... per record index (opcode 131 -> its END)
+uint32_t g_raster_token[kIndexKeys];    // me2_occlusion_raster_trace: the record of the test's occluded answer
 
 // 4x4 inverse (row-major); false if singular.
 bool Invert4(const float* m, float* out) {
@@ -1918,6 +2086,24 @@ bool BuildHull(const std::vector<std::pair<float, float>>& in, Hull& h) {
 // why: 1 an occluder cell too far (or a bad box), 3 at the near plane, 4 off the screen, 5 a cell without data (and
 // the old frame could not tell either); a hole decided in the grid's own frame: 7 occluded, 8 visible.
 uint8_t CpuTest(const uint8_t* base, uint32_t rec, uint64_t frame) {
+  if (CpuSource() == 1) {
+    // me2_occlusion_cpu_source 1: against this frame's rasterized occluders (no holes, no old frames).
+    t_cpu_info = {};
+    const uint32_t verts = LoadBE(base, rec + 16);
+    t_cpu_info.verts = int(verts);
+    const uint8_t answer =
+        Me2RasterTest(base, kUmbraVertices, verts, kUmbraIndices, LoadBE(base, rec + 12), frame, &t_raster_alt);
+    switch (answer) {
+      case 0: st_cpu_nogrid.fetch_add(1, std::memory_order_relaxed); break;
+      case 2: st_cpu_occluded.fetch_add(1, std::memory_order_relaxed); break;
+      case 3: st_cpu_near.fetch_add(1, std::memory_order_relaxed); break;
+      case 4: st_cpu_offscreen.fetch_add(1, std::memory_order_relaxed); break;
+      default: break;
+    }
+    if (answer)
+      st_cpu_tests.fetch_add(1, std::memory_order_relaxed);
+    return answer;
+  }
   if (!g_cpu.ready || g_cpu.vp_frame != frame) {
     st_cpu_nogrid.fetch_add(1, std::memory_order_relaxed);
     return 0;
@@ -2154,6 +2340,17 @@ uint32_t CpuAnsweredTraced(uint8_t answer) {
 void CpuReport() {
   if (!CpuMode())
     return;
+  if (CpuSource() == 1) {
+    Me2RasterReport();
+    uint64_t alt[2][2];
+    for (int a = 0; a < 2; ++a)
+      for (int b = 0; b < 2; ++b)
+        alt[a][b] = st_raster_alt_cmp[a][b].exchange(0);
+    if (alt[0][0] + alt[0][1] + alt[1][0] + alt[1][1])
+      REXLOG_INFO("[occlusion] raster winding (the OTHER winding, me2_occlusion_raster_dual) against the GPU counts: "
+                  "occluded / GPU occluded {}, occluded / GPU VISIBLE {}, visible / GPU occluded {}, both visible {}",
+                  alt[1][0], alt[1][1], alt[0][0], alt[0][1]);
+  }
   const uint64_t tests = st_cpu_tests.exchange(0), occluded = st_cpu_occluded.exchange(0);
   const uint64_t builds = st_cpu_builds.exchange(0);
   const uint64_t cells = st_cpu_grid_cells.exchange(0);
@@ -2218,8 +2415,9 @@ void LatentReport(int64_t seconds) {
   {
     const uint64_t occ = RetestOccludedFrames();
     REXLOG_INFO("[occlusion] Umbra occluded retest (me2_occlusion_umbra_retest_occluded {}, now {}): {} occluded-node tests "
-                "skipped, {} tested", REXCVAR_GET(me2_occlusion_umbra_retest_occluded), occ > 1 ? "on" : "off",
-                st_retest_occ_skipped.exchange(0), st_retest_occ_tested.exchange(0));
+                "skipped, {} tested ({} of them because the node's box moved since its count)",
+                REXCVAR_GET(me2_occlusion_umbra_retest_occluded), occ > 1 ? "on" : "off",
+                st_retest_occ_skipped.exchange(0), st_retest_occ_tested.exchange(0), st_retest_occ_moved.exchange(0));
   }
   REXLOG_INFO("[occlusion] Umbra latent {} s: {} test geometries, {:.1f} % of their keys also seen the frame before; "
               "reads answered {} visible / {} occluded from earlier frames, {} without a count (visible), {} occluded "
@@ -2227,8 +2425,21 @@ void LatentReport(int64_t seconds) {
               seconds, keys, keys ? 100.0 * double(repeated) / double(keys) : 0.0, st_lat_visible.exchange(0),
               st_lat_hidden.exchange(0), st_lat_none.exchange(0), st_lat_moved.exchange(0), st_lat_collected.exchange(0),
               st_lat_dropped.exchange(0), g_lat_used);
+  REXLOG_INFO("[occlusion] Umbra turn: {} occluded answers kept through a camera turn (box wholly on screen at the "
+              "count, me2_occlusion_umbra_latent_turn), {} of them older than latent_frames (turned away and back, "
+              "me2_occlusion_umbra_latent_turn_frames); camera cuts so far: epoch {}",
+              st_lat_turn_kept.exchange(0) + st_lat_turn_old.load(), st_lat_turn_old.exchange(0), g_latent_view.epoch);
 }
 }  // namespace
+
+// me2_prepass.cpp (2026-11-05): whether this frame's Umbra view is answered by the occlusion rasterizer (mode 2,
+// source 1, not a GPU slot of the "raster" rotation). Then Umbra draws no test boxes and needs no prepass depth. The
+// view is set up (sub_8274AA38) before FSceneRenderer::Render draws the prepass in the same frame; a level without
+// Umbra never sets it, so its prepass stays.
+extern "C" bool Me2OcclusionRasterAnswersFrame() {
+  return CpuAnswers() && CpuSource() == 1 &&
+         g_raster_view_frame.load(std::memory_order_relaxed) == g_sa2_game_frames.load(std::memory_order_relaxed);
+}
 
 // ---- me2_occlusion_umbra_defer: render thread only (under State().mutex) --------------------------------------------
 namespace {
@@ -2475,7 +2686,30 @@ REX_HOOK_RAW(sub_82A906E0) {
 // The readers' tags (diagnostic, see st_tag).
 #define ME2_OCCLUSION_READER(addr, tag)                   REX_EXTERN(__imp__sub_##addr);                          REX_HOOK_RAW(sub_##addr) {                                const int saved = t_tag;                                t_tag = tag;                                            __imp__sub_##addr(ctx, base);                           t_tag = saved;                                        }
 ME2_OCCLUSION_READER(82695EE0, 1)
-ME2_OCCLUSION_READER(82696410, 2)
+REX_EXTERN(__imp__sub_82696410);
+REX_HOOK_RAW(sub_82696410) {
+  // r4 = the primitive's compact scene entry (sub_82689710: +16 origin, +28 box extent, big-endian floats)
+  const uint32_t ce = ctx.r4.u32;
+  bool ok = ce >= 0x10000u && ce < 0xF0000000u;
+  if (ok) {
+    for (int k = 0; k < 3; ++k) {
+      uint32_t ob = LoadBE(base, ce + 16 + 4 * uint32_t(k)), eb = LoadBE(base, ce + 28 + 4 * uint32_t(k));
+      float o, e;
+      std::memcpy(&o, &ob, 4);
+      std::memcpy(&e, &eb, 4);
+      ok = ok && std::isfinite(o) && std::isfinite(e) && e >= 0.0f;
+      t_reader_mn[k] = o - e;
+      t_reader_mx[k] = o + e;
+    }
+  }
+  const int saved = t_tag;
+  const bool saved_box = t_reader_box;
+  t_tag = 2;
+  t_reader_box = ok;
+  __imp__sub_82696410(ctx, base);
+  t_tag = saved;
+  t_reader_box = saved_box;
+}
 ME2_OCCLUSION_READER(82696780, 3)
 ME2_OCCLUSION_READER(826A7690, 4)
 // sub_827486B8: a render-command interpreter (vtable 0x82193330 slot 1, (this, opcode)); opcodes 128 / 129 = Issue
@@ -2487,11 +2721,14 @@ REXCVAR_DEFINE_BOOL(me2_occlusion_diag_cmds, false, "ME2",
                     "around the record)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REX_EXTERN(__imp__sub_827486B8);
-REX_HOOK_RAW(sub_827486B8) {
+static void UmbraCommandHook(PPCContext& ctx, uint8_t* base) {
   // me2-nx-deko (2026-11-02, me2_cull_distance.cpp): command 50 = Umbra's per-instance draw-distance question; small
   // primitives far away are answered "skip_instance" there (drawn in no pass).
-  if (ctx.r4.u32 == 50 && me2_umbra_size_cull(ctx, base))
-    return;
+  if (ctx.r4.u32 == 50) {
+    me2_lod_distance_scale_umbra(ctx, base);  // me2-nx-deko (2026-11-04): me2_lod_distance_scale_mode 1
+    if (me2_umbra_size_cull(ctx, base))
+      return;
+  }
   // Command 0 copies the view's LOD distance factor for Umbra: me2_lod_distance_scale applies first.
   if (ctx.r4.u32 == 0)
     me2_lod_distance_scale_view(ctx, base);
@@ -2578,10 +2815,15 @@ REX_HOOK_RAW(sub_827486B8) {
             res.pixels != 0 && frame - res.issued < retest)
           skip_test = true;
         // me2_occlusion_umbra_retest_occluded: an occluded node, its last test recent, its count fresh, the camera still.
+        // 2026-11-04 (user, PC: squadmates standing still lost their bodies, heads floating): only the very box that was
+        // counted (Me2OcclusionBounds::Same). Level geometry tests the same box every frame; an animated character's box
+        // moves a little each frame and is always tested.
         else if (const uint64_t occ = RetestOccludedFrames();
                  occ > 1 && res.any && res.epoch == g_latent_view.epoch && res.pixels == 0 &&
                  frame - res.issued < occ && frame - res.frame <= occ + 2 &&
-                 CameraNear(res.frame, frame, 0.05f, 50.0f)) {  // ~3 degrees, 50 units: turning or walking re-tests
+                 CameraNear(res.frame, frame, 0.05f, 50.0f) &&  // ~3 degrees, 50 units: turning or walking re-tests
+                 (res.bounds.Same(bounds) ||
+                  (st_retest_occ_moved.fetch_add(1, std::memory_order_relaxed), false))) {
           skip_test = true;
           st_retest_occ_skipped.fetch_add(1, std::memory_order_relaxed);
         } else {
@@ -2591,12 +2833,17 @@ REX_HOOK_RAW(sub_827486B8) {
         }
       }
       // me2_occlusion_umbra_cpu: the CPU's answer to this test; with mode 2 it answers Umbra and no box is drawn.
-      if (CpuMode()) {
+      if (CpuMode() && CpuSlotOn()) {
         const auto test_start = std::chrono::steady_clock::now();
         uint8_t answer = CpuTest(base, rec, frame);
+        if (index < kIndexKeys) {
+          g_raster_alt[index] = CpuSource() == 1 ? t_raster_alt : 0;
+          g_raster_token[index] = CpuSource() == 1 ? Me2RasterTakeToken() : 0;
+        }
         // me2_occlusion_cpu_hold: an undecided test (a hole, the near plane) of a key the CPU itself found occluded
-        // within the last N frames stays occluded (10) until the grid covers it again.
-        if (key) {
+        // within the last N frames stays occluded (10) until the grid covers it again. (Grid noise rules: not for the
+        // rasterizer, me2_occlusion_cpu_source 1.)
+        if (key && CpuSource() == 0) {
           static const uint64_t hold = uint64_t(REXCVAR_GET(me2_occlusion_cpu_hold));
           if (LatentSlot* held = LatentFind(key)) {
             static const uint8_t debounce = uint8_t(REXCVAR_GET(me2_occlusion_cpu_debounce));
@@ -2628,7 +2875,7 @@ REX_HOOK_RAW(sub_827486B8) {
         // 2026-10-28 20:36 (PC compare: most misses were reprojection holes, mostly what was off the screen 2-3
         // frames ago): only a test the grid can decide (occluded, visible by depth, off the screen) is answered by the
         // CPU and has no box; a hole or the near plane keeps the box and the latent answer (the GPU's count).
-        if (CpuMode() == 2 && CpuDecided(answer))
+        if (CpuAnswers() && CpuDecided(answer))
           skip_test = true;
       }
       SetIndexKey(index, key, skip_test, bounds);
@@ -2661,13 +2908,13 @@ REX_HOOK_RAW(sub_827486B8) {
       t_cpu_index = index;
       // 2026-10-28 20:5x: the read may come frames after its test (opcode 131); its CPU answer stays good for that
       // read (the test drew no box, so the latent path would have only an old count: 'visible', a prompt blinking).
-      if (CpuMode() == 2 && index < kIndexKeys && g_cpu_answers[index].tag == index + 1 &&
+      if (CpuAnswers() && index < kIndexKeys && g_cpu_answers[index].tag == index + 1 &&
           IndexEpoch(index) == g_latent_view.epoch && frame - g_cpu_answers[index].frame <= 8 &&
           CpuDecided(g_cpu_answers[index].answer)) {
         t_cpu_answer = g_cpu_answers[index].answer;
         if (g_cpu_answers[index].frame != frame)
           st_cpu_late_reads.fetch_add(1, std::memory_order_relaxed);
-      } else if (CpuMode() == 2) {
+      } else if (CpuAnswers()) {
         st_cpu_latent_reads.fetch_add(1, std::memory_order_relaxed);
         if (index < kIndexKeys && g_cpu_answers[index].tag == index + 1 && CpuDecided(g_cpu_answers[index].answer))
           st_cpu_stale_reads.fetch_add(1, std::memory_order_relaxed);
@@ -2690,7 +2937,10 @@ REX_HOOK_RAW(sub_827486B8) {
                                     g_cpu_answers[index].frame == frame
                                 ? g_cpu_answers[index].answer
                                 : 0;
-        g_latent.pending.push_back({seq, key, frame, cpu, IndexBounds(index), IndexEpoch(index)});
+        const uint8_t cpu_alt = cpu && index < kIndexKeys ? g_raster_alt[index] : 0;
+        const uint32_t raster_token = cpu && index < kIndexKeys ? g_raster_token[index] : 0;
+        g_latent.pending.push_back(
+            {seq, key, frame, cpu, IndexBounds(index), IndexEpoch(index), cpu_alt, raster_token});
         if (WallTraceAllowed(key, frame))
           REXLOG_INFO("[umbra-chain-v1] issued end frame {} self {:08X} rec {:08X} index {} query {:08X} seq {} beginframe {}",
                       frame, self, rec, index, query, seq, g_records[seq & (kRecords - 1)].frame.load());
@@ -2741,6 +2991,643 @@ REX_HOOK_RAW(sub_827486B8) {
   }
 }
 
+// me2-nx-deko (2026-11-05, stage 0 of the native static draw lists): which of Umbra's render commands draw. On Umbra
+// levels the visible objects are drawn from inside Umbra's traversal through this interpreter (console stacks
+// 2026-10-27), not through TStaticMeshDrawList::DrawVisible (me2_drawlist_diag.cpp: those drew almost nothing in the
+// prologue). me2_umbra_cmd_diag: per opcode its own calls, draws and time (nested commands taken off their parent),
+// the top ones every 10 s as "[umbra-cmd]" (UE3 render thread).
+REXCVAR_DEFINE_BOOL(me2_umbra_cmd_diag, false, "ME2/Diagnostics",
+                    "Count calls, draws and time of each Umbra render command (sub_827486B8 opcodes), \"[umbra-cmd]\" "
+                    "lines every 10 s")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+extern std::atomic<uint64_t> g_me2_draws_total;  // renut d3d hooks/draw.cpp: every draw
+namespace {
+struct UmbraCmdStat {
+  uint64_t calls = 0, draws = 0, ns = 0;
+};
+UmbraCmdStat g_cmd[256];
+struct UmbraCmdFrame {
+  uint64_t child_ns = 0, child_draws = 0;
+};
+UmbraCmdFrame g_cmd_stack[64];
+int g_cmd_depth = 0;
+std::chrono::steady_clock::time_point g_cmd_window{};
+uint64_t g_cmd_frames0 = 0, g_cmd_all0 = 0;
+void UmbraCmdReport(std::chrono::steady_clock::time_point now) {
+  const uint64_t frame = g_sa2_game_frames.load(std::memory_order_relaxed);
+  const double f = double(std::max<uint64_t>(1, frame - g_cmd_frames0));
+  const uint64_t all = g_me2_draws_total.load(std::memory_order_relaxed) - g_cmd_all0;
+  std::array<int, 256> order{};
+  for (int i = 0; i < 256; ++i) order[i] = i;
+  std::sort(order.begin(), order.end(), [](int a, int b) {
+    return g_cmd[a].draws != g_cmd[b].draws ? g_cmd[a].draws > g_cmd[b].draws : g_cmd[a].ns > g_cmd[b].ns;
+  });
+  std::string by;
+  uint64_t total_draws = 0, total_ns = 0;
+  for (int i = 0; i < 256; ++i) {
+    total_draws += g_cmd[i].draws;
+    total_ns += g_cmd[i].ns;
+  }
+  int shown = 0;
+  for (int i : order) {
+    const UmbraCmdStat& c = g_cmd[i];
+    if (!c.calls || shown >= 14) continue;
+    ++shown;
+    by += fmt::format("; op {} {:.0f} calls {:.0f} draws {:.3f} ms", i, double(c.calls) / f, double(c.draws) / f,
+                      double(c.ns) / 1e6 / f);
+  }
+  REXLOG_INFO("[umbra-cmd] {:.0f} s: Umbra's commands drew {:.0f} draws a frame ({:.1f} % of all draws), {:.2f} ms a "
+              "frame of their own time; per frame by opcode (own draws / time){}",
+              std::chrono::duration<double>(now - g_cmd_window).count(), double(total_draws) / f,
+              all ? 100.0 * double(total_draws) / double(all) : 0.0, double(total_ns) / 1e6 / f, by);
+  for (auto& c : g_cmd) c = UmbraCmdStat{};
+  g_cmd_window = now;
+  g_cmd_frames0 = frame;
+  g_cmd_all0 = g_me2_draws_total.load(std::memory_order_relaxed);
+}
+}  // namespace
+
+// me2-nx-deko (2026-11-05, native visibility step 1): me2_umbra_record_s = N records, every N seconds, one Umbra query
+// (from its op 0 to its op 1 on the render thread) command by command: op, nesting depth, the command record's current
+// instance (cmd = [this + 4], index [cmd + 48]; wrapper = [[0x833960E4 + 4] + 4 * index]: +0 the primitive scene info,
+// +8..+20 its bounding sphere) and the draws each command made. Consecutive commands of the same op and depth are
+// written as one run ("[umbra-rec]" lines).
+REXCVAR_DEFINE_INT32(me2_umbra_record_s, 0, "ME2/Diagnostics",
+                     "Every this many seconds, record one Umbra query command by command (\"[umbra-rec]\" lines); "
+                     "0 = off")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+namespace {
+constexpr uint32_t kUmbraInstanceTable = 0x833960E4u;  // TU2: +4 the wrapper pointers (82DDEC08)
+struct RecItem {
+  uint8_t op = 0, depth = 0;
+  int32_t inst = -1;
+  uint32_t wrapper = 0, psi = 0, proxy_vt = 0, draws = 0;
+  float radius = 0;
+  uint32_t mask = 0xFFFFFFFFu;  // op 48: the batch mask Umbra computed (sub_82DE5318 -> [[0x83396130 + 4] + 4 * index])
+};
+std::vector<RecItem> g_rec;
+bool g_rec_active = false;
+int g_rec_depth = 0;
+uint64_t g_rec_count = 0;
+std::chrono::steady_clock::time_point g_rec_next{};
+inline uint32_t RecL32(const uint8_t* base, uint32_t va) {
+  uint32_t v;
+  std::memcpy(&v, base + va, 4);
+  return __builtin_bswap32(v);
+}
+inline bool RecOk(uint32_t va) { return va >= 0x10000u && va < 0xF0000000u; }
+void RecDump(const uint8_t* base) {
+  ++g_rec_count;
+  std::unordered_map<uint32_t, int> distinct48;
+  uint64_t n48 = 0, n50 = 0, draws = 0;
+  for (const RecItem& r : g_rec) {
+    if (r.op == 48) ++n48, distinct48[uint32_t(r.inst)]++;
+    if (r.op == 50) ++n50;
+    draws += r.draws;
+  }
+  {
+    std::unordered_map<uint32_t, int> masks;
+    for (const RecItem& r : g_rec)
+      if (r.op == 48) masks[r.mask]++;
+    std::string mh;
+    for (auto& kv : masks) mh += fmt::format(" {:X}:{}", kv.first, kv.second);
+    REXLOG_INFO("[umbra-rec] op 48 batch masks (mask:count):{}; planes {} (source {}), gate {:08X}", mh,
+                RecL32(base, 0x8339AFC4u), RecL32(base, 0x8339AFC4u), RecL32(base, 0x83395FA0u));
+    std::string pl;
+    const uint32_t n = std::min<uint32_t>(RecL32(base, 0x8339AFC4u), 8);
+    for (uint32_t k = 0; k < n; ++k) {
+      float v[4];
+      for (int c = 0; c < 4; ++c) {
+        const uint32_t w = RecL32(base, 0x8339AFC8u + 16 * k + 4 * c);
+        std::memcpy(&v[c], &w, 4);
+      }
+      pl += fmt::format(" ({:.3f} {:.3f} {:.3f} {:.0f})", v[0], v[1], v[2], v[3]);
+    }
+    if (!pl.empty()) REXLOG_INFO("[umbra-rec] planes:{}", pl);
+  }
+  REXLOG_INFO("[umbra-rec] query {}: {} commands, op 48 x{} ({} distinct instances), op 50 x{}, {} draws; instance "
+              "table words {:08X} {:08X} {:08X} {:08X}",
+              g_rec_count, g_rec.size(), n48, distinct48.size(), n50, draws, RecL32(base, kUmbraInstanceTable),
+              RecL32(base, kUmbraInstanceTable + 4), RecL32(base, kUmbraInstanceTable + 8),
+              RecL32(base, kUmbraInstanceTable + 12));
+  std::string line;
+  for (size_t i = 0; i < g_rec.size();) {
+    size_t j = i;
+    uint64_t run_draws = 0;
+    std::string insts;
+    while (j < g_rec.size() && g_rec[j].op == g_rec[i].op && g_rec[j].depth == g_rec[i].depth) {
+      run_draws += g_rec[j].draws;
+      if (g_rec[j].inst >= 0 && j - i < 8)
+        insts += fmt::format(" {}:{:08X}/{:08X}/r{:.0f}", g_rec[j].inst, g_rec[j].psi, g_rec[j].proxy_vt,
+                             g_rec[j].radius);
+      ++j;
+    }
+    line += fmt::format("{}[d{} op{} x{}{}{}{}]", line.empty() ? "" : " ", g_rec[i].depth, g_rec[i].op, j - i,
+                        run_draws ? fmt::format(" draws {}", run_draws) : "", insts, j - i > 8 && !insts.empty() ? " ..." : "");
+    if (line.size() > 1500) {
+      REXLOG_INFO("[umbra-rec] {}", line);
+      line.clear();
+    }
+    i = j;
+  }
+  if (!line.empty()) REXLOG_INFO("[umbra-rec] {}", line);
+  g_rec.clear();
+}
+// Before a command: starts a recording at a top-level op 0 when due, adds the command.
+int RecBefore(PPCContext& ctx, uint8_t* base, uint32_t op) {
+  static const int32_t every_s = REXCVAR_GET(me2_umbra_record_s);
+  if (every_s <= 0) return -1;
+  if (g_rec_active && op == 0 && g_rec_depth == 0 && !g_rec.empty()) {  // no op 1 seen: the next query begins
+    g_rec_active = false;
+    RecDump(base);
+  }
+  if (!g_rec_active && op == 0 && g_rec_depth == 0) {
+    const auto now = std::chrono::steady_clock::now();
+    if (g_rec_next == std::chrono::steady_clock::time_point{}) g_rec_next = now + std::chrono::seconds(every_s);
+    if (now >= g_rec_next) {
+      g_rec_active = true;
+      g_rec.clear();
+      g_rec_next = now + std::chrono::seconds(every_s);
+    }
+  }
+  if (!g_rec_active || g_rec.size() >= 20000) return -1;
+  RecItem r;
+  r.op = uint8_t(op);
+  r.depth = uint8_t(std::min(g_rec_depth, 255));
+  const uint32_t self = ctx.r3.u32;
+  const uint32_t cmd = RecOk(self) ? RecL32(base, self + 4) : 0;
+  if (RecOk(cmd)) {
+    r.inst = int32_t(RecL32(base, cmd + 48));
+    const uint32_t table = RecL32(base, kUmbraInstanceTable + 4);
+    if (r.inst >= 0 && RecOk(table)) {
+      r.wrapper = RecL32(base, table + 4u * uint32_t(r.inst));
+      if (RecL32(base, 0x83395FA0u) != 0 && RecOk(RecL32(base, 0x83396134u)))
+        r.mask = RecL32(base, RecL32(base, 0x83396134u) + 4u * uint32_t(r.inst));
+      if (RecOk(r.wrapper)) {
+        r.psi = RecL32(base, r.wrapper);
+        const uint32_t rb = RecL32(base, r.wrapper + 20);
+        std::memcpy(&r.radius, &rb, 4);
+        const uint32_t proxy = RecOk(r.psi) ? RecL32(base, r.psi + 8) : 0;
+        r.proxy_vt = RecOk(proxy) ? RecL32(base, proxy) : 0;
+      }
+    }
+  }
+  g_rec.push_back(r);
+  return int(g_rec.size() - 1);
+}
+}  // namespace
+
+// me2-nx-deko (2026-11-05, native visibility step 2, SHADOW): me2_native_vis_shadow computes, at each top-level Umbra
+// query start (op 0) with a rasterizer buffer for the frame, our own visible set: every instance of Umbra's table
+// (wrapper +0 = the primitive scene info; its bounds at +48: origin, box extent, sphere radius) tested as a box against
+// the frustum and the CPU depth buffer (Me2RasterTestBox). During the query Umbra's reports are noted per instance (op
+// 50 = asked for the draw distance, op 48 = reported visible); at its op 1 the two sets are compared. Nothing that is
+// drawn changes. "[native-vis]" lines every 10 s.
+REXCVAR_DEFINE_BOOL(me2_native_vis_shadow, true, "ME2/Diagnostics",
+                    "Native visibility shadow mode: compute our own visible set per Umbra query and compare it with "
+                    "Umbra's (\"[native-vis]\" lines); changes nothing drawn")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// Step 2.5 (2026-11-05): with the shadow set computed, an instance Umbra reports (ops 50 / 48 / 144) that our box test
+// calls occluded (code 2) is not passed on: on screen the native result for those instances. Frustum disagreements and
+// instances without usable bounds keep Umbra's verdict. "native_vis" in me2_ab_cycle turns it off in its slots.
+// Step 3 (2026-11-05): me2_native_vis replaces Umbra's traversal (sub_82DFD790, called by the query sub_82DF0A88 between
+// its commands 160 and 161; before it the query's setup and op 0, after it the delivery sub_82DF08D8 -> sub_82DECC28
+// with the drawing commands 162 / 164 / 165 / 163 / 1, all still Umbra's and UE3's own). In its place, for every
+// instance of our visible set (codes 1 visible, 3 near plane, 6 no usable bounds, and 5 when the bounds lie far from
+// the primitive's own transform): the command record's instance (cmd = [[query + 432] + 4], index at cmd + 48), the
+// skip byte cmd + 108 cleared, op 50 (UE3's draw distance: "skip_instance" sets the byte), then unless skipped op 48
+// and op 144; then op 145 (the state restore Umbra sends after its test rounds). Needs me2_native_vis_shadow (the set
+// is computed at op 0). "native_vis" in me2_ab_cycle gives Umbra's traversal back in its slots.
+REXCVAR_DEFINE_BOOL(me2_native_vis, true, "ME2",
+                    "Replace Umbra's traversal with the native visible set (needs me2_native_vis_shadow; default on "
+                    "since the console A/Bs of 2026-11-05: +9-14 % fps in Omega, nothing visibly wrong)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(me2_native_vis_filter, false, "ME2",
+                    "TEST: drop Umbra's reports of instances that the native visibility test calls occluded (needs "
+                    "me2_native_vis_shadow)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+namespace {
+struct NvQuery {
+  bool active = false;
+  uint32_t count = 0;
+  std::vector<uint8_t> ours;   // per instance: our code (0 = not tested, 1 visible, 2 occluded, 3 near, 5 frustum,
+                               // 6 no usable bounds, 7 no primitive, 8 frustum but bounds far from the transform)
+  bool native = false;         // this query's traversal was ours (no comparison)
+  std::vector<uint8_t> umbra;  // per instance: bit 0 op 50, bit 1 op 48, bit 2 op 144
+};
+NvQuery g_nv;
+struct NvStats {
+  uint64_t queries = 0, no_buffer = 0, instances = 0, ns = 0, passes = 0;
+  uint64_t worker_passes = 0, worker_reused = 0, worker_retested = 0, worker_ns = 0;  // me2_native_vis_worker
+  uint64_t umbra_vis = 0, ours_vis = 0, both = 0;
+  uint64_t umbra_only[8] = {};  // Umbra reported it (op 48), we did not: by our code
+  uint64_t ours_only_dist = 0;  // we: visible, Umbra: op 50 without op 48 (UE3's draw distance skipped it)
+  uint64_t ours_only_culled = 0;  // we: visible, Umbra: never asked (its frustum / occlusion / cells culled it)
+  uint64_t culled_by_code[8] = {};  // those by our code (1 visible, 3 near, 6 no bounds)
+  uint64_t umbra_noflag = 0;         // op 48 instances that Umbra never asked op 50 for
+  uint64_t filtered48 = 0, filtered_cmds = 0;  // me2_native_vis_filter: op 48 reports dropped, all reports dropped
+  uint64_t native_queries = 0, native_emitted = 0, native_skipped = 0, native_ns = 0, frustum_kept = 0;
+  uint64_t umbra_trav_queries = 0, umbra_trav_ns = 0;  // Umbra's own traversal (sub_82DFD790) in Umbra queries
+  uint64_t umbra_handler_ns = 0, starve_ns = 0, own_ns = 0;  // handlers 50/48/144 inside Umbra's traversal; the starved
+                                                             // traversal; our reports (handlers + masks)
+  uint64_t ours_tests[8] = {};
+  std::chrono::steady_clock::time_point start{};
+  uint64_t frames0 = 0;
+  std::string examples;  // a few Umbra-only instances that we called occluded
+  int nexamples = 0;
+} g_nvs;
+float NvLF(const uint8_t* base, uint32_t va) {
+  const uint32_t v = RecL32(base, va);
+  float f;
+  std::memcpy(&f, &v, 4);
+  return f;
+}
+// The batch planes (predicated tiling: the world plane through the tile split). Umbra's traversal sets them per query
+// (sub_82DE87D0 -> sub_82DF06D8: each source plane at 0x8339B1D0, count at 0x8339AFC4, transformed into the plane set at
+// 0x8339AFC8 that sub_82DE5318 tests each instance's box against for its batch mask). The native traversal has to set
+// them itself: the source plane (camera space) through the view matrix UE3 hands Umbra (view + 64), normalised.
+constexpr uint32_t kUmbraBoxTable = 0x833960FCu;  // Umbra's per-instance world AABBs (see NvBegin)
+constexpr uint32_t kPlaneCount = 0x8339AFC4u, kPlaneSet = 0x8339AFC8u, kPlaneSource = 0x8339B1D0u;
+uint32_t g_nv_view = 0;  // the view of the current sub_8274AA38 call
+// Diagnostics per mode ([0] Umbra's traversal, [1] native): op 48 batch masks, op 164 flags at entry and draws.
+struct NvModeDiag {
+  uint64_t op48 = 0, mask[4] = {}, mask_other = 0;  // masks 0..3, other values
+  uint64_t op164 = 0, op164_flag_set = 0, op164_draws = 0, op164_drawing = 0;
+};
+NvModeDiag g_nvd[2];
+// The starved traversal (2026-11-05, after the first native try drew nothing: Umbra's delivery sub_82DF08D8 ->
+// sub_82DECC28 sends the drawing commands 162 / 164 / 165 from state its traversal builds, so the traversal must run).
+// While g_nv_starve: Umbra's own reports (50 / 48 / 144) and test boxes (128 / 129 / 131) are dropped and its result
+// reads (130) answered "hidden" at once, so it ends after its first round; t_nv_own marks our own commands.
+bool g_nv_starve = false;
+bool g_nv_in_umbra = false;  // inside Umbra's own (timed) traversal
+thread_local bool t_nv_own = false;
+uint64_t g_starve_dropped = 0, g_starve_hidden = 0;
+double g_plane_err = 0;  // the largest difference to Umbra's own plane so far this window (Umbra queries)
+uint64_t g_plane_checks = 0;
+// Our world planes (up to 8) into out[k][4]; the count, or -1 without a view.
+int NvPlanes(const uint8_t* base, float out[8][4]) {
+  if (!RecOk(g_nv_view)) return -1;
+  const int n = int(std::min<uint32_t>(RecL32(base, kPlaneCount), 8));
+  float v[16];
+  for (int i = 0; i < 16; ++i) v[i] = NvLF(base, g_nv_view + 64 + 4 * uint32_t(i));
+  for (int k = 0; k < n; ++k) {
+    float sp[4];
+    for (int c = 0; c < 4; ++c) sp[c] = NvLF(base, kPlaneSource + 16 * uint32_t(k) + 4 * uint32_t(c));
+    float w[4];
+    for (int i = 0; i < 3; ++i) w[i] = v[i * 4 + 0] * sp[0] + v[i * 4 + 1] * sp[1] + v[i * 4 + 2] * sp[2];
+    w[3] = sp[3] + v[12] * sp[0] + v[13] * sp[1] + v[14] * sp[2];
+    const float len = std::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+    for (int c = 0; c < 4; ++c) out[k][c] = len > 0 ? w[c] / len : w[c];
+  }
+  return n;
+}
+void NvCheckPlanes(const uint8_t* base) {
+  float ours[8][4];
+  const int n = NvPlanes(base, ours);
+  for (int k = 0; k < n; ++k)
+    for (int c = 0; c < 4; ++c) {
+      const float um = NvLF(base, kPlaneSet + 16 * uint32_t(k) + 4 * uint32_t(c));
+      const double scale = c == 3 ? std::max(1.0, std::fabs(double(um))) : 1.0;
+      g_plane_err = std::max(g_plane_err, std::fabs(double(ours[k][c]) - double(um)) / scale);
+    }
+  if (n > 0) ++g_plane_checks;
+}
+void NvBegin(const uint8_t* base, uint32_t commander) {
+  const uint64_t frame = g_sa2_game_frames.load(std::memory_order_relaxed);
+  const uint32_t count = RecL32(base, kUmbraInstanceTable), data = RecL32(base, kUmbraInstanceTable + 4);
+  g_nv.active = false;
+  if (count == 0 || count > 65536 || !RecOk(data)) return;
+  const float probe_mn[3] = {0, 0, 0}, probe_mx[3] = {0, 0, 0};
+  if (Me2RasterTestBox(probe_mn, probe_mx, frame) == 0) {
+    ++g_nvs.no_buffer;
+    return;
+  }
+  // The scene op 48 files instances into ([commander + 44]); its compact primitive array (+1280 data, +1284 count,
+  // 56 bytes, +0 the primitive): an instance is live for this query only if its primitive is that array's entry at the
+  // primitive's own index (+32). 2026-11-05: a main-menu run crashed in op 48 on a slot whose primitive was gone.
+  const uint32_t scene = RecOk(commander) ? RecL32(base, commander + 44) : 0;
+  const uint32_t compact = RecOk(scene) ? RecL32(base, scene + 1280) : 0;
+  const uint32_t ncompact = RecOk(scene) ? RecL32(base, scene + 1284) : 0;
+  if (!RecOk(compact) || ncompact == 0 || ncompact > 1000000) return;
+  const auto t0 = std::chrono::steady_clock::now();
+  g_nv.active = true;
+  g_nv.count = count;
+  g_nv.ours.assign(count, 0);
+  g_nv.umbra.assign(count, 0);
+  ++g_nvs.passes;
+  // 2026-11-05 (console: 3.6 ms a query for ~4200 instances, mostly cache misses of the per-instance pointer chase):
+  // the box (Umbra's own per-instance world AABB table, 0x833960FC: +0 count, +4 data, 24 bytes = min xyz, max xyz;
+  // what sub_82DE5318 tests) and the wrapper table are read in order; the frustum / depth test comes first, and only an
+  // instance it keeps gets the liveness checks (its primitive, proxy, and the scene's compact entry at the primitive's
+  // own index; an instance failing them is never reported: the first native run crashed in op 48 on a dead slot).
+  const uint32_t boxes = RecL32(base, kUmbraBoxTable + 4), nboxes = RecL32(base, kUmbraBoxTable);
+  const bool boxes_ok = RecOk(boxes) && nboxes <= 65536;
+  // me2_native_vis_worker: the worker's codes for every instance whose wrapper and box are unchanged since its copy.
+  const uint8_t* w_boxes = nullptr;
+  const uint32_t* w_wraps = nullptr;
+  const uint8_t* w_codes = nullptr;
+  uint32_t w_count = 0;
+  uint64_t w_ns = 0;
+  const bool worker = boxes_ok && Me2RasterBoxPass(frame, &w_boxes, &w_wraps, &w_codes, &w_count, &w_ns);
+  if (worker) ++g_nvs.worker_passes, g_nvs.worker_ns += w_ns;
+  for (uint32_t i = 0; i < count; ++i) {
+    if (worker && i < w_count && i < nboxes && std::memcmp(&w_wraps[i], base + data + 4 * i, 4) == 0 &&
+        std::memcmp(w_boxes + size_t(i) * 24, base + boxes + 24 * i, 24) == 0) {
+      uint8_t code = w_codes[i];
+      ++g_nvs.worker_reused;
+      if (code == 1 || code == 3) {
+        const uint32_t w = RecL32(base, data + 4 * i);
+        const uint32_t psi = RecL32(base, w);
+        const uint32_t proxy = RecOk(psi) ? RecL32(base, psi + 8) : 0;
+        const uint32_t pidx = RecOk(psi) ? RecL32(base, psi + 32) : 0xFFFFFFFFu;
+        if (!RecOk(psi)) code = 7;
+        else if (!RecOk(proxy) || !RecOk(RecL32(base, proxy)) || pidx >= ncompact ||
+                 RecL32(base, compact + 56 * pidx) != psi)
+          code = 6;
+      }
+      g_nv.ours[i] = code;
+      continue;
+    }
+    if (worker) ++g_nvs.worker_retested;
+    const uint32_t w = RecL32(base, data + 4 * i);
+    if (!RecOk(w) || !boxes_ok || i >= nboxes) {
+      g_nv.ours[i] = RecOk(w) ? 6 : 7;
+      continue;
+    }
+    float mn[3], mx[3];
+    bool ok = true;
+    for (int k = 0; k < 3; ++k) mn[k] = NvLF(base, boxes + 24 * i + 4 * k), mx[k] = NvLF(base, boxes + 24 * i + 12 + 4 * k);
+    for (int k = 0; k < 3; ++k) ok = ok && std::isfinite(mn[k]) && std::isfinite(mx[k]) && mn[k] <= mx[k];
+    if (!ok) {
+      g_nv.ours[i] = 6;
+      continue;
+    }
+    uint8_t code = Me2RasterTestBox(mn, mx, frame);
+    if (code == 1 || code == 3) {
+      const uint32_t psi = RecL32(base, w);
+      const uint32_t proxy = RecOk(psi) ? RecL32(base, psi + 8) : 0;
+      const uint32_t pidx = RecOk(psi) ? RecL32(base, psi + 32) : 0xFFFFFFFFu;
+      if (!RecOk(psi)) code = 7;
+      else if (!RecOk(proxy) || !RecOk(RecL32(base, proxy)) || pidx >= ncompact ||
+               RecL32(base, compact + 56 * pidx) != psi)
+        code = 6;
+    }
+    g_nv.ours[i] = code;
+  }
+  g_nvs.ns += uint64_t(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+}
+// Returns true when the command is to be dropped (me2_native_vis_filter).
+bool NvNote(PPCContext& ctx, uint8_t* base, uint32_t op) {
+  if (!g_nv.active || (op != 48 && op != 50 && op != 144)) return false;
+  const uint32_t self = ctx.r3.u32;
+  const uint32_t cmd = RecOk(self) ? RecL32(base, self + 4) : 0;
+  if (!RecOk(cmd)) return false;
+  const int32_t inst = int32_t(RecL32(base, cmd + 48));
+  if (inst < 0 || uint32_t(inst) >= g_nv.count) return false;
+  g_nv.umbra[size_t(inst)] |= op == 50 ? 1 : op == 48 ? 2 : 4;
+  if (op == 48) {
+    NvModeDiag& dg = g_nvd[g_nv.native ? 1 : 0];
+    ++dg.op48;
+    const uint32_t mt = RecL32(base, 0x83396134u);
+    const uint32_t m = RecOk(mt) ? RecL32(base, mt + 4u * uint32_t(inst)) : 0xFFFFFFFFu;
+    if (m < 4) ++dg.mask[m];
+    else ++dg.mask_other;
+  }
+  static const bool filter = REXCVAR_GET(me2_native_vis_filter);
+  if (!filter || g_nv.ours[size_t(inst)] != 2 || Me2AbOff(Me2Ab::kNativeVis)) return false;
+  ++g_nvs.filtered_cmds;
+  if (op == 48) ++g_nvs.filtered48;
+  return true;
+}
+void NvReport(std::chrono::steady_clock::time_point now) {
+  const uint64_t frame = g_sa2_game_frames.load(std::memory_order_relaxed);
+  const double q = double(std::max<uint64_t>(1, g_nvs.queries));
+  REXLOG_INFO("[native-vis] 10 s: {} queries compared ({} without a raster buffer), {:.0f} instances a query; Umbra "
+              "visible {:.1f}, ours {:.1f}, both {:.1f} a query; native pass {:.0f} us a query",
+              g_nvs.queries, g_nvs.no_buffer, g_nvs.instances / q, g_nvs.umbra_vis / q, g_nvs.ours_vis / q,
+              g_nvs.both / q, double(g_nvs.ns) / 1e3 / double(std::max<uint64_t>(1, g_nvs.passes)));
+  REXLOG_INFO("[native-vis]   Umbra visible but not ours (would vanish): occluded {:.2f}, outside the frustum {:.2f}, "
+              "other {:.2f} a query | ours visible but not Umbra's: draw-distance skip {:.1f}, Umbra culled {:.1f} a "
+              "query | our codes a query: visible {:.0f} occluded {:.0f} near {:.0f} frustum {:.0f} no bounds {:.0f} "
+              "no primitive {:.0f}",
+              g_nvs.umbra_only[2] / q, g_nvs.umbra_only[5] / q,
+              (g_nvs.umbra_only[0] + g_nvs.umbra_only[6] + g_nvs.umbra_only[7]) / q, g_nvs.ours_only_dist / q,
+              g_nvs.ours_only_culled / q, g_nvs.ours_tests[1] / q, g_nvs.ours_tests[2] / q, g_nvs.ours_tests[3] / q,
+              g_nvs.ours_tests[5] / q, g_nvs.ours_tests[6] / q, g_nvs.ours_tests[7] / q);
+  REXLOG_INFO("[native-vis]   ours visible, Umbra culled, by our code: visible {:.1f}, near plane {:.1f}, no bounds "
+              "{:.1f} a query; op 48 without op 50 {:.1f} a query",
+              g_nvs.culled_by_code[1] / q, g_nvs.culled_by_code[3] / q, g_nvs.culled_by_code[6] / q,
+              g_nvs.umbra_noflag / q);
+  for (int md = 0; md < 2; ++md) {
+    const NvModeDiag& dg = g_nvd[md];
+    if (!dg.op48 && !dg.op164) continue;
+    REXLOG_INFO("[native-vis]   {}: op 48 x{} masks 0:{} 1:{} 2:{} 3:{} other {}; op 164 x{}, {} with its batch flag "
+                "set at entry, {} drew ({} draws)",
+                md ? "native" : "Umbra ", dg.op48, dg.mask[0], dg.mask[1], dg.mask[2], dg.mask[3], dg.mask_other,
+                dg.op164, dg.op164_flag_set, dg.op164_drawing, dg.op164_draws);
+  }
+  g_nvd[0] = g_nvd[1] = NvModeDiag{};
+  REXLOG_INFO("[native-vis]   batch planes: {} checks, largest difference ours vs Umbra's {:.5f} (normal; d relative)",
+              g_plane_checks, g_plane_err);
+  g_plane_err = 0;
+  g_plane_checks = 0;
+  if (g_starve_dropped || g_starve_hidden)
+    REXLOG_INFO("[native-vis]   starved Umbra: {} of its commands dropped, {} test reads answered hidden",
+                g_starve_dropped, g_starve_hidden);
+  g_starve_dropped = g_starve_hidden = 0;
+  if (g_nvs.worker_passes)
+    REXLOG_INFO("[native-vis]   worker box pass: {} of {} passes ready in time, {:.0f} us a pass on core 3; {:.1f} "
+                "instances a pass taken from it, {:.1f} re-tested (moved since)",
+                g_nvs.worker_passes, g_nvs.passes, double(g_nvs.worker_ns) / 1e3 / double(g_nvs.worker_passes),
+                double(g_nvs.worker_reused) / double(g_nvs.worker_passes),
+                double(g_nvs.worker_retested) / double(g_nvs.worker_passes));
+  if (g_nvs.umbra_trav_queries)
+    REXLOG_INFO("[native-vis]   UMBRA traversal: {} queries, {:.0f} us a query (its tests answered by the rasterizer "
+                "included); of it UE3's handlers of its reports (50 / 48 / 144) {:.0f} us",
+                g_nvs.umbra_trav_queries, double(g_nvs.umbra_trav_ns) / 1e3 / double(g_nvs.umbra_trav_queries),
+                double(g_nvs.umbra_handler_ns) / 1e3 / double(g_nvs.umbra_trav_queries));
+  if (g_nvs.native_queries)
+    REXLOG_INFO("[native-vis]   NATIVE split: starved Umbra {:.0f} us, our reports (masks + handlers) {:.0f} us a query",
+                double(g_nvs.starve_ns) / 1e3 / double(g_nvs.native_queries),
+                double(g_nvs.own_ns) / 1e3 / double(g_nvs.native_queries));
+  if (g_nvs.native_queries)
+    REXLOG_INFO("[native-vis]   NATIVE traversal: {} queries, {:.1f} instances sent a query ({:.1f} skipped by the draw "
+                "distance), {:.0f} us a query for the commands; {:.1f} frustum-rejected kept for far bounds a query",
+                g_nvs.native_queries, double(g_nvs.native_emitted) / double(g_nvs.native_queries),
+                double(g_nvs.native_skipped) / double(g_nvs.native_queries),
+                double(g_nvs.native_ns) / 1e3 / double(g_nvs.native_queries),
+                double(g_nvs.frustum_kept) / double(std::max<uint64_t>(1, g_nvs.native_queries + g_nvs.queries)));
+  if (g_nvs.filtered_cmds)
+    REXLOG_INFO("[native-vis]   filter: {:.1f} visible reports (op 48) dropped a query ({} commands in all)",
+                g_nvs.filtered48 / q, g_nvs.filtered_cmds);
+  if (!g_nvs.examples.empty()) REXLOG_INFO("[native-vis]   Umbra-visible, our occluded / frustum:{}", g_nvs.examples);
+  (void)frame;
+  g_nvs = NvStats{};
+  g_nvs.start = now;
+}
+void NvReportMaybe();
+void NvEnd(const uint8_t* base) {
+  if (!g_nv.active) return;
+  g_nv.active = false;
+  if (g_nv.native) {
+    g_nv.native = false;
+    NvReportMaybe();
+    return;
+  }
+  NvCheckPlanes(base);
+  ++g_nvs.queries;
+  g_nvs.instances += g_nv.count;
+  const uint32_t data = RecL32(base, kUmbraInstanceTable + 4);
+  for (uint32_t i = 0; i < g_nv.count; ++i) {
+    const uint8_t c = g_nv.ours[i];
+    const bool ours = c == 1 || c == 3;
+    const bool um = (g_nv.umbra[i] & 2) != 0;
+    ++g_nvs.ours_tests[c == 8 ? 1 : (c & 7)];
+    g_nvs.umbra_vis += um;
+    g_nvs.ours_vis += ours;
+    g_nvs.both += um && ours;
+    if (um && !ours) {
+      ++g_nvs.umbra_only[c & 7];
+      if ((c == 2 || c == 5) && g_nvs.nexamples < 6) {
+        ++g_nvs.nexamples;
+        const uint32_t w = RecL32(base, data + 4 * i);
+        const uint32_t psi = RecOk(w) ? RecL32(base, w) : 0;
+        float o[3] = {}, e[3] = {};
+        if (RecOk(psi))
+          for (int k = 0; k < 3; ++k) o[k] = NvLF(base, psi + 48 + 4 * k), e[k] = NvLF(base, psi + 60 + 4 * k);
+        g_nvs.examples += fmt::format(" {}:{}/psi {:08X} r {:.0f} o ({:.0f} {:.0f} {:.0f}) e ({:.0f} {:.0f} {:.0f}) "
+                                      "proxy vt {:08X}",
+                                      i, c == 2 ? "occ" : "frustum", psi, RecOk(psi) ? NvLF(base, psi + 72) : 0.0f,
+                                      o[0], o[1], o[2], e[0], e[1], e[2],
+                                      RecOk(psi) && RecOk(RecL32(base, psi + 8)) ? RecL32(base, RecL32(base, psi + 8)) : 0);
+      }
+    }
+    if (ours && !um) {
+      if (g_nv.umbra[i] & 1) ++g_nvs.ours_only_dist;
+      else ++g_nvs.ours_only_culled, ++g_nvs.culled_by_code[c & 7];
+    }
+    if (um && !(g_nv.umbra[i] & 1)) ++g_nvs.umbra_noflag;
+  }
+  NvReportMaybe();
+}
+void NvReportMaybe() {
+  const auto now = std::chrono::steady_clock::now();
+  if (g_nvs.start == std::chrono::steady_clock::time_point{}) g_nvs.start = now;
+  else if (now - g_nvs.start >= std::chrono::seconds(10)) NvReport(now);
+}
+}  // namespace
+
+REX_HOOK_RAW(sub_827486B8) {
+  static const bool diag = REXCVAR_GET(me2_umbra_cmd_diag);
+  static const bool nv = REXCVAR_GET(me2_native_vis_shadow);
+  const uint32_t rec_op = ctx.r4.u32 & 255;
+  if (g_nv_starve && !t_nv_own) {
+    if (rec_op == 50 || rec_op == 48 || rec_op == 144 || rec_op == 128 || rec_op == 129 || rec_op == 131) {
+      ++g_starve_dropped;
+      return;
+    }
+    if (rec_op == 130) {
+      const uint32_t self = ctx.r3.u32;
+      const uint32_t cmd = RecOk(self) ? RecL32(base, self + 4) : 0;
+      const uint32_t rec = RecOk(cmd) ? RecL32(base, cmd + 52) : 0;
+      if (RecOk(rec)) {
+        base[rec + 4] = 1;  // available
+        std::memset(base + rec + 8, 0, 4);  // 0 pixels: hidden
+        ++g_starve_hidden;
+        return;
+      }
+    }
+  }
+  if (g_nv_in_umbra && (rec_op == 50 || rec_op == 48 || rec_op == 144)) {
+    const auto h0 = std::chrono::steady_clock::now();
+    g_nv_in_umbra = false;
+    NvNote(ctx, base, rec_op);
+    ++g_rec_depth;
+    UmbraCommandHook(ctx, base);
+    --g_rec_depth;
+    g_nv_in_umbra = true;
+    g_nvs.umbra_handler_ns += uint64_t(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - h0).count());
+    return;
+  }
+  if (nv) {
+    if (rec_op == 0 && g_rec_depth == 0) NvBegin(base, ctx.r3.u32);
+    // (our own native reports need no notes: 0.5 % of the console's render thread went to them, 2026-11-05)
+    if (!t_nv_own && NvNote(ctx, base, rec_op)) return;  // filtered: the command is not passed on
+    if (rec_op == 164 && g_nv.active) {
+      NvModeDiag& dg = g_nvd[g_nv.native ? 1 : 0];
+      ++dg.op164;
+      // the flags op 164 tests: 0x8340655C[0 / 1] (it picks one by Umbra's current batch)
+      if (RecL32(base, 0x8340655Cu) || RecL32(base, 0x83406560u)) ++dg.op164_flag_set;
+      const uint64_t d0 = g_me2_draws_total.load(std::memory_order_relaxed);
+      ++g_rec_depth;
+      UmbraCommandHook(ctx, base);
+      --g_rec_depth;
+      const uint64_t d = g_me2_draws_total.load(std::memory_order_relaxed) - d0;
+      dg.op164_draws += d;
+      dg.op164_drawing += d ? 1 : 0;
+      return;
+    }
+    if (rec_op == 1 && g_rec_depth == 0) {
+      ++g_rec_depth;
+      UmbraCommandHook(ctx, base);
+      --g_rec_depth;
+      NvEnd(base);
+      return;
+    }
+  }
+  const int rec = RecBefore(ctx, base, rec_op);
+  if (rec >= 0) {
+    const uint64_t d0 = g_me2_draws_total.load(std::memory_order_relaxed);
+    ++g_rec_depth;
+    if (!diag || g_cmd_depth >= 63) UmbraCommandHook(ctx, base);
+    else {
+      g_cmd_stack[++g_cmd_depth] = UmbraCmdFrame{};
+      UmbraCommandHook(ctx, base);
+      --g_cmd_depth;
+    }
+    --g_rec_depth;
+    if (size_t(rec) < g_rec.size()) g_rec[size_t(rec)].draws = uint32_t(g_me2_draws_total.load(std::memory_order_relaxed) - d0);
+    if (rec_op == 1 && g_rec_depth == 0 && g_rec_active) {
+      g_rec_active = false;
+      RecDump(base);
+    }
+    return;
+  }
+  if (!diag || g_cmd_depth >= 63) {
+    ++g_rec_depth;
+    UmbraCommandHook(ctx, base);
+    --g_rec_depth;
+    return;
+  }
+  const uint32_t op = ctx.r4.u32 & 255;
+  const auto t0 = std::chrono::steady_clock::now();
+  if (g_cmd_window == std::chrono::steady_clock::time_point{}) {
+    g_cmd_window = t0;
+    g_cmd_frames0 = g_sa2_game_frames.load(std::memory_order_relaxed);
+    g_cmd_all0 = g_me2_draws_total.load(std::memory_order_relaxed);
+  }
+  const uint64_t d0 = g_me2_draws_total.load(std::memory_order_relaxed);
+  g_cmd_stack[++g_cmd_depth] = UmbraCmdFrame{};
+  UmbraCommandHook(ctx, base);
+  const UmbraCmdFrame mine = g_cmd_stack[g_cmd_depth--];
+  const auto t1 = std::chrono::steady_clock::now();
+  const uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+  const uint64_t d = g_me2_draws_total.load(std::memory_order_relaxed) - d0;
+  UmbraCmdStat& c = g_cmd[op];
+  ++c.calls;
+  c.ns += ns - std::min(ns, mine.child_ns);
+  c.draws += d - std::min(d, mine.child_draws);
+  if (g_cmd_depth > 0) {
+    g_cmd_stack[g_cmd_depth].child_ns += ns;
+    g_cmd_stack[g_cmd_depth].child_draws += d;
+  } else if (t1 - g_cmd_window >= std::chrono::seconds(10)) {
+    UmbraCmdReport(t1);
+  }
+}
+
 // sub_8274AA38(r3, r4 = view, ...): UE3's per-view Umbra visibility (camera setup + resolveVisibility); its view +64
 // is the view matrix it hands Umbra (copied, inverted, set as the camera transform). Kept per frame for the latent
 // answers' camera check.
@@ -2750,6 +3637,7 @@ REXCVAR_DEFINE_INT32(me2_occlusion_view_dump, 0, "ME2",
                      "in that frame (as floats; [view-dump]); 0 = off")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REX_HOOK_RAW(sub_8274AA38) {
+  g_nv_view = ctx.r4.u32;  // native visibility: the view whose matrix Umbra gets as its camera
   if (static const int32_t dump_every = REXCVAR_GET(me2_occlusion_view_dump); dump_every > 0 && ctx.r4.u32) {
     const uint64_t frame = g_sa2_game_frames.load(std::memory_order_relaxed);
     if (frame % uint64_t(dump_every) == 0) {
@@ -2775,10 +3663,13 @@ REX_HOOK_RAW(sub_8274AA38) {
       std::memcpy(&current.view[i], &view_bits, 4);
       std::memcpy(&current.projection[i], &projection_bits, 4);
     }
+    static const float cut_rot = float(REXCVAR_GET(me2_occlusion_cut_rot));
+    g_latent_view.rot_cut = cut_rot;  // me2-nx-deko (2026-11-04)
     const unsigned reason = g_latent_view.Observe(current, frame);
     ViewAt& v = g_view_hist[frame & (kViewHist - 1)];
     v.frame = frame;
     std::memcpy(v.m, current.view, sizeof(v.m));
+    std::memcpy(v.p, current.projection, sizeof(v.p));
     if (reason) {
       // No table clear and no GPU wait. Epoch tags also reject late old-view
       // results and prevent two negative candidates spanning a camera cut.
@@ -2797,7 +3688,23 @@ REX_HOOK_RAW(sub_8274AA38) {
                     CutVisibleFrames());
     }
   }
-  if (UmbraLatent() && ctx.r4.u32 && CpuMode()) {
+  if (CpuMode() == 2) g_cpu_slot_on.store(!Me2AbOff(Me2Ab::kRaster), std::memory_order_relaxed);
+  if (UmbraLatent() && ctx.r4.u32 && CpuMode() && CpuSource() == 1 && CpuSlotOn()) {
+    // me2_occlusion_cpu_source 1: the occluders drawn with this view's view-projection (view +256) before Umbra's
+    // traversal; r6 = the FScene (sub_8274AF90 passes [renderer +0]).
+    const uint64_t frame = g_sa2_game_frames.load(std::memory_order_relaxed);
+    float vp[16];
+    for (int i = 0; i < 16; ++i) {
+      const uint32_t bits = LoadBE(base, ctx.r4.u32 + 256 + 4 * i);
+      std::memcpy(&vp[i], &bits, 4);
+    }
+    float cam[3] = {};
+    const ViewAt& v = g_view_hist[frame & (kViewHist - 1)];
+    if (v.frame == frame)
+      CameraPos(v.m, cam);
+    Me2RasterFrame(base, ctx.r6.u32, vp, cam, frame, ctx.r7.u32);  // r7 = the FSceneRenderer (sub_8274AF90)
+    if (CpuAnswers()) g_raster_view_frame.store(frame, std::memory_order_relaxed);
+  } else if (UmbraLatent() && ctx.r4.u32 && CpuMode() && CpuSource() == 0 && CpuSlotOn()) {
     // me2_occlusion_umbra_cpu: this frame's view-projection (view +256) to the render thread (its depth grid is taken
     // with it) and the newest finished grid reprojected into it, before Umbra's traversal tests anything.
     if (!renut::gpu::g_occlusion_depth_on) {
@@ -2846,4 +3753,82 @@ extern "C" bool me2_occlusion_camera(float out[3]) {
     }
   }
   return false;
+}
+
+// Step 3: Umbra's traversal (sub_82DFD790(query r3, f1)), replaced by the native visible set when me2_native_vis is on,
+// the shadow set of this query is ready and the A/B slot does not give it back to Umbra.
+REX_EXTERN(__imp__sub_82DFD790);
+REX_EXTERN(sub_82DE5318);  // Umbra: an instance's batch mask (its box against the batch planes)
+REX_HOOK_RAW(sub_82DFD790) {
+  static const bool on = REXCVAR_GET(me2_native_vis);
+  if (!on || !g_nv.active || Me2AbOff(Me2Ab::kNativeVis)) {
+    // Umbra's traversal, timed when the shadow set is computed (the cost the native one replaces).
+    const bool timed = g_nv.active;
+    const auto u0 = std::chrono::steady_clock::now();
+    g_nv_in_umbra = timed;
+    __imp__sub_82DFD790(ctx, base);
+    g_nv_in_umbra = false;
+    if (timed) {
+      ++g_nvs.umbra_trav_queries;
+      g_nvs.umbra_trav_ns += uint64_t(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - u0).count());
+    }
+    return;
+  }
+  const uint32_t query = ctx.r3.u32;
+  const uint32_t commander = RecOk(query) ? RecL32(base, query + 432) : 0;
+  const uint32_t cmd = RecOk(commander) ? RecL32(base, commander + 4) : 0;
+  if (!RecOk(cmd)) {
+    __imp__sub_82DFD790(ctx, base);
+    return;
+  }
+  const auto t0 = std::chrono::steady_clock::now();
+  g_nv.native = true;
+  ++g_nvs.native_queries;
+  const uint32_t sp = ctx.r1.u32;
+  // Umbra's traversal, starved: it sets the query's batch planes and the delivery state, reports nothing.
+  g_nv_starve = true;
+  __imp__sub_82DFD790(ctx, base);
+  g_nv_starve = false;
+  const auto t1 = std::chrono::steady_clock::now();
+  g_nvs.starve_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+  ctx.r1.u32 = sp;
+  auto send = [&](uint32_t op) {
+    ctx.r1.u32 = sp;
+    ctx.r3.u64 = commander;
+    ctx.r4.u64 = op;
+    t_nv_own = true;
+    sub_827486B8(ctx, base);
+    t_nv_own = false;
+  };
+  auto st32 = [&](uint32_t va, uint32_t v) {
+    v = __builtin_bswap32(v);
+    std::memcpy(base + va, &v, 4);
+  };
+  // (the batch planes: set by the starved traversal itself)
+  for (uint32_t i = 0; i < g_nv.count; ++i) {
+    const uint8_t c = g_nv.ours[i];
+    if (!(c == 1 || c == 3)) continue;
+    // The instance's batch mask, as the traversal computes it (against the planes just set).
+    ctx.r1.u32 = sp;
+    ctx.r3.u64 = i;
+    sub_82DE5318(ctx, base);
+    st32(cmd + 48, i);
+    base[cmd + 108] = 0;
+    send(50);
+    ++g_nvs.native_emitted;
+    if (base[cmd + 108]) {
+      base[cmd + 108] = 0;
+      ++g_nvs.native_skipped;
+      continue;
+    }
+    send(48);
+    send(144);
+  }
+  st32(cmd + 48, 0xFFFFFFFFu);
+  ctx.r1.u32 = sp;
+  g_nvs.own_ns += uint64_t(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t1).count());
+  g_nvs.native_ns += uint64_t(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
 }

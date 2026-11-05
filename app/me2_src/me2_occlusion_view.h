@@ -32,6 +32,11 @@ struct Me2OcclusionViewHistory {
   Me2OcclusionView previous;
   uint64_t epoch = 1, frame = 0;
   bool seen = false;
+  // me2-nx-deko (2026-11-04): the largest per-frame change of a view rotation element that still counts as turning, not
+  // a cut (me2_occlusion_cut_rot). Was a fixed 0.2 (~12 degrees a frame): at low frame rates a firm stick turn crossed it
+  // every frame, each "cut" threw every occlusion answer away, frame rate fell further (console, Kasumi's party: 23 fps
+  // looking, 5 fps turning, draws 1,300 -> 4,500 a frame).
+  float rot_cut = 0.2f;
 
   // Conservative discontinuity detection, not an inferred guest bCameraCut bit.
   // Normal walking/turning and small temporal projection jitter keep their cache.
@@ -47,7 +52,7 @@ struct Me2OcclusionViewHistory {
         for (unsigned r = 0; r < 3; ++r)
           for (unsigned c = 0; c < 3; ++c)
             rotation = std::max(rotation, std::fabs(current.view[r * 4 + c] - previous.view[r * 4 + c]));
-        if (rotation > 0.2f) reason |= kRotation;
+        if (rotation > rot_cut) reason |= kRotation;
         float a[3], b[3];
         previous.Position(a);
         current.Position(b);

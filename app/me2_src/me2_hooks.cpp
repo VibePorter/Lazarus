@@ -1,8 +1,9 @@
 // Mass Effect 2 (Xbox 360, XDK 2.0.8955): the hooks Renut's renderer shares with the game side
 // (renut_engine/gpu/banjo_shared_hooks.h). With Renut's renderer chosen they hand over to it; otherwise the original.
-// Addresses: docs/d3d-map.md; base-game addresses.
+// Addresses: tools/deko/D3D_ME2_RENUT.md in the ME2_Recomp tree.
 
 #include <algorithm>
+#include "me2_ab_cycle.h"  // me2-nx-deko (2026-11-04): the draw-count rotation
 #include <atomic>
 #include <chrono>
 #include <map>
@@ -117,6 +118,7 @@ void DiagPrepassStackOn(PPCContext& ctx, uint8_t* base, const char* which, int32
 extern "C" void Me2CerberusOnSwap(const uint8_t* base);  // me2_cerberus.cpp
 REX_EXTERN(__imp__sub_82AA5238);
 REX_HOOK_RAW(sub_82AA5238) {  // D3DDevice_Swap (called by UE3's RHI sub_827DE208 after SynchronizeToPresentationInterval)
+  Me2AbTick();  // me2-nx-deko (2026-11-04): the draw-count rotation (me2_ab_cycle.cpp)
   Me2CerberusOnSwap(base);  // me2_cerberus.cpp (before the yield: with Renut it returns from here)
   SA2_RENUT_YIELD_SHARED(sub_82AA5238);
   __imp__sub_82AA5238(ctx, base);

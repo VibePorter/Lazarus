@@ -47,6 +47,8 @@
 #include <rex/platform.h>
 #include <rex/ppc/context.h>
 
+#include "../me2_watch.h"  // ME2 (2026-11-04)
+
 namespace me::hot {
 
 // Guest memory accessors with the generated code's semantics (big-endian; the +0x1000 physical-range offset of the
@@ -66,6 +68,7 @@ inline uint32_t PhysOff(uint32_t a) {
 inline void MarkCards(uint8_t* base, uint32_t a, uint32_t n) {
 #if !defined(ME_HOT_SHADOW_ACCESSORS)
   if (!n) return;
+  Me2WatchMark(a, n);  // ME2 (2026-11-04): the watched D3D device chunks (me2_watch.h)
   const uint64_t end = uint64_t(a) + n - 1;
   const uint32_t last = end > 0xFFFFFFFFull ? 0xFFFFFu : uint32_t(end >> 12);
   for (uint32_t page = a >> 12; page <= last; ++page) base[page] = 0;
@@ -83,6 +86,7 @@ inline uint8_t* Raw(uint8_t* base, uint32_t a) { return base + a + PhysOff(a); }
 inline const uint8_t* Raw(const uint8_t* base, uint32_t a) { return base + a + PhysOff(a); }
 // Destination of an n-byte scalar store (the St* helpers below).
 inline uint8_t* StorePtr(uint8_t* base, uint32_t a, uint32_t n) {
+  Me2WatchMark(a, n);  // ME2 (2026-11-04): the watched D3D device chunks (me2_watch.h)
   base[a >> 12] = 0;  // the store cards (MarkCards above); an n-byte scalar store reaches one more page at most
   base[(a + (n ? n - 1 : 0)) >> 12] = 0;
   return Raw(base, a);

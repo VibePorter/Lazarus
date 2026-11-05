@@ -264,6 +264,14 @@ class Me2App : public rex::ReXApp {
 #if defined(MGR_RENUT_RENDERER)
     REXLOG_INFO("[me2-deko] ME2 reNut D3D renderer (from mgr-nx-deko v0.2.2); built {} {}",
                 __DATE__, __TIME__);
+    // me2-nx-deko (2026-11-04): __DATE__ / __TIME__ above are this file's compile time, which an incremental build keeps
+    // (two NROs of 11-04 both said 21:28:58). The Switch build script writes me2_build_stamp.h before every build.
+#if __has_include("me2_build_stamp.h")
+#include "me2_build_stamp.h"
+    REXLOG_INFO("[me2-deko] build stamp {}", ME2_BUILD_STAMP);
+#else
+    REXLOG_INFO("[me2-deko] build stamp: none (not a Switch script build)");
+#endif
 #endif
 #if !REX_PLATFORM_SWITCH
     if (!rex::cvar::HasNonDefaultValue("gpu_plugin")) {

@@ -159,6 +159,19 @@ bool UnwatchHotReadPage(uint64_t host_address) {
 #endif
 
 u8* g_store_cards = nullptr;  // ME2 (2026-10-28, from mk9-nx / sa2-nx): the store cards (xmemory.h)
+// ME2 (2026-11-04): the watched range (xmemory.h), the app's object.
+WatchedRange* g_watched_range = nullptr;
+void SetWatchedRange(WatchedRange* range) { g_watched_range = range; }
+void MarkWatchedHost(const void* host, size_t length) {
+  WatchedRange* w = g_watched_range;
+  u8* window = g_store_cards;
+  if (!w || !window || !length) return;
+  const uint64_t offset = uint64_t(reinterpret_cast<const u8*>(host) - window);
+  if (offset >= 0x100000000ull) return;
+  u32 guest = u32(offset);
+  if (detail::PhysicalHostOffset(guest) && guest >= 0xE0001000u) guest -= 0x1000u;
+  MarkWatchedAt(w, guest, length > 0xFFFFFFFFull ? 0xFFFFFFFFu : u32(length));
+}
 
 bool Memory::Initialize() {
   file_name_ = fmt::format("xenia_memory_{}", chrono::Clock::QueryHostTickCount());

@@ -19,6 +19,7 @@
 #include <rex/hook.h>
 #include <rex/logging.h>
 #include <rex/ppc.h>
+#include "me2_ab_cycle.h"  // me2-nx-deko (2026-11-04): the draw-count rotation
 
 #include <algorithm>
 #include <atomic>
@@ -88,6 +89,7 @@ int32_t PrepassFactor() {
   static const int32_t a = REXCVAR_GET(me2_prepass_small_factor);
   static const int32_t b = REXCVAR_GET(me2_prepass_small_factor_b);
   static const int32_t ab_s = REXCVAR_GET(me2_prepass_small_factor_ab_s);
+  if (Me2AbOff(Me2Ab::kPrepassSmall)) return 0;
   if (ab_s <= 0) return a;
   static const auto start = std::chrono::steady_clock::now();
   const auto secs = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count();
@@ -288,7 +290,7 @@ extern "C" double me2_cull_max_distance_sq(double max_sq, uint32_t compact, uint
   float radius;
   std::memcpy(&radius, &bits, sizeof(radius));
   MarkPrepassSmall(compact, base, radius, dist_sq);
-  if (!s.on) return max_sq;
+  if (!s.on || Me2AbOff(Me2Ab::kSmallMesh)) return max_sq;
   ++g_calls;
   if (g_logged < 8) {
     ++g_logged;
@@ -361,6 +363,10 @@ namespace {
 constexpr uint32_t kUmbraObjectTable = 0x833960E8;  // [table]: entry pointers by the command's +48 index
 constexpr uint32_t kUmbraLodOn = 0x83406568;        // the view has a LOD distance (perspective)
 constexpr uint32_t kUmbraLodFactor = 0x8340C920;    // FSceneView +496, then the camera position (+384..+392)
+// me2-nx-deko (2026-11-04): the view's own LOD factor as command 0 wrote it, before me2_lod_distance_scale (mode 1)
+// scaled Umbra's copy for static instances (big-endian, 0 = not seen yet). The size cull uses it: with the scaled copy
+// the two cuts compounded (size factor 60 x LOD 3.0 behaved like 20: a table popped in at ~25 px).
+uint32_t g_umbra_lod_view_be = 0;
 constexpr uint32_t kSkipInstanceString = 0x821932F4;  // "skip_instance"
 struct UmbraCullStats {
   uint64_t tested = 0, static_skipped = 0, dynamic_skipped = 0;
@@ -368,6 +374,7 @@ struct UmbraCullStats {
 } g_umbra_cull;  // UE3's render thread only (Umbra's traversal)
 
 bool UmbraCullOn() {
+  if (Me2AbOff(Me2Ab::kUmbraSize)) return false;
   static const int32_t ab_s = REXCVAR_GET(me2_cull_umbra_ab_s);
   if (ab_s <= 0) return true;
   static const auto start = std::chrono::steady_clock::now();
@@ -391,6 +398,13 @@ void UmbraCullReport() {
 }  // namespace
 
 REX_EXTERN(__imp__sub_82DDDD90);  // Umbra: the callback's answer (self, "skip_instance")
+
+// me2-nx-deko (2026-11-04, user: squadmates' bodies vanish, heads float, with me2_cull_dynamic_factor 40 +
+// me2_lod_distance_scale 2): what the size cull sees for the large dynamic instances it skips.
+REXCVAR_DEFINE_BOOL(me2_cull_umbra_trace, false, "ME2/Diagnostics",
+                    "Log the large dynamic Umbra instances the size cull skips (\"[cull-trace]\": scene-info bounds vs "
+                    "Umbra's own position, camera, LOD factor), up to 12 lines every 10 s")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 // Called by the sub_827486B8 hook (me2_occlusion.cpp) for command 50 before the original; true = answered (skipped).
 extern "C" bool me2_umbra_size_cull(PPCContext& ctx, uint8_t* base) {
@@ -422,7 +436,11 @@ extern "C" bool me2_umbra_size_cull(PPCContext& ctx, uint8_t* base) {
   const uint32_t b = psi + uint32_t(g_psi_bounds_off);
   const float radius = LoadF32(base, b + 24);
   if (!(radius > 0.0f) || radius > (is_static ? static_max : dynamic_max)) return false;
-  const float lod = LoadF32(base, kUmbraLodFactor);
+  float lod = LoadF32(base, kUmbraLodFactor);
+  if (g_umbra_lod_view_be) {  // the view's own factor, not me2_lod_distance_scale's (see g_umbra_lod_view_be)
+    const uint32_t bits = __builtin_bswap32(g_umbra_lod_view_be);
+    std::memcpy(&lod, &bits, 4);
+  }
   if (!(lod > 0.0f)) return false;
   const float dx = LoadF32(base, b) - LoadF32(base, kUmbraLodFactor + 4);
   const float dy = LoadF32(base, b + 4) - LoadF32(base, kUmbraLodFactor + 8);
@@ -430,6 +448,28 @@ extern "C" bool me2_umbra_size_cull(PPCContext& ctx, uint8_t* base) {
   const float d = std::max(is_static ? static_min : dynamic_min, radius * float(factor));
   if ((dx * dx + dy * dy + dz * dz) * lod * lod <= d * d) return false;
   ++(is_static ? g_umbra_cull.static_skipped : g_umbra_cull.dynamic_skipped);
+  static const bool trace = REXCVAR_GET(me2_cull_umbra_trace);
+  if (trace && !is_static && radius >= 40.0f) {
+    static auto window = std::chrono::steady_clock::now();
+    static int lines = 0;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - window >= std::chrono::seconds(10)) {
+      window = now;
+      lines = 0;
+    }
+    if (lines < 12) {
+      ++lines;
+      const float ex = LoadF32(base, entry + 8), ey = LoadF32(base, entry + 12), ez = LoadF32(base, entry + 16);
+      const float cx = LoadF32(base, kUmbraLodFactor + 4), cy = LoadF32(base, kUmbraLodFactor + 8),
+                  cz = LoadF32(base, kUmbraLodFactor + 12);
+      REXLOG_INFO("[cull-trace] dynamic skipped: psi {:08X} radius {:.0f} bounds ({:.0f}, {:.0f}, {:.0f}) umbra entry "
+                  "({:.0f}, {:.0f}, {:.0f}) max {:.0f}; camera ({:.0f}, {:.0f}, {:.0f}); lod {:.3f}; distance by bounds "
+                  "{:.0f}, by entry {:.0f}; limit {:.0f}",
+                  psi, radius, LoadF32(base, b), LoadF32(base, b + 4), LoadF32(base, b + 8), ex, ey, ez,
+                  LoadF32(base, entry + 20), cx, cy, cz, lod, std::sqrt(dx * dx + dy * dy + dz * dz),
+                  std::sqrt((ex - cx) * (ex - cx) + (ey - cy) * (ey - cy) + (ez - cz) * (ez - cz)), d);
+    }
+  }
   // The original's own skip path: sub_82DDDD90(self, "skip_instance"), then return.
   ctx.r3.u64 = self;
   ctx.r4.u64 = kSkipInstanceString;
@@ -472,6 +512,7 @@ void StoreBE32(uint8_t* base, uint32_t va, uint32_t v) {
 int32_t LightFactor() {
   static const int32_t f = REXCVAR_GET(me2_light_small_factor);
   static const int32_t ab_s = REXCVAR_GET(me2_light_small_factor_ab_s);
+  if (f > 0 && Me2AbOff(Me2Ab::kLightSmall)) return 0;
   if (f <= 0 || ab_s <= 0) return f;
   static const auto start = std::chrono::steady_clock::now();
   const auto secs = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count();
@@ -608,8 +649,8 @@ bool LightWholeSmall(uint32_t light, const uint8_t* base, const float cam[3]) {
     return false;
   --g_light_whole_unsized;
   ++g_light_whole_tested;
-  bool on = true;
-  if (ab_s > 0) {
+  bool on = !Me2AbOff(Me2Ab::kLightWhole);
+  if (on && ab_s > 0) {
     static const auto start = std::chrono::steady_clock::now();
     on = ((std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count() / ab_s) &
           1) == 0;
@@ -624,6 +665,154 @@ bool LightWholeSmall(uint32_t light, const uint8_t* base, const float cam[3]) {
 }
 }  // namespace
 
+// me2-nx-deko (2026-11-04): the edge of a light. A dynamic point / spot light reaches every primitive its sphere touches,
+// but UE3's falloff, (1 - (d / Radius)^2)^FalloffExponent, is near 0 in the light's outer shell: an object whose whole
+// bounding sphere lies there gets an additive pass (one draw per mesh element) that adds almost nothing. With
+// me2_light_edge N, a light pass leaves out (dynamic lists and static mesh draw lists alike) every primitive whose
+// brightest possible point, the bounding sphere's point nearest the light, receives less than N % of the light. The
+// bounding sphere holds the mesh, so the real mesh receives less still. Point-light scene info (ctor sub_82325A78):
+// Radius +0x220, 1 / Radius +0x224, FalloffExponent +0x228 (UPointLightComponent +0x184 / +0x188); lights without that
+// layout (directional, others) are left alone.
+REXCVAR_DEFINE_INT32(me2_light_edge, 0, "ME2",
+                     "Dynamic light passes leave out primitives that receive less than this percent of the light at "
+                     "their brightest point (UE3 point-light falloff); 0 = off")
+    .range(0, 50)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// me2-nx-deko (2026-11-04, user: with the light trim at 15, far objects visibly lose their light): the light trim
+// (me2_light_small_factor) weighs how strongly the light reaches the object too. An object keeps the light while its
+// radius x factor x (1 + boost x strength) reaches its distance, strength = the light's falloff at the object's point
+// nearest the light (1 in the light's core, 0 at its edge): objects in a light's bright core keep it up to 1 + boost
+// times farther away, objects the light only grazes are left out as before. Point / spot lights only (the scene info
+// layout of me2_light_edge); other lights keep the plain size rule.
+REXCVAR_DEFINE_INT32(me2_light_small_boost, 0, "ME2",
+                     "me2_light_small_factor also weighs the light's strength at the object: objects in a light's "
+                     "core keep it up to 1 + boost times farther; 0 = the plain size rule")
+    .range(0, 50)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(me2_light_edge_ab_s, 0, "ME2",
+                     "A/B: me2_light_edge on and off in turn every this many seconds; 0 = always on")
+    .range(0, 3600)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+namespace {
+constexpr uint32_t kLightFalloffOff = 0x228;  // point-light scene info: FalloffExponent
+struct LightSphere {
+  float x = 0, y = 0, z = 0, r = 0, inv = 0, exponent = 0, min = 0;  // min: me2_light_edge as a fraction
+  float boost = 0;  // me2_light_small_boost
+  bool ok = false;
+};
+// The light pass running on this thread (ok = false: no edge test).
+thread_local LightSphere t_light_sphere;
+uint64_t g_light_edge_static_left = 0, g_light_edge_dynamic_left = 0, g_light_edge_lights = 0;
+uint64_t g_light_boost_kept = 0;  // light draws the size rule alone would have left out
+
+float LightBoost() {
+  static const int32_t boost = REXCVAR_GET(me2_light_small_boost);
+  if (boost <= 0 || Me2AbOff(Me2Ab::kLightBoost)) return 0.0f;
+  return float(boost);
+}
+
+float LightEdgeFraction() {
+  static const int32_t pct = REXCVAR_GET(me2_light_edge);
+  static const int32_t ab_s = REXCVAR_GET(me2_light_edge_ab_s);
+  if (pct <= 0 || Me2AbOff(Me2Ab::kLightEdge)) return 0.0f;
+  if (ab_s > 0) {
+    static const auto start = std::chrono::steady_clock::now();
+    const auto secs = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count();
+    if ((secs / ab_s) & 1) return 0.0f;
+  }
+  return float(pct) / 100.0f;
+}
+
+// The light's sphere and falloff, when it has the point-light layout.
+LightSphere LightSphereOf(uint32_t light, const uint8_t* base, float min, float boost) {
+  LightSphere s;
+  if ((min <= 0.0f && boost <= 0.0f) || !GuestPtrOk(light)) return s;
+  LearnLightLayout(light, base);
+  if (g_light_l2w_off < 0 || !LightLayoutAt(light, base, uint32_t(g_light_l2w_off))) return s;
+  const float radius = LoadF32(base, light + kLightRadiusOff), inv = LoadF32(base, light + kLightRadiusOff + 4);
+  const float exponent = LoadF32(base, light + kLightFalloffOff);
+  if (!(radius >= 16.0f) || radius > 1.0e6f || !(std::fabs(radius * inv - 1.0f) < 1e-3f)) return s;
+  if (!(exponent > 0.01f) || exponent > 64.0f) return s;
+  const uint32_t m = light + uint32_t(g_light_l2w_off);
+  s.x = LoadF32(base, m + 64);
+  s.y = LoadF32(base, m + 68);
+  s.z = LoadF32(base, m + 72);
+  s.r = radius;
+  s.inv = inv;
+  s.exponent = exponent;
+  s.min = min;
+  s.boost = boost;
+  s.ok = true;
+  return s;
+}
+
+// The light's falloff at the bounding sphere's point nearest the light: 1 inside the sphere's reach of the centre, 0 at
+// and beyond the light's radius.
+float LightStrengthAt(const LightSphere& l, float cx, float cy, float cz, float pr) {
+  if (!l.ok) return 0.0f;
+  const float dx = cx - l.x, dy = cy - l.y, dz = cz - l.z;
+  const float nearest = std::sqrt(dx * dx + dy * dy + dz * dz) - std::max(pr, 0.0f);
+  if (nearest <= 0.0f) return 1.0f;
+  const float t = nearest * l.inv;
+  if (t >= 1.0f) return 0.0f;
+  return std::pow(1.0f - t * t, l.exponent);
+}
+
+// me2_light_small_boost: whether an object the size rule calls small keeps the light anyway (strongly lit).
+// dist_sq: its squared distance from the camera; reach: radius x factor.
+bool BoostKeeps(const LightSphere& l, float cx, float cy, float cz, float pr, double dist_sq, double reach) {
+  if (!l.ok || l.boost <= 0.0f) return false;
+  const double r = reach * (1.0 + double(l.boost) * double(LightStrengthAt(l, cx, cy, cz, pr)));
+  if (dist_sq > r * r) return false;
+  ++g_light_boost_kept;
+  return true;
+}
+
+// Whether a primitive with this bounding sphere gets less than the minimum share of the light anywhere.
+bool OutsideLightEdge(const LightSphere& l, float cx, float cy, float cz, float pr) {
+  if (!l.ok || l.min <= 0.0f || !(pr >= 0.0f)) return false;
+  const float dx = cx - l.x, dy = cy - l.y, dz = cz - l.z;
+  const float nearest = std::sqrt(dx * dx + dy * dy + dz * dz) - pr;
+  if (nearest <= 0.0f) return false;
+  const float t = nearest * l.inv;  // nearest / Radius
+  if (t >= 1.0f) return false;      // outside the sphere: UE3 does not list it anyway; leave UE3's choice alone
+  const float a = std::pow(1.0f - t * t, l.exponent);
+  return a < l.min;
+}
+
+// A static mesh element's bounding sphere (its FPrimitiveSceneInfo's bounds).
+bool ElementSphere(uint32_t element, const uint8_t* base, float out[4]) {
+  if (g_psi_bounds_off < 0 || g_mesh_psi_off < 0) return false;
+  const uint32_t mesh = LoadBE32(base, element + 4);
+  if (!GuestPtrOk(mesh)) return false;
+  const uint32_t psi = MeshPsi(mesh, base);
+  if (!GuestPtrOk(psi)) return false;
+  const uint32_t b = psi + uint32_t(g_psi_bounds_off);
+  out[0] = LoadF32(base, b);
+  out[1] = LoadF32(base, b + 4);
+  out[2] = LoadF32(base, b + 8);
+  out[3] = LoadF32(base, b + 24);
+  return out[3] > 0.0f;
+}
+
+void LightEdgeReport() {
+  static const int32_t pct = REXCVAR_GET(me2_light_edge);
+  static auto last = std::chrono::steady_clock::now();
+  const auto now = std::chrono::steady_clock::now();
+  static const int32_t boost = REXCVAR_GET(me2_light_small_boost);
+  if ((pct <= 0 && boost <= 0) || now - last < std::chrono::seconds(10)) return;
+  REXLOG_INFO("[light-cull] light edge last ~10 s ({} %, now {}): {} point light passes tested, {} static mesh light "
+              "draws and {} lit dynamic primitives left out (they get under {} % of the light); boost {} (now {}): {} "
+              "light draws kept for strongly lit objects the size rule would leave out",
+              pct, LightEdgeFraction() > 0.0f ? "on" : "off", g_light_edge_lights, g_light_edge_static_left,
+              g_light_edge_dynamic_left, pct, boost, LightBoost() > 0.0f ? "on" : "off", g_light_boost_kept);
+  g_light_edge_lights = g_light_edge_static_left = g_light_edge_dynamic_left = 0;
+  g_light_boost_kept = 0;
+  last = now;
+}
+}  // namespace
+
 REX_EXTERN(__imp__sub_82688C70);
 REX_HOOK_RAW(sub_82688C70) {
   {
@@ -633,19 +822,28 @@ REX_HOOK_RAW(sub_82688C70) {
       return;
     }
   }
+  // me2-nx-deko (2026-11-04): the light's edge test (me2_light_edge) for this pass.
+  struct SphereScope {
+    explicit SphereScope(const LightSphere& s) { t_light_sphere = s; }
+    ~SphereScope() { t_light_sphere = LightSphere{}; }
+  } sphere_scope(LightSphereOf(ctx.r4.u32, base, LightEdgeFraction(), LightBoost()));
+  if (t_light_sphere.ok && t_light_sphere.min > 0.0f)
+    ++g_light_edge_lights;
+  LightEdgeReport();
   static const bool configured = REXCVAR_GET(me2_light_small_factor) > 0;
-  if (!configured) {
+  if (!configured && !t_light_sphere.ok) {
     __imp__sub_82688C70(ctx, base);
     return;
   }
-  const int32_t factor = LightFactor();
+  const int32_t factor = configured ? LightFactor() : 0;
   // The static mesh hooks below see the factor while this light pass runs.
   struct FactorScope {
     explicit FactorScope(int32_t f) { t_light_factor = f; }
     ~FactorScope() { t_light_factor = 0; }
   } factor_scope(factor);
   float cam[3];
-  if (factor <= 0 || !me2_occlusion_camera(cam)) {
+  const bool cam_ok = factor > 0 && me2_occlusion_camera(cam);
+  if (!cam_ok && !t_light_sphere.ok) {
     ++g_light_calls;
     __imp__sub_82688C70(ctx, base);
     LightReport(factor);
@@ -684,11 +882,19 @@ REX_HOOK_RAW(sub_82688C70) {
         if (GuestPtrOk(psi)) {
           const uint32_t b = psi + uint32_t(g_psi_bounds_off);
           const float radius = LoadF32(base, b + 24);
-          if (radius > 0.0f && radius <= max_radius) {
+          if (cam_ok && radius > 0.0f && radius <= max_radius) {
             const double dx = LoadF32(base, b) - cam[0], dy = LoadF32(base, b + 4) - cam[1],
                          dz = LoadF32(base, b + 8) - cam[2];
             const double d = double(radius) * f;
             small = dx * dx + dy * dy + dz * dz > d * d;
+            if (small && BoostKeeps(t_light_sphere, LoadF32(base, b), LoadF32(base, b + 4), LoadF32(base, b + 8),
+                                    radius, dx * dx + dy * dy + dz * dz, d))
+              small = false;
+          }
+          if (!small && OutsideLightEdge(t_light_sphere, LoadF32(base, b), LoadF32(base, b + 4), LoadF32(base, b + 8),
+                                         radius)) {
+            small = true;
+            ++g_light_edge_dynamic_left;
           }
         }
         if (small) {
@@ -731,10 +937,28 @@ REX_HOOK_RAW(sub_82688C70) {
 namespace {
 inline bool LightStaticSkip(uint32_t element, const uint8_t* base) {
   const int32_t factor = t_light_factor;
-  if (factor <= 0 || !GuestPtrOk(element))
+  const bool edge = t_light_sphere.ok;
+  if ((factor <= 0 && !edge) || !GuestPtrOk(element))
     return false;
   static const float max_radius = float(REXCVAR_GET(me2_light_small_max_radius));
-  const bool skip = ElementSmall(element, base, factor, max_radius);
+  bool skip = factor > 0 && ElementSmall(element, base, factor, max_radius);
+  float sphere[4];
+  // me2-nx-deko (2026-11-04): me2_light_small_boost (strongly lit objects keep the light farther away).
+  if (skip && t_light_sphere.ok && t_light_sphere.boost > 0.0f && ElementSphere(element, base, sphere)) {
+    float cam[3];
+    if (me2_occlusion_camera(cam)) {
+      const double dx = sphere[0] - cam[0], dy = sphere[1] - cam[1], dz = sphere[2] - cam[2];
+      if (BoostKeeps(t_light_sphere, sphere[0], sphere[1], sphere[2], sphere[3], dx * dx + dy * dy + dz * dz,
+                     double(sphere[3]) * double(factor)))
+        skip = false;
+    }
+  }
+  // me2-nx-deko (2026-11-04): me2_light_edge.
+  if (!skip && edge && ElementSphere(element, base, sphere) &&
+      OutsideLightEdge(t_light_sphere, sphere[0], sphere[1], sphere[2], sphere[3])) {
+    ++g_light_edge_static_left;
+    return true;
+  }
   ++(skip ? g_light_static_left : g_light_static_kept);
   return skip;
 }
@@ -774,9 +998,89 @@ REXCVAR_DEFINE_INT32(me2_lod_distance_ab_s, 0, "ME2",
     .range(0, 3600)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+// me2-nx-deko (2026-11-04, user: with the scale at 2.0 Miranda's and Jacob's bodies vanished, their heads floating; the
+// draw-count rotation pinned it on this scale, its "off" slot brought them back). Scaling the view's factor also moves
+// UE3's skeletal mesh LOD choice (screen size), and ME2's character bodies drop out with it. Mode 1 scales only Umbra's
+// copy of the factor (kUmbraLodFactor, written by command 0, read by command 50 for every instance's LOD band and draw
+// distance on Umbra levels): the static mesh LODs and draw distances that save the draws, characters untouched.
+REXCVAR_DEFINE_INT32(me2_lod_distance_scale_mode, 1, "ME2",
+                     "me2_lod_distance_scale applies to: 1 = Umbra's per-instance LOD / draw distance only (skeletal "
+                     "meshes untouched), 0 = the whole view (also skeletal mesh LOD: character bodies can vanish)")
+    .range(0, 1)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+namespace {
+bool LodScaleOn(double& scale) {
+  static const double s = REXCVAR_GET(me2_lod_distance_scale);
+  if (!(s > 0.0) || s == 1.0) return false;
+  if (Me2AbOff(Me2Ab::kLod)) return false;
+  static const int32_t ab_s = REXCVAR_GET(me2_lod_distance_ab_s);
+  if (ab_s > 0) {
+    static const auto start = std::chrono::steady_clock::now();
+    const auto secs = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count();
+    if ((secs / ab_s) & 1) return false;
+  }
+  scale = s;
+  return true;
+}
+}  // namespace
+
+// Mode 1: called for each command 50 (one instance's LOD / draw-distance question) before the original. Command 0
+// wrote the view's factor into kUmbraLodFactor; here a static mesh instance gets it scaled and every other instance
+// (skeletal meshes: characters) the view's own value. 2026-11-04 (user, PC): scaling the copy for every instance still
+// made Miranda's and Jacob's bodies vanish (the LOD-off slot of the rotation brought them back): Umbra asks command 50
+// for the characters' instances too. A value equal to neither of the two last written is a new one from command 0.
+extern "C" void me2_lod_distance_scale_umbra(PPCContext& ctx, uint8_t* base) {
+  static const int32_t mode = REXCVAR_GET(me2_lod_distance_scale_mode);
+  if (mode != 1) return;
+  static uint32_t orig_be = 0, scaled_be = 0;  // the view's factor and its scaled value, as stored (big-endian)
+  uint32_t be;
+  std::memcpy(&be, base + kUmbraLodFactor, 4);
+  if (be != orig_be && be != scaled_be) {
+    const uint32_t bits = __builtin_bswap32(be);
+    float factor;
+    std::memcpy(&factor, &bits, 4);
+    if (!(factor > 0.0f) || factor > 1e6f) return;
+    double scale = 1.0;
+    const bool on = LodScaleOn(scale);
+    const float scaled = on ? float(double(factor) * scale) : factor;
+    uint32_t sb;
+    std::memcpy(&sb, &scaled, 4);
+    orig_be = be;
+    scaled_be = __builtin_bswap32(sb);
+    g_umbra_lod_view_be = be;
+    static uint32_t logged = 0;
+    if (on && logged < 3) {
+      ++logged;
+      REXLOG_INFO("[lod] Umbra's LOD distance factor x{:.2f} -> {:.4f} for static mesh instances only "
+                  "(me2_lod_distance_scale_mode 1: skeletal meshes untouched)", scale, scaled);
+    }
+  }
+  // This instance: static (its scene info has static meshes) or not.
+  bool is_static = false;
+  const uint32_t self = ctx.r3.u32;
+  if (GuestPtrOk(self)) {
+    const uint32_t cmd = LoadBE32(base, self + 4);
+    const uint32_t table = LoadBE32(base, kUmbraObjectTable);
+    if (GuestPtrOk(cmd) && GuestPtrOk(table)) {
+      const uint32_t index = LoadBE32(base, cmd + 48);
+      if (index != 0xFFFFFFFFu && index <= (1u << 20)) {
+        const uint32_t entry = LoadBE32(base, table + index * 4u);
+        const uint32_t psi = GuestPtrOk(entry) ? LoadBE32(base, entry) : 0;
+        is_static = GuestPtrOk(psi) && int32_t(LoadBE32(base, psi + 0x18)) > 0;  // StaticMeshes.Num()
+      }
+    }
+  }
+  const uint32_t want = is_static ? scaled_be : orig_be;
+  if (want && want != be) std::memcpy(base + kUmbraLodFactor, &want, 4);
+}
+
 extern "C" void me2_lod_distance_scale_view(PPCContext& ctx, uint8_t* base) {
+  static const int32_t mode = REXCVAR_GET(me2_lod_distance_scale_mode);
+  if (mode != 0) return;
   static const double scale = REXCVAR_GET(me2_lod_distance_scale);
   if (!(scale > 0.0) || scale == 1.0 || !ctx.r3.u32) return;
+  if (Me2AbOff(Me2Ab::kLod)) return;
   static const int32_t ab_s = REXCVAR_GET(me2_lod_distance_ab_s);
   if (ab_s > 0) {
     static const auto start = std::chrono::steady_clock::now();
