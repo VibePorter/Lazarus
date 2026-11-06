@@ -19,7 +19,9 @@
 
 #include <algorithm>
 #include <string>
+#include <atomic>
 #include <chrono>
+#include <vector>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -256,6 +258,13 @@ X_RESULT MnkInputDriver::GetDeviceCapabilities(DeviceId id, uint32_t flags,
   return X_ERROR_SUCCESS;
 }
 
+// me2-nx-deko (2026-11-06): marks for the test harness script below. The title sets the environment variable
+// REX_AUTO_INPUT_M<i> (steady_clock nanoseconds) when a moment of its own is reached (ME2: 1 the Press Start screen,
+// 2 the main menu; app me2_menu.cpp Me2AutoInputMark); "M<i>+<seconds>:BTN" then counts from that mark instead of from
+// the first poll, so menu presses do not depend on how long startup takes on this machine. "M<i>+<seconds>~<j>:BTN"
+// is pressed only while mark j is not set yet (repeat a press until it took effect). (An environment variable,
+// not a symbol: the title is a separate module that does not link against this DLL's internals.)
+
 X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
   if (!IsEnabled() || id != kMnkDevice) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
@@ -269,17 +278,55 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
     const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     uint16_t b = 0; uint8_t lt = 0, rt = 0; int32_t lx = 0, ly = 0, rx = 0, ry = 0;
     std::string_view rest(script);
+    // me2-nx-deko (2026-11-06): a press is held until the game has read it on 3 frames (reads at least 25 ms apart) as
+    // well as for its time: the game reads the pad once a frame, and a 0.25 s press inside one long frame (streaming
+    // hitches right after the main menu opens) was never seen (PC 11-06 22:09 / 22:12: a menu DOWN lost).
+    struct Seen {
+      double last = -1.0;
+      int frames = 0;
+    };
+    static std::vector<Seen> seen;
+    size_t index = 0;
     while (!rest.empty()) {
       const size_t semi = rest.find(';');
       std::string_view item = rest.substr(0, semi);
       rest = semi == std::string_view::npos ? std::string_view{} : rest.substr(semi + 1);
+      const size_t me = index++;  // the item's place in the script (its Seen entry)
       const size_t c1 = item.find(':');
       if (c1 == std::string_view::npos) continue;
       const size_t c2 = item.find(':', c1 + 1);
-      const double at = std::atof(std::string(item.substr(0, c1)).c_str());
+      double at = 0.0;
+      if (item.size() > 2 && item[0] == 'M') {  // M<i>+<seconds>[~<j>]: from mark i (not reached yet: not pressed)
+        const int mark = item[1] - '0';
+        const size_t until = item.find('~');
+        if (until != std::string_view::npos && until + 1 < c1) {
+          const char name[] = {'R', 'E', 'X', '_', 'A', 'U', 'T', 'O', '_', 'I', 'N', 'P', 'U', 'T', '_', 'M',
+                               item[until + 1], 0};
+          if (std::getenv(name)) continue;  // mark j reached: no longer pressed
+        }
+        const size_t plus = item.find('+');
+        if (mark < 0 || mark >= 8 || plus == std::string_view::npos || plus > c1) continue;
+        const char name[] = {'R', 'E', 'X', '_', 'A', 'U', 'T', 'O', '_', 'I', 'N', 'P', 'U', 'T', '_', 'M',
+                             char('0' + mark), 0};
+        const char* mv = std::getenv(name);
+        const int64_t m = mv ? std::atoll(mv) : 0;
+        if (!m) continue;
+        const double since_start =
+            double(m - std::chrono::duration_cast<std::chrono::nanoseconds>(start.time_since_epoch()).count()) / 1e9;
+        const size_t secs_end = until != std::string_view::npos && until < c1 ? until : c1;
+        at = since_start + std::atof(std::string(item.substr(plus + 1, secs_end - plus - 1)).c_str());
+      } else {
+        at = std::atof(std::string(item.substr(0, c1)).c_str());
+      }
       const std::string btn(item.substr(c1 + 1, c2 == std::string_view::npos ? std::string_view::npos : c2 - c1 - 1));
       const double dur = c2 == std::string_view::npos ? 0.25 : std::atof(std::string(item.substr(c2 + 1)).c_str());
-      if (t < at || t >= at + dur) continue;
+      if (seen.size() <= me) seen.resize(me + 1);
+      Seen& sn = seen[me];
+      if (t < at || (t >= at + dur && sn.frames >= 3)) continue;
+      if (t - sn.last >= 0.025) {
+        sn.last = t;
+        ++sn.frames;
+      }
       if (btn == "A") b |= X_INPUT_GAMEPAD_A; else if (btn == "B") b |= X_INPUT_GAMEPAD_B;
       else if (btn == "X") b |= X_INPUT_GAMEPAD_X; else if (btn == "Y") b |= X_INPUT_GAMEPAD_Y;
       else if (btn == "START") b |= X_INPUT_GAMEPAD_START; else if (btn == "BACK") b |= X_INPUT_GAMEPAD_BACK;

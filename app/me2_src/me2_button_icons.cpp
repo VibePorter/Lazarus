@@ -27,6 +27,13 @@ REXCVAR_DEFINE_BOOL(me2_switch_button_icons, true, "ME2",
 // 2026-10-27 (user): the diagram's Y icon 1 px higher. In its clip (sprite 23, ControlY, used by two of the three
 // layouts) the icon (sprite 22) is placed by a PlaceObject2 at +0x657, translation 12 bits a value from bit 13031:
 // (-2013, 25) twips; A, B and X sit at y 38-57 twips in theirs.
+// me2-nx-deko (2026-11-06, user: docked at 1080p the icons look low-resolution): Renut holds the replacement icons at
+// their HD size (me2_button_icons_data_hd.inc: 128x128, 4x the 32x32 glowing icons, 2x the 64x64 prompts) with mip
+// levels down to the game's size (render/textures.cpp UpgradeToHdIcon).
+REXCVAR_DEFINE_BOOL(me2_hd_button_icons, true, "ME2",
+                    "The Switch button icons at 128x128 with mip levels (sharp when docked, smooth when drawn small); "
+                    "off: at the game's 32x32 / 64x64")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_DOUBLE(me2_diagram_y_raise, 1.0, "ME2",
                       "Controller diagram: how far up (pixels of the movie) the Y icon moves; 0 = the game's place")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
@@ -43,6 +50,8 @@ REXCVAR_DEFINE_STRING(me2_diag_icon_dump, "", "ME2/Diagnostics",
 
 namespace renut::gpu {
 extern bool (*g_texture_replace)(uint32_t width, uint32_t height, uint8_t* guest_texels);
+extern bool (*g_texture_replace_hd)(uint32_t* scale_code, uint32_t* size, uint32_t* levels, const uint8_t** data);
+extern bool (*g_hd_icons_on)();
 }
 
 namespace {
@@ -55,6 +64,17 @@ struct IconReplacement {
 };
 
 #include "me2_button_icons_data.inc"
+
+// The HD levels of an icon (by the game texture's hash): scale code (Renut RenderScale, 5 = 4x, 3 = 2x), level 0's
+// size, the level count, the HD levels (data) and the game-size replacement as the last level (base).
+struct IconHd {
+  uint64_t hash;
+  uint32_t scale_code, size, levels;
+  const uint8_t* data[2];
+  const uint8_t* base;
+};
+#include "me2_button_icons_data_hd.inc"
+thread_local const IconHd* t_last_hd = nullptr;  // the last Replace hit's, for ReplaceHd
 #include "me2_interrupt_icons_data.inc"
 
 uint64_t Fnv1a64(const uint8_t* p, size_t n) {
@@ -81,15 +101,30 @@ void Dump(uint32_t width, uint32_t height, const uint8_t* texels, uint64_t hash)
   }
 }
 
+bool ReplaceHd(uint32_t* scale_code, uint32_t* size, uint32_t* levels, const uint8_t** data) {
+  static const bool on = REXCVAR_GET(me2_hd_button_icons);
+  const IconHd* hd = t_last_hd;
+  if (!on || !hd || hd->levels < 2 || hd->levels > 3) return false;
+  *scale_code = hd->scale_code;
+  *size = hd->size;
+  *levels = hd->levels;
+  for (uint32_t i = 0; i + 1 < hd->levels; ++i) data[i] = hd->data[i];
+  data[hd->levels - 1] = hd->base;
+  return true;
+}
+
 bool Replace(uint32_t width, uint32_t height, uint8_t* texels) {
   const size_t bytes = size_t(width) * height * 4;
   const uint64_t hash = Fnv1a64(texels, bytes);
   Dump(width, height, texels, hash);
   // Only the sizes the icons have.
   if (!((width == 64 && height == 64) || (width == 32 && height == 32))) return false;
+  t_last_hd = nullptr;
   for (const IconReplacement& r : kIcons) {
     if (r.hash != hash || r.width != width || r.height != height) continue;
     std::memcpy(texels, r.texels, bytes);
+    for (const IconHd& hd : kIconsHd)
+      if (hd.hash == hash) t_last_hd = &hd;
     static std::atomic<uint32_t> logged{0};
     if (logged.fetch_add(1, std::memory_order_relaxed) < 40) REXLOG_INFO("[icons] {} -> Switch icon", r.name);
     return true;
@@ -228,6 +263,12 @@ struct Install {
     renut::gpu::g_texture_replace = [](uint32_t w, uint32_t h, uint8_t* t) {
       static const bool on = REXCVAR_GET(me2_switch_button_icons);
       return on && Replace(w, h, t);
+    };
+    // me2-nx-deko (2026-11-06): the HD levels of the icon just replaced (me2_hd_button_icons).
+    renut::gpu::g_texture_replace_hd = ReplaceHd;
+    renut::gpu::g_hd_icons_on = [] {
+      static const bool on = REXCVAR_GET(me2_switch_button_icons) && REXCVAR_GET(me2_hd_button_icons);
+      return on;
     };
   }
 } g_install;

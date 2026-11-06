@@ -45,10 +45,19 @@
 #include <rex/system/xthread.h>
 #include <rex/system/xtimer.h>
 #include <rex/sys_counters.h>
+#include <rex/cvar.h>
 
 namespace rex::system {
 
-constexpr uint32_t kDeferredOverlappedDelayMillis = 100;
+// me2-nx-deko (2026-11-06): Xenia's fixed latency of every deferred (overlapped) XAM call (XamContentCreate, XamEnumerate,
+// the system UI), now a setting. The calls run one at a time on the dispatch thread, so it adds up: ME2 mounts its 23
+// DLC packages one after another behind the Press Start screen (console 11-06: 12.4 s, ~0.54 s each, of which this
+// sleep was 0.1 s per call), and the main menu waits for the last of them. Any value keeps the call asynchronous (it
+// returns IO_PENDING and completes on the dispatch thread).
+REXCVAR_DEFINE_INT32(kernel_deferred_overlapped_ms, 100, "Kernel",
+                     "Delay before a deferred (overlapped) XAM call runs, in ms (Xenia's 100; 1 = as soon as possible)")
+    .range(0, 1000)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 // This is a global object initialized with the XboxkrnlModule.
 // It references the current kernel state object that all kernel methods should
@@ -1237,9 +1246,9 @@ void KernelState::CompleteOverlappedDeferredEx(
         if (pre_callback) {
           pre_callback();
         }
-        REXSYS_DEBUG("Deferred overlapped {:08X}: sleeping {}ms", overlapped_ptr,
-                     kDeferredOverlappedDelayMillis);
-        rex::thread::Sleep(std::chrono::milliseconds(kDeferredOverlappedDelayMillis));
+        static const int32_t delay_ms = REXCVAR_GET(kernel_deferred_overlapped_ms);
+        REXSYS_DEBUG("Deferred overlapped {:08X}: sleeping {}ms", overlapped_ptr, delay_ms);
+        if (delay_ms > 0) rex::thread::Sleep(std::chrono::milliseconds(delay_ms));
         uint32_t extended_error, length;
         REXSYS_DEBUG("Deferred overlapped {:08X}: running completion", overlapped_ptr);
         auto result = completion_callback(extended_error, length);

@@ -217,6 +217,10 @@ void (*g_me2_draw_observer)(uint32_t device, uint32_t primitive, uint32_t start,
                             uint32_t indexed) = nullptr;
 // ... and after the draw was queued (me2_element_timing: the draw's own cost).
 void (*g_me2_draw_post)() = nullptr;
+// me2-nx-deko (2026-11-07): me2_diag_bad_consts (app/me2_src/hot/me_hot_guest.cpp): the device's shader constants
+// checked at each draw for NaN / huge floats (-1 = cvar not read yet, 0 = off).
+extern "C" int8_t g_me2_bad_consts;
+extern "C" void Me2BadConstsDraw(const uint8_t* device_host, uint32_t device);
 namespace {
 
 // void D3DDevice_DrawVertices(D3DDevice*, D3DPRIMITIVETYPE, UINT StartVertex,
@@ -227,6 +231,8 @@ void D3DDevice_DrawVertices_hook(u32 device, u32 primitive, u32 start_vertex, u3
   g_me2_draws_total.fetch_add(1, std::memory_order_relaxed);
   if (g_me2_draw_observer)
     g_me2_draw_observer(device, primitive, start_vertex, vertex_count, 0);
+  if (g_me2_bad_consts != 0) [[unlikely]]
+    Me2BadConstsDraw(GuestPtr<const uint8_t>(device), device);
   if (DrawCallersOn())
     NoteDrawCaller(device);
   DrawCall call;
@@ -250,6 +256,8 @@ void D3DDevice_DrawIndexedVertices_hook(u32 device, u32 primitive, u32 base_vert
   g_me2_draws_total.fetch_add(1, std::memory_order_relaxed);
   if (g_me2_draw_observer)
     g_me2_draw_observer(device, primitive, start_index, index_count, 1u | (base_vertex << 1));
+  if (g_me2_bad_consts != 0) [[unlikely]]
+    Me2BadConstsDraw(GuestPtr<const uint8_t>(device), device);
   if (DrawCallersOn())
     NoteDrawCaller(device);
   DrawCall call;

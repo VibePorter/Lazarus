@@ -54,6 +54,10 @@ class HostPathDevice : public Device {
   // and read-only devices leave it off (see a5c3a963 ghost-file fix).
   bool allow_share_delete() const { return allow_share_delete_; }
   const std::filesystem::path& host_path() const { return host_path_; }
+  // me2-nx-deko (2026-11-06): where this device's tree index lives (read-only devices; before Initialize). Empty: the
+  // default next to the folder (or vfs_path_index), which suits the game folder but not a package inside a list the
+  // game enumerates.
+  void SetIndexPath(std::filesystem::path path) { index_path_ = std::move(path); }
 
   const std::string& name() const override { return name_; }
   uint32_t attributes() const override { return 0; }
@@ -75,6 +79,7 @@ class HostPathDevice : public Device {
 
   std::string name_;
   std::filesystem::path host_path_;
+  std::filesystem::path index_path_;  // SetIndexPath
   std::unique_ptr<Entry> root_entry_;
   bool read_only_;
   bool allow_share_delete_;

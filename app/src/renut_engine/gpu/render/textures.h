@@ -154,6 +154,21 @@ struct HostTexture {
   uint64_t handed_writes = 0;
   std::shared_ptr<DepthImage> held;
   bool held_current = false;
+  // me2-nx-deko (2026-11-06, me2_renut_color_handover): the same for a colour resolve destination (a whole single-sample
+  // colour target resolved without bias into a single-level 2D texture of its size and format): the copy is drawn only
+  // when the target is written by anything but a whole clear (render/draw.cpp, "Colour hand-over").
+  bool color_handover = false;
+  // me2-nx-deko (2026-11-06): a level of it came from g_texture_replace (the Switch button icons): a point-filtered
+  // fetch that shrinks it is filtered linearly instead (TextureBinding::smooth_minify).
+  bool replaced_icon = false;
+  // me2-nx-deko (2026-11-06, user: docked at 1080p the icons look low-resolution): the icon's HD levels
+  // (g_texture_replace_hd: level 0 is hd_size square, each next half, the last the game-size replacement), and once
+  // UpgradeToHdIcon put them in place, hd_icon: the host texture is hd_size square with hd_count levels, sampled as
+  // hd_scale times the guest's size (TextureBinding::lod_scale; TextureBinding::scale stays 1x for the shaders).
+  const uint8_t *hd_data[4] = {};
+  uint32_t hd_count = 0, hd_size = 0;
+  RenderScale hd_scale;
+  bool hd_icon = false;
 };
 
 struct TextureBinding {
@@ -167,6 +182,11 @@ struct TextureBinding {
   // me2-nx-deko (2026-10-31): the lowest mip level the host texture has yet (HostTexture::resident_from); the
   // sampler's minimum LOD (SamplerSlotLocked).
   uint32_t min_level = 0;
+  // me2-nx-deko (2026-11-06, HostTexture::replaced_icon): the console's hacking mini-game draws the 32x32 button icons
+  // at ~70 % with a point-filtered bitmap fill (RenderDoc, Ryujinx capture 3602: a 32 px quad, the icon ~24 px inside),
+  // which drops every third texel column: the B's right bowls and the A's right leg went missing at 720p (PC at 1080p
+  // draws them full size). The replacement icons are minified linearly; magnification keeps the game's point filter.
+  bool smooth_minify = false;
 };
 
 // Flags on a stacked texture's 3D descriptor index (RENUT_STACKED_TEXTURE,
@@ -231,6 +251,9 @@ TextureBinding BindTextureLocked(u32 texture_va, const TextureFetch &device_fetc
 // (its own texture); and a destination that goes stops holding anything.
 uint32_t DepthHandOverSlotLocked(HostTexture &dest, const plume::RenderComponentMapping &mapping, BindEffects *fx);
 void DepthHandOverForgetLocked(HostTexture &dest);
+// me2-nx-deko (2026-11-06, me2_renut_color_handover): a destination whose content is elsewhere (a target's image or the
+// held one) gets it into its own texture now, for code that reads its texture directly (the final pass's FXAA / upscale).
+void HandOverMaterialiseLocked(HostTexture &dest);
 
 // The guest memory a texture's data spans: pages[0]/sizes[0] its base level,
 // pages[1]/sizes[1] its mip chain (a page is 4 KiB of physical memory; a zero
@@ -301,7 +324,8 @@ void BumpTextureEpochLocked();
 // Bindless sampler slot matching the device fetch constant's sampler state.
 // 'lod_scale' (TextureBinding::lod_scale): a texture with host levels, which
 // are sampled to LOD log2(lod_scale) with linear blending between them.
-uint32_t SamplerSlotLocked(const TextureFetch &device_fetch, RenderScale lod_scale = {}, uint32_t min_level = 0);
+uint32_t SamplerSlotLocked(const TextureFetch &device_fetch, RenderScale lod_scale = {}, uint32_t min_level = 0,
+                           bool smooth_minify = false);
 
 // For the memory report: host textures, and of them the resolve destinations
 // (which the render resolution scales), with the video memory their levels

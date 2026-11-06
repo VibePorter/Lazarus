@@ -20,6 +20,13 @@
 
 #include "../me_hot_common.h"
 
+// me2-nx-deko (2026-11-07, Ryujinx captures 14505 / 15300: a light pass's vertex constants c237-c240 held a memory
+// structure (pointers, small integers, NaN) instead of a matrix, and its pixels came out at 1e34 -> white blobs):
+// me2_diag_bad_consts (me_hot_guest.cpp) logs uploads whose floats are NaN, infinite or huge, with the guest callers.
+// -1 = not read yet, 0 = off, 1 = on.
+extern "C" int8_t g_me2_bad_consts;
+extern "C" void Me2BadConstsCheck(const PPCContext& ctx, const uint8_t* base, bool vertex, uint32_t src, uint32_t count);
+
 namespace me::hot::shader_consts {
 
 inline constexpr Cmp kCmp = {R(3) | R(7), 0, 0};
@@ -36,6 +43,10 @@ inline bool Set(PPCContext& ctx, uint8_t* base, uint32_t base_reg, uint32_t mask
     if (uint64_t(dst) + n > 0x100000000ull || uint64_t(src) + n > 0x100000000ull) return false;
     if (uint64_t(dst) < uint64_t(src) + n && uint64_t(src) < uint64_t(dst) + n) return false;  // overlap
     if (PhysOff(dst) != PhysOff(dst + n - 1) || PhysOff(src) != PhysOff(src + n - 1)) return false;
+#if !defined(ME_HOT_SHADOW_ACCESSORS)
+    if (g_me2_bad_consts != 0) [[unlikely]]
+      Me2BadConstsCheck(ctx, base, base_reg == 120, src, count);
+#endif
     std::memcpy(Raw(base, dst), Raw(base, src), n);
     MarkCards(base, dst, n);  // ME2: the store cards
   }

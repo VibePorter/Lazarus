@@ -74,6 +74,8 @@ if(NOT TARGET rexglue_switch_startup)
         "${_rexglue_switch_driver_stubs}"
         "${CMAKE_CURRENT_LIST_DIR}/../src/ui/switch_crash_hooks.c"
         "${CMAKE_CURRENT_LIST_DIR}/../src/ui/switch_perf.cpp"
+        # me2-nx-deko (2026-11-06, from renut-nx 1.0.2): the NRO's code and read-only data on 2 MB blocks (switch_code_blocks).
+        "${CMAKE_CURRENT_LIST_DIR}/../src/ui/switch_code_blocks.cpp"
         # FPS and resolution for the console overlays (SaltyNX) and Reverse-NX reading.
         "${CMAKE_CURRENT_LIST_DIR}/../src/ui/switch_saltynx.cpp"
         "${CMAKE_CURRENT_LIST_DIR}/../src/ui/switch_sysclk.cpp"

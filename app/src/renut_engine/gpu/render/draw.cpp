@@ -111,6 +111,17 @@ REXCVAR_DEFINE_BOOL(me2_renut_resolve_fuse_exp_bias, true, "ME2/Renderer",
 // answers "visible" (it has no occlusion queries; me2_hooks.cpp), so the flares shone through whatever hid their lights
 // (a white ellipse through a character's head). Their four pixel shaders (matched in capture 6035: the core and its
 // ghosts, two halos, the blue streak) are left out unless this is on.
+REXCVAR_DEFINE_BOOL(me2_renut_color_handover, false, "ME2/Renderer",
+                    "Colour hand-over: a resolve of a whole single-sample colour target into a texture of its size and "
+                    "format (no exponent bias, one level) is not copied; the texture samples the target's image until "
+                    "the target is written, and a whole clear of the target gives the texture that image outright (no "
+                    "copy at all). Any other write draws the copy first ('[color-handover]' lines every 10 s; A/B kind "
+                    "color_handover)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(me2_renut_gpu_profile_quads, true, "ME2/Diagnostics",
+                    "With renut_gpu_profile: draws of at most 6 vertices (full-screen passes) get their own kind in the "
+                    "GPU profile by pixel shader ('quads ...'); only the frames the profile times are affected")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(me2_renut_lens_flares, false, "ME2/Renderer",
                     "Draw the lens flares (always at full strength: the light's occlusion is not known)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
@@ -1253,6 +1264,21 @@ struct Targets {
 // before a depth target is bound again.
 const Targets *g_handover_targets = nullptr;
 void DepthHandOverBeforeBindLocked(HostSurface *surface, const plume::RenderRect *clear_rect, u32 clear_flags);
+// me2-nx-deko (2026-11-06, me2_renut_color_handover; "Colour hand-over" below).
+void ColorHandOverBeforeBindLocked(HostSurface *surface, bool take);
+bool ColorMaterialiseLocked(HostTexture &d, int reason);
+uint32_t ColorHandOverSlotLocked(HostTexture &d, const plume::RenderComponentMapping &mapping, BindEffects *fx);
+// Whether 's' is a colour or the depth target of 't' (a destination is not sampled from the image of its draw's target).
+inline bool SurfaceIsDrawTarget(const HostSurface *s, const Targets *t) {
+  if (!s || !t)
+    return false;
+  if (t->depth == s)
+    return true;
+  for (uint32_t i = 0; i < t->color_count; ++i)
+    if (t->colors[i] == s)
+      return true;
+  return false;
+}
 
 // A rect in guest pixels as host pixels of targets 'scale' times the size.
 plume::RenderRect ScaleRect(const plume::RenderRect &rect, RenderScale scale) {
@@ -1321,29 +1347,58 @@ uint32_t TargetsProfileLabel(const Targets &t) {
 }
 
 // banjo-nx (banjo_renut_diag_gpu_shaders, package 28b): the draw's pass split by its pixel shader and blending.
-uint32_t ShaderProfileLabel(const Targets &t, const ShaderRecord *ps, const PipelineKey &key) {
+// me2-nx-deko (2026-11-06, 'quad'): the same split under "quads ..." for me2_renut_gpu_profile_quads.
+uint32_t ShaderProfileLabel(const Targets &t, const ShaderRecord *ps, const PipelineKey &key, bool quad = false) {
   const uint32_t target = TargetsProfileLabel(t);
   // RB_BLENDCONTROL ONE / ZERO / ADD for colour and alpha (BlendDesc's no-blend case).
   const bool blended = key.color_count && (key.blend_control[0] & 0x1FFF1FFF) != 0x00010001;
-  const uint64_t k = (uint64_t(target) << 44) ^ (ps ? ps->hash : 0x5A5A5A5Au) ^ (blended ? (1ull << 63) : 0);
+  const uint64_t k = (uint64_t(target) << 44) ^ (ps ? ps->hash : 0x5A5A5A5Au) ^ (blended ? (1ull << 63) : 0) ^
+                     (quad ? (1ull << 62) : 0);
   static std::unordered_map<uint64_t, uint32_t> labels;
   if (auto it = labels.find(k); it != labels.end())
     return it->second;
-  const std::string name = ps ? fmt::format("{} | PS {:016X}{}", gpu_profile::Name(target), ps->hash,
+  const char *prefix = quad ? "quads " : "";
+  const std::string name = ps ? fmt::format("{}{} | PS {:016X}{}", prefix, gpu_profile::Name(target), ps->hash,
                                             blended ? " blended" : "")
-                              : fmt::format("{} | no pixel shader", gpu_profile::Name(target));
+                              : fmt::format("{}{} | no pixel shader", prefix, gpu_profile::Name(target));
   const uint32_t label = gpu_profile::Label(name);
   labels.emplace(k, label);
   return label;
 }
 
+// me2-nx-deko (2026-11-06, GPU profile): while set, the kind BindTargets marks instead of the targets' "draws" one.
+// Clears and the 7e3 alias sync marked their kind and then bound their targets, which re-marked "draws WxH": their
+// GPU time was reported as draws (and "clears" / "EDRAM 7e3 alias sync" stayed near zero).
+uint32_t g_profile_hold = 0;
+struct ProfileHold {
+  uint32_t previous;
+  explicit ProfileHold(uint32_t label) : previous(g_profile_hold) { g_profile_hold = label; }
+  ~ProfileHold() { g_profile_hold = previous; }
+};
+
+// me2-nx-deko (2026-11-06, me2_renut_gpu_profile_quads): the GPU profile's kind of a draw. With the cvar, draws of at
+// most 6 vertices (full-screen passes: UE3's EDRAM restores, deferred light / shadow projections, post, copies) get a
+// kind by pixel shader ("quads ..."), the other draws keep their target's; a timestamp only where the kind changes.
+uint32_t DrawProfileLabel(const DrawCall &call, const Targets &t, const ShaderRecord *ps, const PipelineKey &key) {
+  if (banjo::renut_gpu::DiagGpuShadersOn())
+    return ShaderProfileLabel(t, ps, key);
+  static const bool quads = REXCVAR_GET(me2_renut_gpu_profile_quads);
+  const u32 n = call.up_vertices ? call.up_vertex_count : call.count;
+  if (quads && !call.tessellation && n && n <= 6)
+    return ShaderProfileLabel(t, ps, key, true);
+  return TargetsProfileLabel(t);
+}
+
 bool BindTargets(const Targets &t) {
   if (t.depth && t.depth->handed)
     DepthHandOverBeforeBindLocked(t.depth, nullptr, 0);  // banjo-nx (2026-10-19, banjo_deko3d_depth_handover)
+  for (uint32_t i = 0; i < t.color_count; ++i)  // me2-nx-deko (2026-11-06, me2_renut_color_handover)
+    if (t.colors[i] && t.colors[i]->handed)
+      ColorHandOverBeforeBindLocked(t.colors[i], false);
   // banjo-nx: with banjo_renut_diag_gpu_shaders the draw marks its own label (ShaderProfileLabel), the pass's name
   // in it, which saves a timestamp a draw.
   if (!banjo::renut_gpu::DiagGpuShadersOn() && gpu_profile::Timed())
-    gpu_profile::Mark(State(), TargetsProfileLabel(t));
+    gpu_profile::Mark(State(), g_profile_hold ? g_profile_hold : TargetsProfileLabel(t));
   for (uint32_t i = 0; i < t.color_count; ++i)
     TransitionSurfaceLocked(t.colors[i], plume::RenderTextureLayout::COLOR_WRITE);
   if (t.depth)
@@ -1626,8 +1681,11 @@ void SyncEdramAliasLocked(HostSurface *target) {
   t.width = std::min(target->width, source->width);
   t.height = std::min(target->height, source->height);
   t.scale = target->scale;
-  if (!BindTargets(t))
-    return;
+  {
+    const ProfileHold hold(kProfileLabel);  // me2-nx-deko (2026-11-06)
+    if (!BindTargets(t))
+      return;
+  }
   plume::RenderCommandList *cmd = s.command_list;
   const plume::RenderRect host = ScaleRect(plume::RenderRect(0, 0, int32_t(t.width), int32_t(t.height)), t.scale);
   cmd->setViewports(plume::RenderViewport(0.0f, 0.0f, float(host.right), float(host.bottom)));
@@ -2460,7 +2518,7 @@ void FillTextures(const GuestDevice &device, u32 fetch_mask, SharedConstants &sc
         (!m.fx.depth_source || m.depth_epoch == g_depth_epoch) &&
         std::memcmp(m.device, fetch.dword, sizeof(m.device)) == 0 &&
         std::memcmp(m.header, &header->Format, sizeof(m.header)) == 0 &&
-        !(m.fx.handover_surface && g_handover_targets && g_handover_targets->depth == m.fx.handover_surface)) {
+        !SurfaceIsDrawTarget(m.fx.handover_surface, g_handover_targets)) {  // me2-nx-deko: colour targets too
       for (HostTexture *t : m.fx.transition)
         if (t)
           TransitionTextureLocked(t, plume::RenderTextureLayout::SHADER_READ);
@@ -2500,7 +2558,8 @@ void FillTextures(const GuestDevice &device, u32 fetch_mask, SharedConstants &sc
         index |= kStackedLayerWrapBit;
     }
     sc.texture_indices[dim][r] = index;
-    sc.sampler_indices[r] = SamplerWord(SamplerSlotLocked(fetch, binding.lod_scale, binding.min_level));
+    sc.sampler_indices[r] = SamplerWord(SamplerSlotLocked(fetch, binding.lod_scale, binding.min_level,
+                                                          binding.smooth_minify));
     if (memo) {
       m.va = texture_va;
       std::memcpy(m.device, fetch.dword, sizeof(m.device));
@@ -4620,8 +4679,10 @@ bool RepeatDrawLocked(VideoState &s, const u8 *device_state, const DrawCall &cal
                    gpu_streams))
     return false;
   r.seq = chain.seq;
-  if (gpu_profile::Timed())
+  if (gpu_profile::Timed()) {
+    gpu_profile::Mark(s, r.profile_label);  // me2-nx-deko (2026-11-06): no-op unless another kind came between
     gpu_profile::CountDraw(s, r.profile_label);
+  }
   for (u32 i = 0; i < r.targets.color_count; ++i)
     if (r.color_writes & (1u << i))
       ++r.targets.colors[i]->writes, r.targets.colors[i]->write_seq = ++g_edram_write_seq,
@@ -4920,7 +4981,8 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
       continue;
     const u32 va = device.U32(d3d::kDeviceOffsetTextures + r * 4);
     const auto *header = va ? GuestPtr<const d3d::BaseTexture>(va) : nullptr;
-    textures_reused = header && std::memcmp(treuse.header[r], &header->Format, sizeof(treuse.header[r])) == 0;
+    textures_reused = header && std::memcmp(treuse.header[r], &header->Format, sizeof(treuse.header[r])) == 0 &&
+                      !SurfaceIsDrawTarget(treuse.fx[r].handover_surface, &targets);  // me2-nx-deko (2026-11-06)
   }
   if (textures_reused) {
     for (u32 r = 0; r < 32; ++r) {
@@ -5464,10 +5526,10 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
   if (gpu_profile::Timed()) {
     // banjo-nx (package 28b): the GPU profile's draws a frame, and with banjo_renut_diag_gpu_shaders its label.
     // banjo-nx (2026-10-19, render-thread proposal 7): only in the frames the profile times.
-    const uint32_t label = banjo::renut_gpu::DiagGpuShadersOn() ? ShaderProfileLabel(targets, ps, key)
-                                                                : TargetsProfileLabel(targets);
-    if (banjo::renut_gpu::DiagGpuShadersOn())
-      gpu_profile::Mark(s, label);
+    // me2-nx-deko (2026-11-06): marked always (Mark writes only on a change of kind): a "quads" kind and the draws after
+    // it (me2_renut_gpu_profile_quads).
+    const uint32_t label = DrawProfileLabel(call, targets, ps, key);
+    gpu_profile::Mark(s, label);
     gpu_profile::CountDraw(s, label);
   }
   // sa2-nx (2026-10-20, sa2_renut_lean_diagnostics): the draw log's check once, not a call per draw.
@@ -5561,9 +5623,7 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
     r.framebuffer = g_bound.framebuffer;
     r.primitive = call.primitive;
     r.first_vertex = geometry.first_vertex;
-    r.profile_label = !gpu_profile::Timed()                      ? 0
-                      : banjo::renut_gpu::DiagGpuShadersOn() ? ShaderProfileLabel(targets, ps, key)
-                                                             : TargetsProfileLabel(targets);
+    r.profile_label = gpu_profile::Timed() ? DrawProfileLabel(call, targets, ps, key) : 0;
     r.targets = targets;
     r.color_writes = 0;
     for (u32 i = 0; i < targets.color_count && i < key.color_count; ++i)
@@ -5602,6 +5662,8 @@ bool (*g_defer_draws)() = nullptr;
 void (*g_defer_push)(std::function<void(bool draw, u32 retarget_depth_va)> replay, u32 depth_va) = nullptr;
 void (*g_before_depth_resolve)(u32 depth_va) = nullptr;
 void (*g_frame_end)() = nullptr;
+bool (*g_delta_raw_ab_off)() = nullptr;  // me2-nx-deko (2026-11-06): me2_ab_cycle "delta_raw" (queued.cpp WatchRawOn)
+bool (*g_color_handover_ab_off)() = nullptr;  // me2-nx-deko (2026-11-06): me2_ab_cycle "color_handover"
 
 namespace detail {
 
@@ -5762,8 +5824,10 @@ namespace {
 // through the 8-bit view of that EDRAM, then adds the glow particles through a
 // 16-bit float view; the float target kept the frames before, and the glow
 // piled up into drips.
+// me2-nx-deko (2026-11-06): 'profile_label' = the caller's GPU profile kind, held through BindTargets; the copies onto
+// the other formats' views go to "clears: other-format views of the EDRAM".
 void ClearTargets(const Targets &t, u32 flags, const plume::RenderRect &rect, const float color[4],
-                  float depth, u32 stencil) {
+                  float depth, u32 stencil, uint32_t profile_label) {
   if (banjo::renut_gpu::ResolveTraceOn()) {
     RGPU_INFO("[trace] clear {:X} rect ({},{})-({},{}) of {}x{} depth {} stencil {} colour ({}, {}, {}, {}) target {:08X}",
               flags, rect.left, rect.top, rect.right, rect.bottom, t.width, t.height, depth, stencil, color[0],
@@ -5776,8 +5840,18 @@ void ClearTargets(const Targets &t, u32 flags, const plume::RenderRect &rect, co
     DepthHandOverBeforeBindLocked(t.depth, &rect, flags);
   if (t.depth && (flags & 0x20))
     t.depth->stencil_used = true;
-  if (!BindTargets(t))
-    return;
+  // me2-nx-deko (2026-11-06, me2_renut_color_handover): before BindTargets, which would draw the copies.
+  for (uint32_t i = 0; i < t.color_count; ++i) {
+    HostSurface *c = t.colors[i];
+    if (c && c->handed)
+      ColorHandOverBeforeBindLocked(c, (flags & (1u << i)) && rect.left <= 0 && rect.top <= 0 &&
+                                           rect.right >= int32_t(c->width) && rect.bottom >= int32_t(c->height));
+  }
+  {
+    const ProfileHold hold(profile_label);
+    if (!BindTargets(t))
+      return;
+  }
   plume::RenderCommandList *cmd = State().command_list;
   const plume::RenderRect host_rect = ScaleRect(rect, t.scale);
   const plume::RenderColor clear_color(color[0], color[1], color[2], color[3]);
@@ -5805,6 +5879,8 @@ void ClearTargets(const Targets &t, u32 flags, const plume::RenderRect &rect, co
     cmd->clearDepthStencil((flags & 0x10) != 0, (flags & 0x20) != 0, depth, stencil & 0xFF,
                            &host_rect, 1);
   }
+  static const uint32_t kAliasLabel = gpu_profile::Label("clears: other-format views of the EDRAM");
+  const ProfileHold alias_hold(kAliasLabel);
   for (HostSurface *alias : aliases) {
     Targets a;
     a.colors[a.color_count++] = alias;
@@ -5918,6 +5994,8 @@ void UnhandLocked(HostTexture &d) {
 
 // Draws the resolve left out into the destination's own targets, from where its content is.
 bool MaterialiseLocked(HostTexture &d, bool words) {
+  if (d.color_handover)
+    return ColorMaterialiseLocked(d, 3);  // me2-nx-deko (2026-11-06): the target goes (DepthHandOverBeforeRetireLocked)
   ++g_texture_epoch;
   const ClearRect src{d.last_src[0], d.last_src[1], d.last_src[2], d.last_src[3]};
   if (HostSurface *source = d.handed_from) {
@@ -6249,7 +6327,7 @@ void ClearStateLocked(const u8 *device_state, u32 flags, const ClearRect *rect,
   // me2-nx-deko (2026-10-28, GPU profile): clears had no kind and went to whatever was marked before (often "resolves").
   static const uint32_t kProfileLabel = gpu_profile::Label("clears");
   gpu_profile::Mark(s, kProfileLabel);
-  ClearTargets(targets, flags, clear_rect, color, depth, stencil);
+  ClearTargets(targets, flags, clear_rect, color, depth, stencil, kProfileLabel);
 }
 
 // banjo-nx (2026-10-19, banjo_renut_depth_words_lazy): a destination's first resolves write the words either way.
@@ -6281,6 +6359,8 @@ void EnsureDepthWordsLocked(HostTexture &dest) {
 
 // banjo-nx (2026-10-19, banjo_deko3d_depth_handover): see "Depth hand-over".
 uint32_t DepthHandOverSlotLocked(HostTexture &d, const plume::RenderComponentMapping &mapping, BindEffects *fx) {
+  if (d.color_handover)
+    return ColorHandOverSlotLocked(d, mapping, fx);  // me2-nx-deko (2026-11-06, me2_renut_color_handover)
   if (HostSurface *source = d.handed_from) {
     if (!source->texture || source->generation != d.handed_generation || source->writes != d.handed_writes) {
       UnhandLocked(d);
@@ -6344,6 +6424,274 @@ void DepthHandOverBeforeRetireLocked(HostSurface *surface) {
       banjo::renut_gpu::CountHandOver(5);
     }
   }
+}
+
+// Colour hand-over (me2-nx-deko, 2026-11-06, me2_renut_color_handover)
+// ---------------------------------------------------------------------------
+// The depth hand-over's scheme for colour resolves. A resolve of a whole single-sample colour target into a texture of
+// the target's size and format (level 0 of a single-level 2D texture, no exponent bias, no reinterpreting view) is not
+// drawn: the destination's content stays in the target's image (handed_from, with the generation and writes it had),
+// and a bind of the destination samples that image through a view with the destination's component mapping. Before the
+// target is bound again (a draw, a clear, an alias sync: BindTargets), goes, or is a target of a draw that samples the
+// destination, the copy is drawn after all (ColorMaterialiseLocked) from the image still unchanged - the cost of the
+// resolve, only later. A whole clear of the target instead gives the image to the destination ('held') and the
+// destination's previous one (or a new one) to the target, which the clear then fills: on the Xbox 360 the resolve and
+// the clear both happen in EDRAM, here neither copies anything. Code that reads a destination's own texture
+// (the final pass's FXAA / upscale) materialises it first (HandOverMaterialiseLocked).
+
+namespace {
+
+struct ColorHandOverStats {
+  uint64_t considered = 0;                    // colour resolves that fit their destination
+  uint64_t handed = 0, handed_bytes = 0;      // left in the target's image
+  uint64_t taken = 0, taken_bytes = 0;        // ... and given to the destination at a whole clear: copies saved
+  uint64_t drawn[5] = {}, drawn_bytes = 0;    // drawn after all: 0 target written, 1 sampled by a draw into the target,
+                                              // 2 partial resolve into the destination, 3 target gone, 4 read directly
+  uint64_t lost = 0;                          // the target changed unseen: the destination kept stale content
+  uint64_t skip[8] = {}, skip_bytes[8] = {};  // not handed: 0 off, 1 multisampled, 2 part of the target or of the
+                                              // texture, 3 size or scale, 4 format or view, 5 levels / dimension /
+                                              // not a render target, 6 exponent bias, 7 4x view of a 1x backing
+};
+ColorHandOverStats g_chs;
+
+uint64_t HostBytes(const HostTexture &d) {
+  return uint64_t(d.alloc_width) * d.alloc_height * plume::RenderFormatSize(d.host_format);
+}
+
+bool ColorHandOverOn() {
+  static const bool on = REXCVAR_GET(me2_renut_color_handover);
+  return on && !(g_color_handover_ab_off && g_color_handover_ab_off());
+}
+
+void ColorHandOverReportLocked() {
+  static auto last = std::chrono::steady_clock::now();
+  static uint64_t last_frame = TextureFrameLocked();
+  const auto now = std::chrono::steady_clock::now();
+  if (now - last < std::chrono::seconds(10))
+    return;
+  const double secs = std::chrono::duration<double>(now - last).count();
+  const uint64_t frames = std::max<uint64_t>(1, TextureFrameLocked() - last_frame);
+  last = now;
+  last_frame = TextureFrameLocked();
+  static const bool on = REXCVAR_GET(me2_renut_color_handover);
+  if (!on && !g_chs.considered)
+    return;
+  const auto mb = [frames](uint64_t bytes) { return double(bytes) / double(frames) / 1e6; };
+  const uint64_t drawn = g_chs.drawn[0] + g_chs.drawn[1] + g_chs.drawn[2] + g_chs.drawn[3] + g_chs.drawn[4];
+  RGPU_INFO("[color-handover] {:.0f} s, {} frames: {:.1f} colour resolves a frame; handed {:.1f}/f ({:.2f} MB/f); COPIES "
+            "SAVED at a whole clear {:.1f}/f ({:.2f} MB/f); drawn after all {:.1f}/f ({:.2f} MB/f: target written {}, "
+            "sampled while a target {}, partial resolve over it {}, target gone {}, read directly {}); lost {}; not "
+            "handed (count, MB/f): off {} {:.2f}, MSAA {} {:.2f}, part {} {:.2f}, size {} {:.2f}, format {} {:.2f}, "
+            "levels {} {:.2f}, bias {} {:.2f}, 4x {} {:.2f}",
+            secs, frames, double(g_chs.considered) / double(frames), double(g_chs.handed) / double(frames),
+            mb(g_chs.handed_bytes), double(g_chs.taken) / double(frames), mb(g_chs.taken_bytes),
+            double(drawn) / double(frames), mb(g_chs.drawn_bytes), g_chs.drawn[0], g_chs.drawn[1], g_chs.drawn[2],
+            g_chs.drawn[3], g_chs.drawn[4], g_chs.lost, g_chs.skip[0], mb(g_chs.skip_bytes[0]), g_chs.skip[1],
+            mb(g_chs.skip_bytes[1]), g_chs.skip[2], mb(g_chs.skip_bytes[2]), g_chs.skip[3], mb(g_chs.skip_bytes[3]),
+            g_chs.skip[4], mb(g_chs.skip_bytes[4]), g_chs.skip[5], mb(g_chs.skip_bytes[5]), g_chs.skip[6],
+            mb(g_chs.skip_bytes[6]), g_chs.skip[7], mb(g_chs.skip_bytes[7]));
+  g_chs = ColorHandOverStats{};
+}
+
+// The copy a resolve left out: the whole of 'from' (a target, or a held image as one) into d's own texture.
+bool ColorCopyLocked(HostSurface *from, HostTexture &d) {
+  const plume::RenderRect rect(0, 0, int32_t(d.alloc_width), int32_t(d.alloc_height));
+  bool ok = DrawResolveCopy(from, &d, rect, 0, 0);
+  if (!ok) {
+    plume::RenderCommandList *cmd = State().command_list;
+    if (!cmd || !from->texture || !d.texture)
+      return false;
+    TransitionSurfaceLocked(from, plume::RenderTextureLayout::COPY_SOURCE);
+    TransitionTextureLocked(&d, plume::RenderTextureLayout::COPY_DEST);
+    const plume::RenderBox box(0, 0, rect.right, rect.bottom);
+    cmd->copyTextureRegion(plume::RenderTextureCopyLocation::Subresource(d.texture.get(), 0, 0),
+                           plume::RenderTextureCopyLocation::Subresource(from->texture.get()), 0, 0, 0, &box);
+    ok = true;
+  }
+  TransitionTextureLocked(&d, plume::RenderTextureLayout::SHADER_READ);
+  return ok;
+}
+
+// The destination takes the target's image; the target takes the destination's previous one (or a new one).
+bool ColorTakeImageLocked(HostTexture &d, HostSurface &s) {
+  if (d.held && (d.held->host_width != s.scale.Size(s.width) || d.held->host_height != s.scale.Size(s.height) ||
+                 d.held->format != s.format || d.held->samples != s.samples)) {
+    RetireDepthImageLocked(*d.held);
+    d.held.reset();
+  }
+  if (!d.held) {
+    auto image = std::make_shared<DepthImage>();
+    if (!MakeDepthImageLocked(s, *image))
+      return false;
+    d.held = std::move(image);
+  }
+  UnhandLocked(d);
+  SwapDepthImageLocked(s, *d.held);
+  d.held_current = true;
+  ++g_texture_epoch;
+  ++g_chs.taken;
+  g_chs.taken_bytes += HostBytes(d);
+  return true;
+}
+
+// Whether the resolve was left in the target's image (true); otherwise (false) the caller draws it, and a destination
+// still holding other content gets it first when the resolve does not cover it.
+bool ColorHandOverResolveLocked(HostSurface *surface, HostTexture *dest, const ClearRect &src, i32 dest_x, i32 dest_y,
+                                u32 dest_level, u32 slice, u32 z, int32_t bias) {
+  ColorHandOverReportLocked();
+  ++g_chs.considered;
+  const bool whole = src.x1 == 0 && src.y1 == 0 && src.x2 == int32_t(surface->width) &&
+                     src.y2 == int32_t(surface->height) && dest_x == 0 && dest_y == 0 && dest_level == 0 &&
+                     slice == 0 && z == 0;
+  int reason = -1;
+  if (!ColorHandOverOn())
+    reason = 0;
+  else if (surface->samples != plume::RenderSampleCount::COUNT_1)
+    reason = 1;
+  else if (!whole)
+    reason = 2;
+  else if (dest->width != surface->width || dest->height != surface->height || !(dest->scale == surface->scale) ||
+           dest->alloc_width != surface->scale.Size(surface->width) ||
+           dest->alloc_height != surface->scale.Size(surface->height))
+    reason = 3;
+  else if (dest->host_format != surface->format || dest->view_desc.format != surface->format || dest->words)
+    reason = 4;
+  else if (dest->dimension != TextureDimension::Tex2D || dest->stacked || dest->extra_levels || dest->mip_levels != 1 ||
+           !dest->render_target || !dest->texture || !surface->texture)
+    reason = 5;
+  else if (bias)
+    reason = 6;
+  else if (Msaa4xBackingLocked(surface))
+    reason = 7;
+  if (reason >= 0) {
+    ++g_chs.skip[reason];
+    g_chs.skip_bytes[reason] += HostBytes(*dest);
+    if (dest->handed_from || dest->held_current) {
+      const bool covers = dest_x == 0 && dest_y == 0 && dest_level == 0 && slice == 0 && z == 0 &&
+                          src.x2 - src.x1 >= int32_t(dest->width) && src.y2 - src.y1 >= int32_t(dest->height);
+      if (covers) {
+        UnhandLocked(*dest);
+        dest->held_current = false;
+        ++g_texture_epoch;
+      } else {
+        ColorMaterialiseLocked(*dest, 2);
+      }
+    }
+    return false;
+  }
+  UnhandLocked(*dest);  // what it held is overwritten
+  dest->held_current = false;
+  dest->color_handover = true;
+  dest->handed_from = surface;
+  dest->handed_generation = surface->generation;
+  dest->handed_writes = surface->writes;
+  ++surface->handed;
+  g_handed.push_back(dest);
+  ++g_texture_epoch;
+  ++g_chs.handed;
+  g_chs.handed_bytes += HostBytes(*dest);
+  return true;
+}
+
+bool ColorMaterialiseLocked(HostTexture &d, int reason) {
+  ++g_texture_epoch;
+  bool ok = false;
+  if (HostSurface *source = d.handed_from) {
+    const bool same = source->texture && source->generation == d.handed_generation &&
+                      source->writes == d.handed_writes;
+    UnhandLocked(d);
+    ok = same && ColorCopyLocked(source, d);
+  } else if (d.held && d.held_current) {
+    d.held_current = false;
+    // The held image as the target it was taken from, for the copy.
+    HostSurface image;
+    image.width = d.width;
+    image.height = d.height;
+    image.scale = d.scale;
+    image.format = d.held->format;
+    image.samples = d.held->samples;
+    image.format_word = d.held->format_word;
+    SwapDepthImageLocked(image, *d.held);
+    ok = ColorCopyLocked(&image, d);
+    SwapDepthImageLocked(image, *d.held);
+  } else {
+    return false;
+  }
+  if (ok) {
+    ++g_chs.drawn[std::clamp(reason, 0, 4)];
+    g_chs.drawn_bytes += HostBytes(d);
+  } else {
+    ++g_chs.lost;
+  }
+  return ok;
+}
+
+void ColorHandOverBeforeBindLocked(HostSurface *surface, bool take) {
+  if (!surface || !surface->handed)
+    return;
+  std::vector<HostTexture *> holders;
+  for (HostTexture *d : g_handed)
+    if (d->handed_from == surface)
+      holders.push_back(d);
+  // The last resolve's destination takes the image at a whole clear; any other is drawn.
+  for (size_t i = holders.size(); i-- > 0;) {
+    HostTexture &d = *holders[i];
+    if (take && surface->generation == d.handed_generation && surface->writes == d.handed_writes &&
+        ColorTakeImageLocked(d, *surface)) {
+      take = false;
+      continue;
+    }
+    ColorMaterialiseLocked(d, 0);
+  }
+}
+
+uint32_t ColorHandOverSlotLocked(HostTexture &d, const plume::RenderComponentMapping &mapping, BindEffects *fx) {
+  if (HostSurface *source = d.handed_from) {
+    if (!source->texture || source->generation != d.handed_generation || source->writes != d.handed_writes) {
+      UnhandLocked(d);
+      ++g_chs.lost;
+      ++g_texture_epoch;
+      return UINT32_MAX;
+    }
+    // Not the image of a target of the draw: the copy is drawn after all.
+    if (SurfaceIsDrawTarget(source, g_handover_targets)) {
+      ColorMaterialiseLocked(d, 1);
+      return UINT32_MAX;
+    }
+    const uint32_t slot =
+        DepthImageViewSlotLocked(source->texture.get(), source->format, source->handover_views, mapping);
+    if (slot == kInvalidDescriptor) {
+      ColorMaterialiseLocked(d, 4);
+      return UINT32_MAX;
+    }
+    TransitionSurfaceLocked(source, plume::RenderTextureLayout::SHADER_READ);
+    if (fx)
+      fx->handover_surface = source;
+    return slot;
+  }
+  if (!d.held || !d.held_current)
+    return UINT32_MAX;
+  DepthImage &image = *d.held;
+  const uint32_t slot = DepthImageViewSlotLocked(image.texture.get(), image.format, image.views, mapping);
+  if (slot == kInvalidDescriptor) {
+    ColorMaterialiseLocked(d, 4);
+    return UINT32_MAX;
+  }
+  TransitionDepthImageLocked(image, plume::RenderTextureLayout::SHADER_READ);
+  if (fx)
+    fx->handover_image = &image;
+  return slot;
+}
+
+}  // namespace
+
+void HandOverMaterialiseLocked(HostTexture &d) {
+  if (!d.handed_from && !d.held_current)
+    return;
+  if (d.color_handover)
+    ColorMaterialiseLocked(d, 4);
+  else
+    MaterialiseLocked(d, false);
 }
 
 // banjo-nx (2026-10-19, banjo_renut_resolve_skip): what a resolve wrote into its destination: the source surface (its
@@ -6608,6 +6956,9 @@ void ResolveStateLocked(const u8 *device_state, u32 flags, const ClearRect *sour
       if (fits && banjo::renut_gpu::ResolveSkipOn() && dest->resolve_signature == sig) {
         // banjo-nx (2026-10-19, banjo_renut_resolve_skip): the same resolve of an unchanged source is in dest already.
         banjo::renut_gpu::CountSkippedResolve(false);
+      } else if (fits && ColorHandOverResolveLocked(surface, dest, src, dest_x, dest_y, dest_level, slice, z, bias)) {
+        // me2-nx-deko (2026-11-06, me2_renut_color_handover): the copy is left out (see "Colour hand-over").
+        dest->resolve_signature = sig;
       } else if (fits) {
         dest->resolve_signature = sig;
         g_bound.framebuffer = nullptr;
@@ -6721,7 +7072,7 @@ void ResolveStateLocked(const u8 *device_state, u32 flags, const ClearRect *sour
     static const float kBlack[4] = {0, 0, 0, 0};
     const u32 clear_flags = ((flags & 0x100) ? 1u : 0u) | ((flags & 0x200) ? 0x30u : 0u);
     ClearTargets(t, clear_flags, rect, clear_color ? clear_color : kBlack, clear_depth,
-                 clear_stencil);
+                 clear_stencil, kClearLabel);
   }
 }
 

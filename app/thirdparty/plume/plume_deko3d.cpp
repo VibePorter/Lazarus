@@ -42,6 +42,11 @@ namespace plume {
     // Free memory, for the log lines that may be about running out of it: the heap's free bytes (newlib) and the
     // process's unused memory (the system's figures).
     extern "C" char *fake_heap_end; // libnx: the heap's end (sbrk grows towards it)
+    static void memoryFigures(uint64_t &heapFree, uint64_t &processFree);
+}
+// The heap census (sdk core/threading_posix.cpp switch_stack_census_s) reads these.
+extern "C" std::atomic<uint64_t> g_rex_gpu_arena_bytes, g_rex_gpu_arena_used, g_rex_gpu_heap_block_bytes;
+namespace plume {
     static void memoryFigures(uint64_t &heapFree, uint64_t &processFree) {
         // Free chunks inside what malloc has taken, and what sbrk can still give.
         struct mallinfo mi = mallinfo();
@@ -79,6 +84,7 @@ namespace plume {
     Deko3DStats g_deko3dStats;
     std::atomic<bool> g_deko3dBudgetChunkFree{false};
     std::atomic<uint64_t> g_deko3dBudgetArenaFloor{128ull << 20};
+    std::atomic<uint64_t> g_deko3dArenaMax{1024ull << 20};  // ME2 (2026-11-06): me2_deko3d_arena_max_mb
     // PLUME_DEKO3D_GUARDS: bytes after each block's storage, and their value.
     static constexpr uint32_t GuardBytes = 64u << 10;
     static constexpr uint8_t GuardByte = 0xA5;
@@ -1025,6 +1031,7 @@ namespace plume {
             if (block) {
                 std::lock_guard<std::mutex> lock(arena.mutex);
                 arena.heapBlocks[block] = storage;
+                g_rex_gpu_heap_block_bytes.fetch_add(m.size, std::memory_order_relaxed);
             }
             else
                 free(storage);
@@ -1089,13 +1096,17 @@ namespace plume {
             arena.tried = true;
             uint64_t heapFree = 0, processFree = 0;
             memoryFigures(heapFree, processFree);
-            uint64_t want = heapFree > ArenaLeave ? std::min(heapFree - ArenaLeave, ArenaMax) : 0;
+            // ME2 (2026-11-06, me2_deko3d_arena_max_mb): at most g_deko3dArenaMax (ArenaMax by default). The busiest
+            // sessions of 2026-11-06 used 589-749 MB of it while the guest side of the same heap ran dry at a level load.
+            const uint64_t arenaMax = std::min(ArenaMax, g_deko3dArenaMax.load(std::memory_order_relaxed));
+            uint64_t want = heapFree > ArenaLeave ? std::min(heapFree - ArenaLeave, arenaMax) : 0;
             want &= ~((64ull << 20) - 1);
             if (want >= ArenaMin)
                 arena.base = static_cast<uint8_t *>(memalign(DK_MEMBLOCK_ALIGNMENT, size_t(want)));
             if (arena.base) {
                 arena.size = want;
                 arena.free[0] = want;
+                g_rex_gpu_arena_bytes.store(want, std::memory_order_relaxed);
             }
             logf("block arena: %" PRIu64 " MB %s (heap %" PRIu64 " MB free before it, process %" PRIu64 " MB unused)",
                  want >> 20, arena.base ? "reserved" : "NOT reserved: blocks from the heap", heapFree >> 20,
@@ -1123,6 +1134,7 @@ namespace plume {
         if (left)
             arena.free[offset + size] = left;
         arena.used += size;
+        g_rex_gpu_arena_used.store(arena.used, std::memory_order_relaxed);
         if (arena.used > arena.peak) {
             const bool report = (arena.used >> 26) != (arena.peak >> 26);
             arena.peak = arena.used;
@@ -1162,6 +1174,7 @@ namespace plume {
     // The range back into `free`, merged with its neighbours (arena.mutex held).
     void Deko3DDevice::arenaFreeRangeLocked(uint64_t start, uint64_t length) {
         arena.used -= length;
+        g_rex_gpu_arena_used.store(arena.used, std::memory_order_relaxed);
         auto next = arena.free.lower_bound(start);
         if (next != arena.free.end() && next->first == start + length) {
             length += next->second;
@@ -1195,6 +1208,7 @@ namespace plume {
             if (it != arena.heapBlocks.end()) {
                 heapStorage = it->second;
                 arena.heapBlocks.erase(it);
+                g_rex_gpu_heap_block_bytes.fetch_sub(dkMemBlockGetSize(block), std::memory_order_relaxed);
             }
         }
         dkMemBlockDestroy(block);

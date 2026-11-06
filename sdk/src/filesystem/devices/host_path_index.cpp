@@ -199,6 +199,7 @@ using Key = std::tuple<std::string, bool, uint64_t>;
 using namespace vfs_index;
 
 std::filesystem::path HostPathDevice::PathIndex() const {
+  if (!index_path_.empty()) return index_path_;
   const std::string& configured = REXCVAR_GET(vfs_path_index);
   if (!configured.empty()) {
     return rex::to_path(configured);

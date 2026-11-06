@@ -127,10 +127,13 @@ def style_dpad(full, pressed_src, size=64, tint=(185, 185, 185)):
     return style(full, size, tint, 3, dim=dim)
 
 
-def style_glow(src, size=32, tint=(120, 200, 90), letter=None, margin=0.14, bold=3, icon_dx=0):
+def style_glow(src, size=32, tint=(120, 200, 90), letter=None, margin=0.14, bold=3, icon_dx=0, letter_shift=(0, 0),
+               coverage=None):
     """The glowing variant of the game's face buttons (GUI_SF_SharedAssets.mainController_I*): a see-through body in
     the button's colour, a bright rim, a coloured glow around it and dark letters of the same hue with a bright edge.
-    icon_dx: the whole icon (body, rim, glow and letter) moved this many output pixels right (negative: left)."""
+    icon_dx: the whole icon (body, rim, glow and letter) moved this many output pixels right (negative: left).
+    letter_shift: the letter alone moved by (x, y) pixels of the 8x canvas (grid_fit_glow picks it). coverage: a list
+    that receives the letter's coverage at the output size (for grid_fit_glow)."""
     big = size * 8
     glyph = src.convert('RGBA')
     alpha = glyph.getchannel('A')
@@ -143,6 +146,8 @@ def style_glow(src, size=32, tint=(120, 200, 90), letter=None, margin=0.14, bold
     a.paste(glyph.getchannel('A'), ((big - glyph.width) // 2, (big - glyph.height) // 2))
     body = fill_holes(a)
     letters = ImageChops.subtract(body, a.point(lambda v: 255 if v > 127 else 0))
+    if tuple(letter_shift) != (0, 0):
+        letters = ImageChops.offset(letters, *letter_shift)
     r, g, b = tint
     bright = tuple(min(255, int(c * 1.45 + 40)) for c in tint)
     dark = letter if letter is not None else tuple(int(c * 0.28) for c in tint)
@@ -159,9 +164,26 @@ def style_glow(src, size=32, tint=(120, 200, 90), letter=None, margin=0.14, bold
     edge = ImageChops.multiply(bold.filter(ImageFilter.MaxFilter((big // 48) | 1)), body)
     out.alpha_composite(solid(bright, edge.filter(ImageFilter.GaussianBlur(big * 0.004)), 0.9))          # letter edge
     out.alpha_composite(solid(dark, bold, 1.0))                                                          # letters
+    if coverage is not None:
+        coverage.append(bold.resize((size, size), Image.BOX))
     out = cutout_letters(out, bold).resize((size, size), Image.LANCZOS)
     if icon_dx:
         moved = Image.new('RGBA', (size, size), (0, 0, 0, 0))
         moved.paste(out, (icon_dx, 0))
         out = moved
     return out
+
+
+def grid_fit_glow(src, size=32, tint=(120, 200, 90), letter=None, icon_dx=0, reach=4):
+    """me2-nx-deko (2026-11-06, user: on the console's hacking mini-game the B's right side looked cut, the A's right
+    leg thinner): the mini-game draws these icons at their own size with point sampling, so the letter is seen texel
+    for texel, and a stroke that falls between two output pixels shows as two faint half columns. The letter is moved
+    by up to `reach` pixels of the 8x canvas (an eighth of an output pixel each) to where its pixels at `size` are the
+    crispest (closest to fully covered or empty); a small preference keeps it near its place. Returns letter_shift."""
+    def crisp(shift):
+        cov = []
+        style_glow(src, size, tint, letter=letter, icon_dx=icon_dx, letter_shift=shift, coverage=cov)
+        v = [p / 255 for p in cov[0].getdata() if p > 8]
+        return (sum(abs(2 * x - 1) for x in v) / len(v) if v else 0.0) - 0.004 * (abs(shift[0]) + abs(shift[1]))
+    shifts = [(dx, dy) for dx in range(-reach, reach + 1) for dy in range(-reach, reach + 1)]
+    return max(shifts, key=crisp)

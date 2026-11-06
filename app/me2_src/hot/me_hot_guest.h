@@ -17,6 +17,7 @@
 #include <type_traits>
 
 #include "me_hot_common.h"
+#include "../me2_replay.h"  // me2-nx-deko (2026-11-06): draw-setup replay observers (ME_HOT_HOOK_IMPL)
 
 namespace me::hot {
 
@@ -91,6 +92,7 @@ inline void Dispatch(Hook& h, uint32_t& n, PPCContext& ctx, uint8_t* base) {
   }                                                                                                         \
   REX_EXTERN(__imp__sub_##ADDR);                                                                            \
   REX_HOOK_RAW(sub_##ADDR) {                                                                                \
+    const auto me2_replay_scope = me2::replay::EnterAt<0x##ADDR##u>(ctx, base); /* me2_replay.h */          \
     static thread_local uint32_t n_calls;                                                                   \
     static me::hot::Hook h{"sub_" #ADDR, &__imp__sub_##ADDR, &me::hot::NativeB<&NS::Native>,               \
                            &NS::ShadowNative, &NS::Writes, NS::kCmp};                                       \

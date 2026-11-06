@@ -67,6 +67,8 @@ Source GetFlagSource(std::string_view name);
 
 extern "C" {
 void _start(void);
+/* me2-nx-deko (2026-11-06): guest_memory_switch.cpp, the TLB test of renut-nx (switch_tlb_test_s). */
+void RexGmLatencyTest(void (*emit)(const char*));
 /* rexglue log folder, ending in '/' (switch_crash_hooks.c), and its creation (only when something is written). */
 const char* RexSwitchLogDir(void);
 void RexSwitchEnsureLogDir(void);
@@ -473,6 +475,11 @@ void StackAggAdd(const std::vector<Sample>& samples, double fps, u64 now_ticks, 
   const std::string path = std::string(RexSwitchLogDir()) + "rex_stacks.log";
   FILE* f = std::fopen(path.c_str(), "w");
   if (!f) return;
+  // me2-nx-deko (2026-11-06): one large buffer. With newlib's default (1 KB) the ~60,000 lines of ~25 fprintf calls each
+  // became ~10,000 small SD writes: a 9.9 MB file took up to 69 s (console 11-06), and the profiler sampled nothing
+  // meanwhile. Static: it must outlive the fclose below, and only this thread writes the file.
+  static std::vector<char> io_buffer(8u << 20);
+  std::setvbuf(f, io_buffer.data(), _IOFBF, io_buffer.size());
   std::fprintf(f, "# rex_stacks: %zu stacks (%llu samples dropped: table full); columns: fps<28 28-32 32+ thread pc frames"
                   " (image offsets, innermost first)\n",
                g_stack_agg.size(), (unsigned long long)g_stack_agg_dropped);
@@ -1110,6 +1117,9 @@ void ProfilerMain(void*) {
     if (s >= 5 && s <= 600) report_seconds = u64(s);
   }
   if (!report) sample_stacks = false;
+  // me2-nx-deko (2026-11-06, from renut-nx 1.0.2): the TLB test (switch_tlb_test_s), once, this many seconds in.
+  const u64 tlb_test_s = u64(std::max(0, std::atoi(rex::cvar::GetFlagByName("switch_tlb_test_s").c_str())));
+  bool tlb_test_done = tlb_test_s == 0;
   std::fprintf(stderr, "[perf] warm-up done: report %s, stack sampling %s, file %s\n", report ? "on" : "off",
                sample_stacks ? "on" : "off", ReportPath().c_str());
 
@@ -1135,6 +1145,7 @@ void ProfilerMain(void*) {
 
   // A short first report just to set the starting CPU time.
   u64 report_start = armGetSystemTick();
+  const u64 loop_start = report_start;  // me2-nx-deko (2026-11-06): switch_tlb_test_s
   if (report) Report(1, tick_freq, counters_last, "startup");
   report_start = armGetSystemTick();
 
@@ -1195,6 +1206,10 @@ void ProfilerMain(void*) {
     const u64 now = armGetSystemTick();
     // Once per second, FPS and resolution for the overlay (the profile report runs every 10 s).
     overlay.Step(now, tick_freq, true);
+    if (!tlb_test_done && now - loop_start >= tlb_test_s * tick_freq) {
+      tlb_test_done = true;
+      RexGmLatencyTest([](const char* line) { std::fprintf(stderr, "%s\n", line); });
+    }
     if (report && now - report_start >= report_seconds * tick_freq) {
       Report(now - report_start, tick_freq, counters_last, kModes[mode_index].name);
       if (g_ab_active.load(std::memory_order_relaxed)) {
@@ -1205,7 +1220,15 @@ void ProfilerMain(void*) {
           g_ab_active.store(false, std::memory_order_relaxed);
         }
       }
-      report_start = armGetSystemTick();
+      // me2-nx-deko (2026-11-06): the next interval starts where Report took its counters ('now'), not when it
+      // returned. Report rewrites the whole rex_stacks.log, which grows over the session: its time went into the next
+      // interval's counters but not into its seconds (console log 11-06: every report "60.0 s", fps 28 -> 64, CPU up
+      // to 515 % of 400 %, and the stacks' fps bands all "32+").
+      const u64 report_end = armGetSystemTick();
+      const double report_ms = double(report_end - now) * 1000.0 / double(tick_freq);
+      if (report_ms >= 500.0)
+        std::fprintf(stderr, "[perf] the report took %.0f ms (rex_stacks.log rewrite included)\n", report_ms);
+      report_start = now;
     }
   }
 }

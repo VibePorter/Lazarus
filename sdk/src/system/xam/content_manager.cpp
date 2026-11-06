@@ -45,6 +45,15 @@
  *     Besides giving readable copies of the saves, sorted by profile, it always keeps a previous
  *     version to recover a profile that got corrupted.
  */
+// me2-nx-deko (2026-11-06): marketplace content (DLC, content type 2) mounted read-only, as the 360 mounts a downloaded
+// package, so its folder tree comes from a cached index instead of one SD stat per file (HostPathDevice, backlog U2).
+// Console 11-06: ME2 mounts its 23 DLC packages (~1,400 files) one after another behind the Press Start screen; the
+// scans were ~85 ms a package on average (up to ~400 ms for the 220-file ones). The index of package <name> is
+// <content root>/../cache/vfs_index_dlc_<name>.bin (not inside the content folders: the game lists those).
+REXCVAR_DEFINE_BOOL(content_marketplace_read_only, true, "Kernel",
+                    "Marketplace content (DLC) packages are mounted read-only, with a cached index of their files "
+                    "(faster mounts). false = read-write and a full folder scan at every mount, as before")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_STRING(content_backup_root, "", "Kernel",
                       "Folder where a copy of each save is left, with one subfolder per profile. "
                       "Empty = nothing is copied");
@@ -204,8 +213,19 @@ ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view
   content_data_ = data;
 
   auto fs = kernel_state_->file_system();
-  auto device = std::make_unique<rex::filesystem::HostPathDevice>(device_path_, package_path, false,
+  // me2-nx-deko (2026-11-06, content_marketplace_read_only): DLC read-only, with its own tree index.
+  const bool marketplace = static_cast<uint32_t>(data.content_type.get()) == 2u;
+  const bool read_only = marketplace && REXCVAR_GET(content_marketplace_read_only);
+  auto device = std::make_unique<rex::filesystem::HostPathDevice>(device_path_, package_path, read_only,
                                                                   /*allow_share_delete=*/true);
+  if (read_only) {
+    // package_path = <content root>/<xuid>/<title>/<type>/<name>
+    std::filesystem::path root = package_path;
+    if (!root.has_filename()) root = root.parent_path();
+    const std::string name = rex::path_to_utf8(root.filename());
+    for (int i = 0; i < 4 && root.has_parent_path(); ++i) root = root.parent_path();
+    device->SetIndexPath(root.parent_path() / "cache" / rex::to_path("vfs_index_dlc_" + name + ".bin"));
+  }
   device->Initialize();
   fs->RegisterDevice(std::move(device));
   fs->RegisterSymbolicLink(root_name_ + ":", device_path_);

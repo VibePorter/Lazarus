@@ -36,11 +36,14 @@
 #include <rex/system/xmemory.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
+
+#include <fmt/format.h>
 
 extern "C" bool Me2PatchConversationTriggers(uint8_t* movie, uint32_t size);
 bool Me2PatchSubtitleHtml(uint8_t* movie, uint32_t size);  // me2_subtitles.cpp
@@ -164,7 +167,30 @@ void PatchGameOver(uint8_t* m) {
         "death screen: Resume next to A on the right, Main Menu next to B at the bottom");
 }
 
+}  // namespace (reopened below)
+
+// me2-nx-deko (2026-11-06): a mark for the test harness's input script (sdk input/mnk_input_driver.cpp,
+// SA2_AUTO_INPUT "M<i>+<seconds>:BTN"): environment variable REX_AUTO_INPUT_M<i> = steady_clock nanoseconds, set once.
+// Nothing without a script. 1 = the Press Start screen (me2_startup_movies.cpp), 2 = the main menu opened.
+extern "C" void Me2AutoInputMark(int index) {
+  const char* script = std::getenv("SA2_AUTO_INPUT");
+  if (!script || !*script || index < 0 || index > 9) return;
+  const std::string name = fmt::format("REX_AUTO_INPUT_M{}", index);
+  if (std::getenv(name.c_str())) return;
+  const long long ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+#ifdef _WIN32
+  _putenv_s(name.c_str(), std::to_string(ns).c_str());
+#else
+  setenv(name.c_str(), std::to_string(ns).c_str(), 0);
+#endif
+  REXLOG_INFO("[input] test script mark {}", index);
+}
+
+namespace {
+
 void PatchMainMenu(uint8_t* m) {
+  Me2AutoInputMark(2);  // the main menu
   if (REXCVAR_GET(me2_menu_hide_import_me1))
     Apply(m,
           {{0x25DC8,

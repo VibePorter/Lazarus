@@ -119,10 +119,18 @@ bool IsPlaying(PPCContext& ctx, uint8_t* base, uint32_t player, uint32_t name) {
 }
 }  // namespace
 
+extern "C" void Me2AutoInputMark(int index);  // me2_menu.cpp (test harness input marks)
+
 namespace me2::startup_movies {
 
 void WaitForStartupMovies(PPCContext& ctx, uint8_t* base) {
   if (g_done.load(std::memory_order_acquire) || g_done.exchange(true)) return;
+  // me2-nx-deko (2026-11-06): mark 1 of the test harness's input script (the Press Start screen), once this returns.
+  struct Mark {
+    ~Mark() {
+      Me2AutoInputMark(1);
+    }
+  } mark;
   if (!REXCVAR_GET(me2_startup_movies_first)) return;
   const uint32_t player = Player(base);
   if (!player) {

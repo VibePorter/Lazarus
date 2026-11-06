@@ -90,6 +90,15 @@ REXCVAR_DEFINE_STRING(switch_guest_thread_cores, "", "Kernel",
                       "Switch: core mask of chosen guest threads by entry point, \"ENTRY:MASK[:PREFERRED],...\" in hex "
                       "(e.g. \"830463B0:8\"); empty = the guest core layout for every guest thread")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// me2-nx-deko (2026-11-06): the host stack of every guest thread. Console heap census of 2026-11-06 (switch_stack_census_s,
+// a whole session: Omega, the Normandy, MSV Strontium Mule with its loads and collections): 32 guest threads x 16 MB =
+// 512 MB of the 3,095 MB heap, the deepest any of them went 27 KB (UE3's game thread; XMA Decoder 20 KB, the render
+// thread 15 KB). 2 MB keeps ~75x that and gives ~450 MB back to the heap (the guest memory commits and the GPU arena that
+// ran out at level loads). A thread past it faults at once (libnx maps a guard gap below each stack).
+REXCVAR_DEFINE_INT32(switch_guest_thread_stack_mb, 2, "Kernel",
+                     "Switch: host stack of each guest thread in MB (was 16; the deepest measured use is 27 KB)")
+    .range(1, 16)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
                     "Ignores game-specified thread priorities");
 
@@ -807,7 +816,11 @@ X_STATUS XThread::Create() {
   RetainHandle();
 
   rex::thread::Thread::CreationParameters params;
+#if REX_PLATFORM_SWITCH
+  params.stack_size = size_t(REXCVAR_GET(switch_guest_thread_stack_mb)) << 20;  // me2-nx-deko (2026-11-06)
+#else
   params.stack_size = 16_MiB;  // Allocate a big host stack.
+#endif
   params.create_suspended = true;
   thread_ = rex::thread::Thread::Create(params, [this]() {
     rex::initialize_seh_thread();
@@ -1865,7 +1878,11 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state, stream::ByteStre
 
     rex::thread::Thread::CreationParameters params;
     params.create_suspended = true;  // Not done restoring yet.
+#if REX_PLATFORM_SWITCH
+    params.stack_size = size_t(REXCVAR_GET(switch_guest_thread_stack_mb)) << 20;  // me2-nx-deko (2026-11-06)
+#else
     params.stack_size = 16_MiB;
+#endif
     thread->thread_ = rex::thread::Thread::Create(params, [thread, state]() {
       // Set thread ID override. This is used by logging.
       rex::thread::set_current_thread_id(thread->handle());

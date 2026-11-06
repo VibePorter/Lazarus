@@ -23,9 +23,31 @@ REXCVAR_DEFINE_STRING(me2_ab_cycle, "", "ME2/Diagnostics",
                       "lines "
                       "each second; empty = off")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// me2-nx-deko (2026-11-06): UE3's CompositeDynamicLights (SystemSettings, Coalesced.ini False). On, a dynamic light that
+// casts no shadow is folded into the spherical-harmonic light environment of each character / dynamic object it touches
+// (sub_822F1528, the light environment update) instead of drawing that object once more for the light. TU2: the
+// settings data GSystemSettings at 0x833EA9A8 (sub_82418A90 -> the name/field table sub_8234ABD8: DynamicLights +24,
+// DynamicShadows +28, LightEnvironmentShadows +32, CompositeDynamicLights +36, UBOOL words); read by sub_822F1528,
+// sub_82688188 and sub_8268BA90. Written here once a frame when it should change; the light environments pick it up
+// at their next update. Rotation kind "composite_lights": on slots 1, off slots the game's value.
+REXCVAR_DEFINE_INT32(me2_composite_lights, -1, "ME2",
+                     "UE3 CompositeDynamicLights: 1 = on (unshadowed dynamic lights merged into the light "
+                     "environments, fewer draws), 0 = off, -1 = the game's (Coalesced.ini False). me2_ab_cycle "
+                     "\"composite_lights\" alternates 1 and the game's")
+    .range(-1, 1)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(me2_ab_cycle_s, 6, "ME2/Diagnostics", "Draw-count rotation: seconds of a slot")
     .range(2, 600)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+// me2-nx-deko (2026-11-06): the renderer asks through a hook (render/draw.h), set before main.
+namespace renut::gpu {
+extern bool (*g_color_handover_ab_off)();
+extern bool (*g_delta_raw_ab_off)();
+}
+[[maybe_unused]] static const bool kColorHandoverHooked =
+    (renut::gpu::g_color_handover_ab_off = [] { return Me2AbOff(Me2Ab::kColorHandover); },
+     renut::gpu::g_delta_raw_ab_off = [] { return Me2AbOff(Me2Ab::kDeltaRaw); }, true);
 
 extern std::atomic<uint64_t> g_me2_draws_total;        // renut d3d hooks/draw.cpp: every draw
 extern std::atomic<uint64_t> g_me2_begin_draws_total;  // ... and the Begin*Vertices draws (Umbra test boxes)
@@ -34,7 +56,9 @@ namespace {
 
 constexpr const char* kNames[int(Me2Ab::kCount)] = {"occlusion", "light_small", "light_whole", "light_edge", "umbra_size",
                                                     "small_mesh", "prepass",     "lod",         "retest_occluded", "light_boost",
-                                                    "raster",    "relink",      "material",  "native_vis", "reader_raster"};
+                                                    "raster",    "relink",      "material",  "native_vis", "reader_raster",
+                                                    "color_handover", "light_occ", "composite_lights", "occl_nowait",
+                                                    "occl_nowait_shadow", "raster_lean", "delta_raw"};
 
 struct Rotation {
   std::vector<int> cuts;  // Me2Ab values in rotation order
@@ -80,6 +104,15 @@ std::atomic<int> g_off{-1};  // the cut off now (-1: none)
 
 bool Me2AbOff(Me2Ab id) { return g_off.load(std::memory_order_relaxed) == int(id); }
 
+bool Me2AbInRotation(Me2Ab id) {
+  static const uint32_t listed = [] {
+    uint32_t m = 0;
+    for (int c : Get().cuts) m |= 1u << c;
+    return m;
+  }();
+  return (listed >> int(id)) & 1u;
+}
+
 void Me2AbTick() {
   Rotation& r = Get();
   if (r.cuts.empty()) return;
@@ -113,4 +146,39 @@ void Me2AbTick() {
     last_second = t;
   }
   g_off.store(off, std::memory_order_relaxed);
+}
+
+// me2-nx-deko (2026-11-06): CompositeDynamicLights (see me2_composite_lights above).
+void Me2CompositeLightsTick(unsigned char* base) {
+  constexpr uint32_t kSettings = 0x833EA9A8u, kComposite = kSettings + 36;
+  static const int setting = REXCVAR_GET(me2_composite_lights);
+  static const bool in_rotation = [] {
+    for (int c : Get().cuts)
+      if (c == int(Me2Ab::kCompositeLights)) return true;
+    return false;
+  }();
+  if (setting < 0 && !in_rotation) return;
+  const auto load = [base](uint32_t va) { return __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + va)); };
+  static int state = 0;  // 0 not checked yet, 1 usable, -1 refused
+  static uint32_t game_value = 0;
+  if (state == 0) {
+    // The game's settings are in place once frames are drawn; a word that is not a UBOOL means another layout.
+    const uint32_t dl = load(kSettings + 24), ds = load(kSettings + 28), les = load(kSettings + 32), cdl = load(kComposite);
+    const bool ok = dl <= 1 && ds <= 1 && les <= 1 && cdl <= 1;
+    REXLOG_INFO("[composite] SystemSettings at {:08X}: DynamicLights {} DynamicShadows {} LightEnvironmentShadows {} "
+                "CompositeDynamicLights {} ({}; me2_composite_lights {}, rotation {})",
+                kSettings, dl, ds, les, cdl, ok ? "as expected" : "NOT UBOOLs: left alone", setting,
+                in_rotation ? "on" : "off");
+    state = ok ? 1 : -1;
+    game_value = cdl;
+  }
+  if (state < 0) return;
+  uint32_t want = setting < 0 ? game_value : uint32_t(setting);
+  if (in_rotation) want = Me2AbOff(Me2Ab::kCompositeLights) ? game_value : 1u;
+  const uint32_t now = load(kComposite);
+  if (now == want) return;
+  *reinterpret_cast<uint32_t*>(base + kComposite) = __builtin_bswap32(want);
+  static uint32_t changes = 0;
+  if (++changes <= 8 || changes % 64 == 0)
+    REXLOG_INFO("[composite] CompositeDynamicLights {} -> {} (change {})", now, want, changes);
 }

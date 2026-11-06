@@ -20,7 +20,9 @@
 #include <rex/logging.h>
 #include <rex/platform.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -106,4 +108,57 @@ REX_HOOK_RAW(sub_82DA2018) {
     return;
   }
   __imp__sub_82DA2018(ctx, base);
+}
+
+// me2-nx-deko (2026-11-06, me2_physx_step_ms): fewer PhysX substeps a frame. UE3's TickRBPhysScene (TU2 sub_825D9A28:
+// scene r3, DeltaTime f1, MaxSubstep f2, bFixedTimeStep r6) splits each frame into NumSubSteps = ceil(DeltaTime /
+// MaxSubstep) steps (at least 1, at most WorldInfo +1144 MaxPhysicsSubsteps) and hands them to NpScene::setTiming
+// (sub_8302B410, vtable slot 328: step f1, count r5, NX_TIMESTEP_FIXED). ME2's step is UE3's 0.02 s, so every frame
+// at 25-30 fps runs two full collision and solver passes, and three under 25 fps. Console 11-06 (combat, 15-19 fps): the
+// game thread waited ~52 % of the time in fetchResults (sub_8302C630) for the PhysX thread (X83055738, 16-25 % of a
+// core). A longer step (e.g. 40 ms) gives one pass a frame from 25 fps up. Variable timing only (r6 == 0).
+REXCVAR_DEFINE_INT32(me2_physx_step_ms, 0, "ME2",
+                     "Longest PhysX substep in ms (UE3's is 20: two substeps a frame at 30 fps). E.g. 40 = one substep a "
+                     "frame from 25 fps up. 0 = the game's")
+    .range(0, 100)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+namespace {
+struct StepStats {
+  uint64_t calls = 0, fixed = 0;
+  double dt = 0.0, game_steps = 0.0, our_steps = 0.0, game_step_min = 1e9, game_step_max = 0.0;
+  std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+};
+StepStats g_step;  // game thread only
+}  // namespace
+
+REX_EXTERN(__imp__sub_825D9A28);
+REX_HOOK_RAW(sub_825D9A28) {  // TickRBPhysScene(FRBPhysScene*, FLOAT DeltaTime, FLOAT MaxSubstep, ..., UBOOL bFixedTimeStep)
+  static const double ours = double(REXCVAR_GET(me2_physx_step_ms)) / 1000.0;
+  const double dt = ctx.f1.f64, step = ctx.f2.f64;
+  StepStats& s = g_step;
+  ++s.calls;
+  if (ctx.r6.u32 != 0) {
+    ++s.fixed;
+  } else if (dt > 0.0 && step > 0.0) {
+    s.dt += dt;
+    s.game_step_min = std::min(s.game_step_min, step);
+    s.game_step_max = std::max(s.game_step_max, step);
+    s.game_steps += std::max(1.0, std::ceil(dt / step - 1e-6));
+    if (ours > step) ctx.f2.f64 = ours;
+    s.our_steps += std::max(1.0, std::ceil(dt / ctx.f2.f64 - 1e-6));
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (now - s.since >= std::chrono::seconds(60)) {
+    const uint64_t n = s.calls - s.fixed;
+    if (n)
+      REXLOG_INFO("[physx] 60 s: {} physics ticks (frame {:.1f} ms on average), the game's substep {:.1f}-{:.1f} ms -> "
+                  "{:.2f} substeps a tick; with me2_physx_step_ms {} -> {:.2f} (before the MaxPhysicsSubsteps cap); {} "
+                  "fixed-step ticks left alone",
+                  n, 1000.0 * s.dt / double(n), 1000.0 * s.game_step_min, 1000.0 * s.game_step_max,
+                  s.game_steps / double(n), int(ours * 1000.0 + 0.5), s.our_steps / double(n), s.fixed);
+    s = StepStats{};
+    s.since = now;
+  }
+  __imp__sub_825D9A28(ctx, base);
 }

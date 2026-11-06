@@ -431,6 +431,12 @@ struct LevelSource {
 
 // ME2 (2026-10-27): set by the game's side (app/me2_src/me2_button_icons.cpp); see ReadLevel.
 bool (*g_texture_replace)(uint32_t width, uint32_t height, uint8_t *guest_texels) = nullptr;
+// me2-nx-deko (2026-11-06): the HD levels of the icon the last g_texture_replace hit gave on this thread (scale code,
+// level 0's size, level count, the levels' texels in the guest's layout); false: none (HostTexture::hd_data).
+bool (*g_texture_replace_hd)(uint32_t *scale_code, uint32_t *size, uint32_t *levels, const uint8_t **data) = nullptr;
+// me2-nx-deko (2026-11-06): set by the game's side with g_texture_replace_hd (me2_hd_button_icons).
+bool (*g_hd_icons_on)() = nullptr;
+bool HdIconsOn() { return g_hd_icons_on && g_hd_icons_on(); }
 
 namespace {
 
@@ -458,6 +464,9 @@ void ReadCopy2D(const TextureFetch& fetch, const LevelSource& src, uint32_t bloc
     }
   }
 }
+
+// me2-nx-deko (2026-11-06): set when ReadLevel gave a level from g_texture_replace (HostTexture::replaced_icon).
+bool g_level_replaced = false;
 
 void ReadLevel(const TextureFormatInfo &info, const TextureFetch &fetch, const LevelSource &src,
                uint32_t blocks_w, uint32_t blocks_h, uint32_t depth, uint8_t *dst,
@@ -491,7 +500,8 @@ void ReadLevel(const TextureFormatInfo &info, const TextureFetch &fetch, const L
         std::memcpy(line, src.base + (size_t(sy) * src.pitch_blocks + src.x_blocks) * 4, size_t(blocks_w) * 4);
       }
     }
-    g_texture_replace(blocks_w, blocks_h, raw.data());
+    if (g_texture_replace(blocks_w, blocks_h, raw.data()))
+      g_level_replaced = true;
     for (uint32_t y = 0; y < blocks_h; ++y) {
       std::memcpy(row.data(), raw.data() + size_t(y) * blocks_w * 4, row.size());
       SwapEndian(endian, row.data(), row.data(), row.size());
@@ -550,6 +560,7 @@ void ReadLevel(const TextureFormatInfo &info, const TextureFetch &fetch, const L
 // Staging data read from guest memory at submission rather than at the draw,
 // the way the GPU reads a texture when it executes (see BindTextureLocked).
 struct PendingFill {
+  u32 texture_va;  // me2-nx-deko (2026-11-06): its host texture, for HostTexture::replaced_icon
   TextureFormatInfo info;
   TextureFetch fetch;
   LevelSource src;
@@ -619,10 +630,23 @@ bool Upload(HostTexture &t, const TextureFetch &fetch, bool defer_read, uint32_t
       if (!staging)
         return false;
       auto *dst = static_cast<uint8_t *>(staging.cpu);
-      if (defer_read)
-        g_pending_fills.push_back({t.info, fetch, src, blocks_w, blocks_h, d, dst, row_pitch, slice_pitch});
-      else
+      if (defer_read) {
+        g_pending_fills.push_back({t.guest_va, t.info, fetch, src, blocks_w, blocks_h, d, dst, row_pitch, slice_pitch});
+      } else {
+        g_level_replaced = false;
         ReadLevel(t.info, fetch, src, blocks_w, blocks_h, d, dst, row_pitch, slice_pitch);
+        if (g_level_replaced) {
+          t.replaced_icon = true;
+          // me2-nx-deko (2026-11-06): its HD levels, for UpgradeToHdIcon after the upload.
+          uint32_t code = 0;
+          if (level == 0 && g_texture_replace_hd &&
+              g_texture_replace_hd(&code, &t.hd_size, &t.hd_count, t.hd_data) && t.hd_count >= 2 &&
+              t.hd_count <= 4 && code < RenderScale::kCount)
+            t.hd_scale = RenderScale{code};
+          else
+            t.hd_count = 0;
+        }
+      }
       // Footprints are in texels, block-aligned for compressed formats. Decoded
       // blocks are plain texels, so a level smaller than a block (a small mip)
       // takes only its own part of the decoded block.
@@ -776,6 +800,87 @@ bool Create(HostTexture &t, const TextureFetch &fetch, bool render_target,
 void MaskedDesc(const TextureFetch &fetch, u32 out[6]) {
   for (int i = 0; i < 6; ++i)
     out[i] = fetch.dword[i] & kDescMask[i];
+}
+
+void Retire(HostTexture &t);
+
+// me2-nx-deko (2026-11-06, user: docked at 1080p the button icons look low-resolution): an icon g_texture_replace
+// gave (HostTexture::hd_data) is held at its HD size with mip levels down to the game's size, and sampled with that
+// many levels (TextureBinding::lod_scale = hd_scale, trilinear with smooth_minify): sharp at 1080p, smooth smaller.
+// Right after its upload at the bind, so the copies come before the draw that samples it. False: left as it is.
+bool UpgradeToHdIcon(HostTexture &t, const TextureFetch &fetch) {
+  if (t.hd_icon || t.hd_count < 2 || t.render_target || t.gpu_written || t.dimension != TextureDimension::Tex2D ||
+      t.stacked || t.depth != 1 || t.info.block_size != 1 || t.info.guest_block_bytes != 4 || !t.texture)
+    return false;
+  auto &s = State();
+  plume::RenderCommandList *cmd = s.command_list;
+  plume::RenderDevice *device = Video::Device();
+  const uint32_t levels = t.hd_count;
+  // The staging for every level first: nothing is recorded unless all of it fits.
+  UploadAllocation staging[4];
+  uint32_t pitch[4] = {};
+  for (uint32_t level = 0; level < levels; ++level) {
+    const uint32_t w = std::max(1u, t.hd_size >> level);
+    pitch[level] = (w * t.info.host_block_bytes + 255u) / 256u * 256u;
+    staging[level] = s.uploads[s.frame].Allocate(uint64_t(pitch[level]) * w, 512);
+    if (!staging[level])
+      return false;
+  }
+  auto texture = device->createTexture(plume::RenderTextureDesc::Texture2D(t.hd_size, t.hd_size, levels, t.host_format));
+  if (!TextureCreated(texture.get()))
+    return false;
+  texture->setName("renut HD icon");
+  plume::RenderTextureViewDesc view_desc = t.view_desc;
+  view_desc.mipLevels = levels;
+  auto view = texture->createTextureView(view_desc);
+  if (!view)
+    return false;
+  const u32 endian = fetch.Endian();
+  std::vector<uint8_t> row;
+  cmd->barriers(plume::RenderBarrierStage::COPY,
+                plume::RenderTextureBarrier(texture.get(), plume::RenderTextureLayout::COPY_DEST));
+  for (uint32_t level = 0; level < levels; ++level) {
+    const uint32_t w = std::max(1u, t.hd_size >> level);
+    row.resize(size_t(w) * 4);
+    auto *dst = static_cast<uint8_t *>(staging[level].cpu);
+    for (uint32_t y = 0; y < w; ++y) {
+      // As ReadLevel's replacement path: the guest's bytes, its endian swap, the host conversion.
+      std::memcpy(row.data(), t.hd_data[level] + size_t(y) * w * 4, row.size());
+      SwapEndian(endian, row.data(), row.data(), row.size());
+      uint8_t *out = dst + size_t(y) * pitch[level];
+      if (t.info.conversion == TexelConversion::Copy)
+        std::memcpy(out, row.data(), size_t(w) * t.info.host_block_bytes);
+      else
+        ConvertTexels(t.info.conversion, row.data(), out, w);
+    }
+    cmd->copyTextureRegion(plume::RenderTextureCopyLocation::Subresource(texture.get(), level, 0),
+                           plume::RenderTextureCopyLocation::PlacedFootprint(
+                               staging[level].ref.ref, t.info.host, w, w, 1, pitch[level] / t.info.host_block_bytes,
+                               staging[level].ref.offset),
+                           0, 0, 0, nullptr);
+  }
+  // The new image in the texture's slot; views of the old one (other swizzles) go.
+  ++g_texture_epoch;
+  for (HostTexture::SwizzleView &v : t.swizzle_views) {
+    Video::FreeTextureSlotLocked(v.slot);
+    Video::RetireLocked(std::move(v.view));
+  }
+  t.swizzle_views.clear();
+  Video::RetireLocked(std::move(t.view));
+  Video::RetireLocked(std::move(t.texture));
+  t.texture = std::move(texture);
+  t.view = std::move(view);
+  t.view_desc = view_desc;
+  Video::SetTextureSlotLocked(t.slot, t.texture.get(), t.view.get());
+  t.layout = plume::RenderTextureLayout::COPY_DEST;
+  t.mip_levels = levels;
+  t.alloc_width = t.alloc_height = t.hd_size;
+  t.hd_icon = true;
+  static uint32_t logged = 0;
+  if (logged++ < 32)
+    RGPU_INFO("[icons] texture {:08X} ({}x{}) held at {}x{} with {} levels (HD icon)", t.guest_va, t.width, t.height,
+              t.hd_size, t.hd_size, levels);
+  return true;
 }
 
 void Retire(HostTexture &t) {
@@ -1356,8 +1461,12 @@ void NoteTextureUnlocked(u32 resource_va) {
 
 void FlushTextureFillsLocked() {
   for (const PendingFill &f : g_pending_fills) {
+    g_level_replaced = false;
     ReadLevel(f.info, f.fetch, f.src, f.blocks_w, f.blocks_h, f.depth, f.dst, f.row_pitch,
               f.slice_pitch);
+    if (g_level_replaced)
+      if (HostTexture *t = FindHostTextureLocked(f.texture_va))
+        t->replaced_icon = true;
   }
   g_pending_fills.clear();
 }
@@ -1781,7 +1890,21 @@ TextureBinding BindTextureLocked(u32 texture_va, const TextureFetch &device_fetc
           else ++g_stream_stats.new_whole, g_stream_stats.bytes_whole += TextureBytes(t);
           t.resident_from = 0;  // whole: any queued levels are moot (StreamPumpLocked drops the entry)
           t.stream_id = 0;
+          // me2-nx-deko (2026-11-06): an HD icon whose guest bytes changed is made again at the guest's size first.
+          if (t.hd_icon) {
+            const u32 slot_va = t.guest_va;
+            Retire(t);
+            t.hd_icon = false;
+            t.hd_count = 0;
+            t.replaced_icon = false;
+            if (!Create(t, fetch, false, plume::RenderFormat::UNKNOWN, false, RenderScale{})) {
+              RGPU_WARN("[icons] texture {:08X}: could not be made again after its HD icon", slot_va);
+              return binding;
+            }
+          }
           t.uploaded = Upload(t, fetch, false);
+          if (t.uploaded && t.hd_count && HdIconsOn())
+            UpgradeToHdIcon(t, fetch);
           BudgetFrame();
           g_budget_used += TextureBytes(t);
         }
@@ -1833,8 +1956,9 @@ TextureBinding BindTextureLocked(u32 texture_va, const TextureFetch &device_fetc
   }
   binding.stacked = t.stacked;
   binding.scale = t.scale;
-  binding.lod_scale = t.extra_levels ? t.scale : RenderScale{};
+  binding.lod_scale = t.hd_icon ? t.hd_scale : t.extra_levels ? t.scale : RenderScale{};  // me2-nx-deko: HD icons
   binding.min_level = t.resident_from;  // me2-nx-deko (2026-10-31): the levels it has yet
+  binding.smooth_minify = t.replaced_icon;  // me2-nx-deko (2026-11-06)
   return binding;
 }
 
@@ -2294,6 +2418,9 @@ HostTexture *UiFsrSceneLocked(HostTexture *source) {
                 u32(source->host_format), source->render_target, source->words != nullptr);
     return source;
   }
+  // me2-nx-deko (2026-11-06, me2_renut_color_handover): the passes below read the scene's own texture.
+  if (source->handed_from || source->held_current)
+    HandOverMaterialiseLocked(*source);
   auto &s = State();
   HostTexture *scene = source;
   if (fxaa)
@@ -2437,10 +2564,10 @@ TextureMemory TextureMemoryLocked() {
 }
 
 namespace {
-uint32_t SamplerSlotUncached(const TextureFetch &fetch, RenderScale lod_scale, uint32_t min_level);
+uint32_t SamplerSlotUncached(const TextureFetch &fetch, RenderScale lod_scale, uint32_t min_level, bool smooth_minify);
 } // namespace
 
-uint32_t SamplerSlotLocked(const TextureFetch &fetch, RenderScale lod_scale, uint32_t min_level) {
+uint32_t SamplerSlotLocked(const TextureFetch &fetch, RenderScale lod_scale, uint32_t min_level, bool smooth_minify) {
   // Every draw asks for each of its textures: remember the answer by the
   // fetch constant words the sampler state comes from (clamps in 0, filters,
   // anisotropy and LOD bias in 3, mip range in 4, border color in 5).
@@ -2450,22 +2577,26 @@ uint32_t SamplerSlotLocked(const TextureFetch &fetch, RenderScale lod_scale, uin
     RenderScale lod_scale;
     uint32_t min_anisotropy = 1;
     uint32_t min_level = 0;
+    bool smooth_minify = false;
     uint32_t slot = 0;
   };
   static Memo memo[256];
   const uint32_t min_anisotropy = MinAnisotropy();
   const u32 words[4] = {fetch.dword[0], fetch.dword[3], fetch.dword[4], fetch.dword[5]};
   Memo &entry = memo[(words[0] * 0x9E3779B1u ^ words[1] * 0x85EBCA6Bu ^ words[2] * 0xC2B2AE35u ^
-                      words[3] ^ lod_scale.code * 0x27D4EB2Fu ^ min_level * 0x165667B1u) >> 24];
+                      words[3] ^ lod_scale.code * 0x27D4EB2Fu ^ min_level * 0x165667B1u ^
+                      (smooth_minify ? 0x5BD1E995u : 0u)) >> 24];
   if (entry.valid && entry.lod_scale == lod_scale && entry.min_anisotropy == min_anisotropy &&
-      entry.min_level == min_level && std::memcmp(entry.words, words, sizeof(words)) == 0)
+      entry.min_level == min_level && entry.smooth_minify == smooth_minify &&
+      std::memcmp(entry.words, words, sizeof(words)) == 0)
     return entry.slot;
-  const uint32_t slot = SamplerSlotUncached(fetch, lod_scale, min_level);
+  const uint32_t slot = SamplerSlotUncached(fetch, lod_scale, min_level, smooth_minify);
   entry.valid = true;
   std::memcpy(entry.words, words, sizeof(words));
   entry.lod_scale = lod_scale;
   entry.min_anisotropy = min_anisotropy;
   entry.min_level = min_level;
+  entry.smooth_minify = smooth_minify;
   entry.slot = slot;
   return slot;
 }
@@ -2474,7 +2605,7 @@ namespace {
 
 // The sampler slot for the fetch constant's sampler state, created the first
 // time it is asked for.
-uint32_t SamplerSlotUncached(const TextureFetch &fetch, RenderScale lod_scale, uint32_t min_level) {
+uint32_t SamplerSlotUncached(const TextureFetch &fetch, RenderScale lod_scale, uint32_t min_level, bool smooth_minify) {
   auto address = [](TextureAddress mode) {
     switch (mode) {
     case TextureAddress::Wrap:
@@ -2501,6 +2632,9 @@ uint32_t SamplerSlotUncached(const TextureFetch &fetch, RenderScale lod_scale, u
   desc.addressW = address(fetch.Address(2));
   desc.magFilter = filter(fetch.MagFilter());
   desc.minFilter = filter(fetch.MinFilter());
+  // me2-nx-deko (2026-11-06, TextureBinding::smooth_minify): the Switch button icons are shrunk linearly.
+  if (smooth_minify)
+    desc.minFilter = plume::RenderFilter::LINEAR;
   desc.mipmapMode = fetch.MipFilter() == TextureFilter::Point ? plume::RenderMipmapMode::NEAREST
                                                               : plume::RenderMipmapMode::LINEAR;
   // MaxAnisotropy stores 2..5 for ratios 2:1..16:1 (its table at 0x82003D68).

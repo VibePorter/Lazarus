@@ -68,6 +68,8 @@ namespace plume {
     // after the 9th chunk, then on and on, with the chunks mostly empty).
     extern std::atomic<bool> g_deko3dBudgetChunkFree;
     extern std::atomic<uint64_t> g_deko3dBudgetArenaFloor;
+    // ME2 (2026-11-06, me2_deko3d_arena_max_mb): the block arena's largest size (set before the device is created).
+    extern std::atomic<uint64_t> g_deko3dArenaMax;
 
     // Where the back end's messages go (stderr until set: the application's log, so they reach it on the console and in
     // an emulator alike).

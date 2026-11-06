@@ -268,7 +268,8 @@ void FreeDepthViews(std::vector<DepthImage::View> &views) {
 }
 
 void RetireTarget(HostSurface &surface) {
-  if (surface.depth && surface.handed)
+  // me2-nx-deko (2026-11-06, me2_renut_color_handover): colour targets hand their image over too.
+  if (surface.handed)
     DepthHandOverBeforeRetireLocked(&surface);  // banjo-nx (2026-10-19, banjo_deko3d_depth_handover)
   FreeDepthViews(surface.handover_views);
   surface.stencil_used = false;
@@ -834,14 +835,17 @@ void SwapDepthImageLocked(HostSurface &surface, DepthImage &image) {
 bool MakeDepthImageLocked(const HostSurface &surface, DepthImage &image) {
   plume::RenderDevice *device = Video::Device();
   const uint32_t w = surface.scale.Size(surface.width), h = surface.scale.Size(surface.height);
+  // me2-nx-deko (2026-11-06, me2_renut_color_handover): a colour target's image as BuildTarget makes it.
   image.texture = device->createTexture(
-      plume::RenderTextureDesc::DepthTarget(w, h, surface.format, plume::RenderMultisampling(surface.samples)));
+      surface.depth
+          ? plume::RenderTextureDesc::DepthTarget(w, h, surface.format, plume::RenderMultisampling(surface.samples))
+          : plume::RenderTextureDesc::ColorTarget(w, h, surface.format, plume::RenderMultisampling(surface.samples)));
   if (!TextureCreated(image.texture.get())) {
     image.texture.reset();
     ReportDeviceLost(device);
     return false;
   }
-  image.texture->setName("renut depth surface (hand-over)");
+  image.texture->setName(surface.depth ? "renut depth surface (hand-over)" : "renut color surface (hand-over)");
   image.layout = plume::RenderTextureLayout::UNKNOWN;
   image.generation = g_next_generation++;
   image.host_width = w;
@@ -854,8 +858,17 @@ bool MakeDepthImageLocked(const HostSurface &surface, DepthImage &image) {
 
 void RetireDepthImageLocked(DepthImage &image) {
   // The framebuffers a surface made over this image (cached by its generation).
+  // me2-nx-deko (2026-11-06, me2_renut_color_handover): or as a colour attachment (generations are unique).
+  const auto uses = [&image](const FramebufferKey &key) {
+    if (key.depth && key.depth_generation == image.generation)
+      return true;
+    for (uint32_t c = 0; c < d3d::kMaxRenderTargets; ++c)
+      if (key.colors[c] && key.color_generations[c] == image.generation)
+        return true;
+    return false;
+  };
   for (size_t i = 0; i < g_framebuffers.size();) {
-    if (g_framebuffers[i].key.depth && g_framebuffers[i].key.depth_generation == image.generation) {
+    if (uses(g_framebuffers[i].key)) {
       Video::RetireLocked(std::move(g_framebuffers[i].framebuffer));
       g_framebuffers[i] = std::move(g_framebuffers.back());
       g_framebuffers.pop_back();

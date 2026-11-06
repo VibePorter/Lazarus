@@ -119,6 +119,7 @@ extern "C" void Me2CerberusOnSwap(const uint8_t* base);  // me2_cerberus.cpp
 REX_EXTERN(__imp__sub_82AA5238);
 REX_HOOK_RAW(sub_82AA5238) {  // D3DDevice_Swap (called by UE3's RHI sub_827DE208 after SynchronizeToPresentationInterval)
   Me2AbTick();  // me2-nx-deko (2026-11-04): the draw-count rotation (me2_ab_cycle.cpp)
+  Me2CompositeLightsTick(base);  // me2-nx-deko (2026-11-06): CompositeDynamicLights (me2_ab_cycle.cpp)
   Me2CerberusOnSwap(base);  // me2_cerberus.cpp (before the yield: with Renut it returns from here)
   SA2_RENUT_YIELD_SHARED(sub_82AA5238);
   __imp__sub_82AA5238(ctx, base);
@@ -128,6 +129,14 @@ REX_HOOK_RAW(sub_82AA5238) {  // D3DDevice_Swap (called by UE3's RHI sub_827DE20
 // ME2 (2026-10-26, me2_core_layout = 1): the thread issuing the D3D draws (UE3's render thread, which also runs Renut's
 // per-draw hooks: the busiest guest thread in the console profile) alone on core 0, the other guest threads on cores 1-2.
 REXCVAR_DECLARE(int32_t, me2_core_layout);  // me2_crowd_cpu.cpp
+// me2-nx-deko (2026-11-06): with me2_core_layout 1, the cores of the guest threads other than UE3's render thread (and
+// those switch_guest_thread_cores / the audio cores place). 0 = cores 1-2 and, with the NSP forwarder, 3 (as before).
+// With the game thread alone on core 2 (switch_guest_thread_cores "82865C98:4:2"): 0xA, cores 1 and 3.
+REXCVAR_DEFINE_INT32(me2_core_layout_others, 0, "ME2",
+                     "Switch, me2_core_layout 1: core mask of the other guest threads (0 = 0x6 plus core 3 when the "
+                     "process has it)")
+    .range(0, 15)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 extern "C" uint32_t RexSetGuestThreadCoreLayoutCaller(int main_core, uint32_t others_mask, int others_preferred);
 #if REX_PLATFORM_SWITCH
 extern "C" unsigned long long RexSwitchProcessCoreMask(void);  // sdk core/threading_switch.cpp
@@ -149,14 +158,17 @@ inline void RenderThreadLayoutOnce() {
   if (g_layout_owner.load(std::memory_order_relaxed) == &t_draws) return;
   if (REXCVAR_GET(me2_core_layout) != 1) return;
   g_layout_owner.store(&t_draws, std::memory_order_relaxed);
+  const uint32_t others_set = uint32_t(REXCVAR_GET(me2_core_layout_others)) & uint32_t(RexSwitchProcessCoreMask());
+  const uint32_t others_mask = others_set ? others_set : 0x6u | uint32_t(RexSwitchProcessCoreMask() & 0x8u);
+  const int others_pref = (others_mask & 0x4u) ? 2 : __builtin_ctz(others_mask);
   if (g_layout_changes.fetch_add(1, std::memory_order_relaxed) >= 16) {
-    RexSetGuestThreadCoreLayoutCaller(0, 0x6u | uint32_t(RexSwitchProcessCoreMask() & 0x8u), 2);
+    RexSetGuestThreadCoreLayoutCaller(0, others_mask, others_pref);
     return;  // quiet after 16 changes
   }
   // With the NSP forwarder (core 3 allowed) the other guest threads may also use the core 3 time the audio threads
   // (switch_audio_core_mask) leave, below Wwise's 0x3A.
-  const uint32_t others = 0x6u | uint32_t(RexSwitchProcessCoreMask() & 0x8u);
-  const uint32_t moved = RexSetGuestThreadCoreLayoutCaller(0, others, 2);
+  const uint32_t others = others_mask;
+  const uint32_t moved = RexSetGuestThreadCoreLayoutCaller(0, others, others_pref);
   REXLOG_INFO("[me2] me2_core_layout: the D3D draw thread (UE3's render thread) alone on core 0, the other guest "
               "threads on cores {:#x} ({} threads; process cores {:#x})", others, moved, RexSwitchProcessCoreMask());
 #endif

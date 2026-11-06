@@ -28,7 +28,11 @@
 #include <cstdint>
 #include <cstring>
 #include <mutex>
+#include <string>
+#include <unordered_map>
 #include <vector>
+
+#include <fmt/format.h>
 
 REXCVAR_DEFINE_INT32(me2_cull_small_factor, 100, "ME2",
                      "Small static meshes are not drawn beyond this many times their bounds radius (0 = off; 100 = a "
@@ -74,6 +78,9 @@ REXCVAR_DEFINE_INT32(me2_prepass_small_max_radius, 512, "ME2",
 
 extern std::atomic<uint64_t> g_sa2_game_frames;  // src/sa2_capture.cpp: counted at each Swap
 extern "C" bool me2_occlusion_camera(float out[3]);  // me2_occlusion.cpp
+// me2_occlusion_raster.cpp: a world box against this frame's CPU depth buffer (0 no buffer, 1 visible, 2 occluded,
+// 3 crosses the near plane, 5 outside the frustum; conservative).
+extern "C" uint8_t Me2RasterTestBox(const float* mn, const float* mx, uint64_t frame);
 
 namespace {
 
@@ -689,9 +696,27 @@ REXCVAR_DEFINE_INT32(me2_light_small_boost, 0, "ME2",
                      "core keep it up to 1 + boost times farther; 0 = the plain size rule")
     .range(0, 50)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// me2-nx-deko (2026-11-06): the value in me2_ab_cycle "light_edge"'s off slots (0: the rule off, as before), so the
+// rotation can compare two thresholds (console A/B 10 vs 20 % at the party).
+REXCVAR_DEFINE_INT32(me2_light_edge_ab_other, 0, "ME2",
+                     "me2_ab_cycle \"light_edge\": the me2_light_edge percent in its off slots (0 = the rule off)")
+    .range(0, 50)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(me2_light_edge_ab_s, 0, "ME2",
                      "A/B: me2_light_edge on and off in turn every this many seconds; 0 = always on")
     .range(0, 3600)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// me2-nx-deko (2026-11-06): light occlusion. UE3 renders a dynamic light, and redraws each mesh it touches additively,
+// when the light's sphere meets the view frustum; whether that part of the world is visible is never asked. The
+// rasterizer's CPU depth buffer answers it (Me2RasterTestBox, conservative: occluded only when every pixel under the
+// box's screen rectangle has an occluder nearer than the box). A point / spot light whose sphere's box is occluded or
+// off-screen lights nothing visible: its pass can go. Each light draw of a visible light is tested too, with the mesh's
+// bounds box clipped to the light's box: the part of a big wall the light reaches may be hidden while the rest of it is
+// visible. 1 = count only ("[light-occ]" every 10 s), 2 = leave them out ("light_occ" in me2_ab_cycle: counted only).
+REXCVAR_DEFINE_INT32(me2_light_occlusion, 0, "ME2",
+                     "Light passes against the rasterizer's CPU depth buffer: 1 = count what occluded / off-screen "
+                     "lights and light draws would save, 2 = leave them out; 0 = off")
+    .range(0, 2)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace {
@@ -715,7 +740,11 @@ float LightBoost() {
 float LightEdgeFraction() {
   static const int32_t pct = REXCVAR_GET(me2_light_edge);
   static const int32_t ab_s = REXCVAR_GET(me2_light_edge_ab_s);
-  if (pct <= 0 || Me2AbOff(Me2Ab::kLightEdge)) return 0.0f;
+  if (pct <= 0) return 0.0f;
+  if (Me2AbOff(Me2Ab::kLightEdge)) {
+    static const int32_t other = REXCVAR_GET(me2_light_edge_ab_other);
+    return float(other) / 100.0f;
+  }
   if (ab_s > 0) {
     static const auto start = std::chrono::steady_clock::now();
     const auto secs = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count();
@@ -802,16 +831,368 @@ void LightEdgeReport() {
   const auto now = std::chrono::steady_clock::now();
   static const int32_t boost = REXCVAR_GET(me2_light_small_boost);
   if ((pct <= 0 && boost <= 0) || now - last < std::chrono::seconds(10)) return;
-  REXLOG_INFO("[light-cull] light edge last ~10 s ({} %, now {}): {} point light passes tested, {} static mesh light "
+  REXLOG_INFO("[light-cull] light edge last ~10 s ({} %, now {:.0f} %): {} point light passes tested, {} static mesh light "
               "draws and {} lit dynamic primitives left out (they get under {} % of the light); boost {} (now {}): {} "
               "light draws kept for strongly lit objects the size rule would leave out",
-              pct, LightEdgeFraction() > 0.0f ? "on" : "off", g_light_edge_lights, g_light_edge_static_left,
+              pct, double(LightEdgeFraction()) * 100.0, g_light_edge_lights, g_light_edge_static_left,
               g_light_edge_dynamic_left, pct, boost, LightBoost() > 0.0f ? "on" : "off", g_light_boost_kept);
   g_light_edge_lights = g_light_edge_static_left = g_light_edge_dynamic_left = 0;
   g_light_boost_kept = 0;
   last = now;
 }
+
+// me2-nx-deko (2026-11-06): me2_light_occlusion.
+struct LightOcc {
+  bool ok = false;          // a point / spot light with a box, and a depth buffer this frame
+  bool whole = false;       // the light's own box occluded or off-screen: everything it draws would go
+  float mn[3] = {}, mx[3] = {};
+  uint64_t frame = 0;
+};
+thread_local LightOcc t_lo;  // the light pass running on this thread
+struct LightOccStats {
+  uint64_t passes = 0, not_point = 0, no_buffer = 0, code[6] = {};
+  uint64_t whole_static = 0, whole_dynamic = 0;  // light draws inside lights that would go whole
+  uint64_t st_tested = 0, st_occ = 0, st_out = 0, st_apart = 0;
+  uint64_t dy_tested = 0, dy_occ = 0, dy_out = 0, dy_apart = 0;
+  uint64_t tests = 0, ns = 0;
+};
+LightOccStats g_lo;
+
+int LightOccMode() {
+  static const int32_t mode = REXCVAR_GET(me2_light_occlusion);
+  if (mode <= 0) return 0;
+  if (mode >= 2 && Me2AbOff(Me2Ab::kLightOcc)) return 1;
+  return mode;
+}
+
+uint8_t LightOccTest(const float* mn, const float* mx) {
+  const auto t0 = std::chrono::steady_clock::now();
+  const uint8_t code = Me2RasterTestBox(mn, mx, t_lo.frame);
+  g_lo.ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+  ++g_lo.tests;
+  return code;
+}
+
+// At the start of a light pass: the light's own box. True = the whole pass is to be left out (mode 2).
+bool LightOccBegin(uint32_t light, const uint8_t* base) {
+  t_lo = LightOcc{};
+  const int mode = LightOccMode();
+  if (!mode) return false;
+  ++g_lo.passes;
+  const LightSphere s = LightSphereOf(light, base, 1.0f, 0.0f);  // (min only marks the sphere as wanted)
+  if (!s.ok) {
+    ++g_lo.not_point;
+    return false;
+  }
+  t_lo.frame = g_sa2_game_frames.load(std::memory_order_relaxed);
+  t_lo.mn[0] = s.x - s.r, t_lo.mn[1] = s.y - s.r, t_lo.mn[2] = s.z - s.r;
+  t_lo.mx[0] = s.x + s.r, t_lo.mx[1] = s.y + s.r, t_lo.mx[2] = s.z + s.r;
+  const uint8_t code = LightOccTest(t_lo.mn, t_lo.mx);
+  if (code == 0) {
+    ++g_lo.no_buffer;
+    return false;
+  }
+  ++g_lo.code[code < 6 ? code : 0];
+  t_lo.ok = true;
+  t_lo.whole = code == 2 || code == 5;
+  return mode == 2 && t_lo.whole;
+}
+
+// One light draw: the mesh's bounds box (origin c, extent e) clipped to the light's box. 0 keep, 1 occluded, 2 off-screen,
+// 3 the boxes do not meet. Counted per kind (static mesh element / lit dynamic primitive).
+int LightOccDraw(const float c[3], const float e[3], bool dynamic) {
+  if (t_lo.whole) {
+    ++(dynamic ? g_lo.whole_dynamic : g_lo.whole_static);
+    return 1;
+  }
+  int r = 0;
+  float mn[3], mx[3];
+  for (int k = 0; k < 3 && !r; ++k) {
+    mn[k] = std::max(c[k] - e[k], t_lo.mn[k]);
+    mx[k] = std::min(c[k] + e[k], t_lo.mx[k]);
+    if (!(mn[k] <= mx[k])) r = 3;
+  }
+  if (!r) {
+    const uint8_t code = LightOccTest(mn, mx);
+    r = code == 2 ? 1 : code == 5 ? 2 : 0;
+  }
+  ++(dynamic ? g_lo.dy_tested : g_lo.st_tested);
+  if (r == 1) ++(dynamic ? g_lo.dy_occ : g_lo.st_occ);
+  if (r == 2) ++(dynamic ? g_lo.dy_out : g_lo.st_out);
+  if (r == 3) ++(dynamic ? g_lo.dy_apart : g_lo.st_apart);
+  return r;
+}
+
+// A bounds box (FBoxSphereBounds at 'b': origin +0, extent +12) with sane values.
+bool BoundsBox(const uint8_t* base, uint32_t b, float c[3], float e[3]) {
+  for (int k = 0; k < 3; ++k) {
+    c[k] = LoadF32(base, b + 4u * uint32_t(k));
+    e[k] = LoadF32(base, b + 12u + 4u * uint32_t(k));
+    if (!std::isfinite(c[k]) || !(e[k] >= 0.0f) || e[k] > 1.0e7f) return false;
+  }
+  return true;
+}
+
+void LightOccReport() {
+  static auto last = std::chrono::steady_clock::now();
+  static uint64_t frame0 = g_sa2_game_frames.load(std::memory_order_relaxed);
+  const auto now = std::chrono::steady_clock::now();
+  if (!LightOccMode() || now - last < std::chrono::seconds(10)) return;
+  const uint64_t frame = g_sa2_game_frames.load(std::memory_order_relaxed);
+  const double f = double(std::max<uint64_t>(1, frame - frame0));
+  const LightOccStats& s = g_lo;
+  const auto pf = [f](uint64_t v) { return double(v) / f; };
+  REXLOG_INFO("[light-occ] {:.0f} s, {:.0f} frames (mode {}): light passes {:.1f}/f: point/spot {:.1f} = visible {:.1f}, "
+              "near {:.1f}, OCCLUDED {:.2f}, OFF-SCREEN {:.2f} (no buffer {:.1f}, other lights {:.1f}); light draws in "
+              "lights that would go whole: {:.1f} static + {:.1f} dynamic /f; per draw of the other lights: static "
+              "{:.1f}/f tested, would go {:.1f} (occluded {:.1f}, off-screen {:.1f}, apart {:.1f}); dynamic {:.1f}/f, "
+              "would go {:.1f} ({:.1f} / {:.1f} / {:.1f}); tests {:.0f}/f, {:.3f} ms a frame",
+              std::chrono::duration<double>(now - last).count(), f, LightOccMode(), pf(s.passes),
+              pf(s.passes - s.not_point - s.no_buffer), pf(s.code[1]), pf(s.code[3]), pf(s.code[2]), pf(s.code[5]),
+              pf(s.no_buffer), pf(s.not_point), pf(s.whole_static), pf(s.whole_dynamic), pf(s.st_tested),
+              pf(s.st_occ + s.st_out + s.st_apart), pf(s.st_occ), pf(s.st_out), pf(s.st_apart), pf(s.dy_tested),
+              pf(s.dy_occ + s.dy_out + s.dy_apart), pf(s.dy_occ), pf(s.dy_out), pf(s.dy_apart), pf(s.tests),
+              double(s.ns) / f / 1e6);
+  g_lo = LightOccStats{};
+  last = now;
+  frame0 = frame;
+}
 }  // namespace
+
+// ---------------------------------------------------------------------------------------------------------------------
+// me2-nx-deko (2026-11-06): light pass and particle counts (me2_lightpart_diag, default off; changes nothing). Console
+// stacks 2026-11-06 19:44 (Kasumi's party): RenderLights 18.5 % of the UE3 render thread (the per-light static mesh
+// lists 11.1 %), translucency 19.1 % (particles: FParticleSystemSceneProxy::DrawDynamicElements sub_82707BE0, ~14 %).
+// "[lightpart] lights": per frame the light passes, their static mesh draws and lit dynamic primitives; the drawn
+// static mesh draws by how many lights light the same primitive; what a cap of K lights a primitive (the K strongest at
+// the primitive's point nearest the light, UE3 point-light falloff) would leave out; the draws that get under 15 / 20 /
+// 30 % of their light; the lights with the most draws. "[lightpart] particles": particle system draws a frame (calls,
+// emitters, Renut draws, us) by the system's on-screen radius at 720p (bounds radius / distance, ~70 degree view).
+REXCVAR_DEFINE_BOOL(me2_lightpart_diag, false, "ME2/Diagnostics",
+                    "Counts for the light passes (lights per primitive, light caps, weak light draws) and the particle "
+                    "systems (draws by on-screen size); '[lightpart]' lines every 10 s. Changes nothing")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+extern std::atomic<uint64_t> g_me2_draws_total;  // renut d3d hooks/draw.cpp: every draw
+
+namespace {
+bool LpdOn() {
+  static const bool on = REXCVAR_GET(me2_lightpart_diag);
+  return on;
+}
+struct LpdLight {
+  uint32_t light = 0;
+  LightSphere sphere;  // ok: point / spot (strength from the falloff); else every primitive counts as fully lit
+  uint32_t static_draws = 0, dynamic = 0;
+};
+struct LpdHit {
+  int light;
+  float strength;
+  uint32_t draws;  // static mesh draws (0 for a lit dynamic primitive)
+};
+struct LpdWindow {
+  uint64_t frames = 0, passes = 0, static_draws = 0, dynamic = 0;
+  uint64_t by_lights[6] = {};  // static draws of primitives lit by 1, 2, 3, 4, 5, 6+ lights
+  uint64_t cap_saved[4] = {};  // static draws a cap of 1..4 lights a primitive leaves out
+  uint64_t weak[3] = {};       // static draws under 15 / 20 / 30 % of their light
+  std::unordered_map<uint32_t, std::pair<uint64_t, float>> per_light;  // light -> (static draws, radius)
+  // particles: by on-screen radius (camera inside, < 4, < 16, < 64, >= 64 px)
+  uint64_t p_calls[5] = {}, p_emitters[5] = {}, p_draws[5] = {}, p_ns[5] = {};
+  uint64_t p_no_bounds_calls = 0, p_no_bounds_draws = 0, p_no_bounds_ns = 0;
+  std::chrono::steady_clock::time_point start{};
+};
+LpdWindow g_lpd;
+std::vector<LpdLight> g_lpd_lights;                          // this frame's light passes
+std::unordered_map<uint32_t, std::vector<LpdHit>> g_lpd_prims;  // this frame: primitive -> its light hits
+uint64_t g_lpd_frame = ~0ull;
+thread_local int t_lpd_light = -1;  // the light pass running on this thread
+
+float LpdStrength(const LightSphere& l, float cx, float cy, float cz, float pr) {
+  if (!l.ok) return 1.0f;
+  const float dx = cx - l.x, dy = cy - l.y, dz = cz - l.z;
+  const float nearest = std::sqrt(dx * dx + dy * dy + dz * dz) - pr;
+  if (nearest <= 0.0f) return 1.0f;
+  const float t = nearest * l.inv;
+  if (t >= 1.0f) return 0.0f;
+  return std::pow(1.0f - t * t, l.exponent);
+}
+
+void LpdReport(std::chrono::steady_clock::time_point now) {
+  LpdWindow& w = g_lpd;
+  const double f = double(std::max<uint64_t>(w.frames, 1));
+  const double sd = double(std::max<uint64_t>(w.static_draws, 1));
+  std::vector<std::pair<uint32_t, std::pair<uint64_t, float>>> top(w.per_light.begin(), w.per_light.end());
+  std::sort(top.begin(), top.end(), [](auto& a, auto& b) { return a.second.first > b.second.first; });
+  std::string tops;
+  for (size_t i = 0; i < top.size() && i < 10; ++i)
+    tops += fmt::format(" {:08X} r{:.0f}: {:.1f};", top[i].first, top[i].second.second, double(top[i].second.first) / f);
+  REXLOG_INFO("[lightpart] lights, {:.0f} frames: {:.1f} light passes a frame, {:.1f} static mesh light draws, {:.1f} "
+              "lit dynamic primitives; static draws by the lights of their primitive 1/2/3/4/5/6+: {:.1f} / {:.1f} / "
+              "{:.1f} / {:.1f} / {:.1f} / {:.1f}; a cap of 1/2/3/4 lights a primitive leaves out {:.1f} / {:.1f} / "
+              "{:.1f} / {:.1f} draws a frame ({:.0f} / {:.0f} / {:.0f} / {:.0f} %); draws under 15/20/30 % of their light: "
+              "{:.1f} / {:.1f} / {:.1f} a frame; {} lights, the most draws a frame:{}",
+              f, double(w.passes) / f, double(w.static_draws) / f, double(w.dynamic) / f, w.by_lights[0] / f,
+              w.by_lights[1] / f, w.by_lights[2] / f, w.by_lights[3] / f, w.by_lights[4] / f, w.by_lights[5] / f,
+              w.cap_saved[0] / f, w.cap_saved[1] / f, w.cap_saved[2] / f, w.cap_saved[3] / f,
+              100.0 * w.cap_saved[0] / sd, 100.0 * w.cap_saved[1] / sd, 100.0 * w.cap_saved[2] / sd,
+              100.0 * w.cap_saved[3] / sd, w.weak[0] / f, w.weak[1] / f, w.weak[2] / f, w.per_light.size(), tops);
+  static const char* kBucket[5] = {"camera inside", "< 4 px", "< 16 px", "< 64 px", ">= 64 px"};
+  std::string parts;
+  uint64_t calls = w.p_no_bounds_calls, draws = w.p_no_bounds_draws, ns = w.p_no_bounds_ns;
+  for (int b = 0; b < 5; ++b) {
+    calls += w.p_calls[b], draws += w.p_draws[b], ns += w.p_ns[b];
+    parts += fmt::format(" {}: {:.1f} calls, {:.1f} emitters, {:.1f} draws, {:.3f} ms;", kBucket[b], w.p_calls[b] / f,
+                         w.p_emitters[b] / f, w.p_draws[b] / f, double(w.p_ns[b]) / f / 1e6);
+  }
+  REXLOG_INFO("[lightpart] particles: {:.1f} system draws a frame, {:.1f} Renut draws, {:.3f} ms a frame; by on-screen "
+              "radius:{} no bounds: {:.1f} calls, {:.1f} draws",
+              calls / f, draws / f, double(ns) / f / 1e6, parts, w.p_no_bounds_calls / f, w.p_no_bounds_draws / f);
+  g_lpd = LpdWindow{};
+  g_lpd.start = now;
+}
+
+// The frame's light hits into the window (at the first light pass of the next frame).
+void LpdFold() {
+  LpdWindow& w = g_lpd;
+  ++w.frames;
+  w.passes += g_lpd_lights.size();
+  for (const LpdLight& l : g_lpd_lights) {
+    w.static_draws += l.static_draws;
+    w.dynamic += l.dynamic;
+    auto& pl = w.per_light[l.light];
+    pl.first += l.static_draws;
+    pl.second = l.sphere.ok ? l.sphere.r : 0.0f;
+  }
+  std::vector<LpdHit> hits;
+  for (auto& [psi, v] : g_lpd_prims) {
+    // one entry per light (a light's static draws of this primitive summed)
+    hits.clear();
+    for (const LpdHit& h : v) {
+      auto it = std::find_if(hits.begin(), hits.end(), [&](const LpdHit& x) { return x.light == h.light; });
+      if (it == hits.end())
+        hits.push_back(h);
+      else
+        it->draws += h.draws;
+    }
+    uint32_t draws = 0;
+    for (const LpdHit& h : hits) draws += h.draws;
+    w.by_lights[std::min<size_t>(hits.size(), 6) - 1] += draws;
+    std::sort(hits.begin(), hits.end(), [](const LpdHit& a, const LpdHit& b) { return a.strength > b.strength; });
+    for (int k = 1; k <= 4; ++k)
+      for (size_t i = size_t(k); i < hits.size(); ++i) w.cap_saved[k - 1] += hits[i].draws;
+    for (const LpdHit& h : hits) {
+      if (h.strength < 0.15f) w.weak[0] += h.draws;
+      if (h.strength < 0.20f) w.weak[1] += h.draws;
+      if (h.strength < 0.30f) w.weak[2] += h.draws;
+    }
+  }
+  g_lpd_lights.clear();
+  g_lpd_prims.clear();
+}
+
+struct LpdLightScope {
+  bool on = false;
+  LpdLightScope(uint32_t light, const uint8_t* base) {
+    if (!LpdOn() || !GuestPtrOk(light)) return;
+    const uint64_t frame = g_sa2_game_frames.load(std::memory_order_relaxed);
+    if (frame != g_lpd_frame) {
+      if (g_lpd_frame != ~0ull) LpdFold();
+      g_lpd_frame = frame;
+      const auto now = std::chrono::steady_clock::now();
+      if (g_lpd.start == std::chrono::steady_clock::time_point{}) g_lpd.start = now;
+      if (now - g_lpd.start >= std::chrono::seconds(10)) LpdReport(now);
+    }
+    LpdLight l;
+    l.light = light;
+    l.sphere = LightSphereOf(light, base, 0.01f, 0.0f);
+    g_lpd_lights.push_back(l);
+    t_lpd_light = int(g_lpd_lights.size()) - 1;
+    on = true;
+  }
+  ~LpdLightScope() {
+    if (on) t_lpd_light = -1;
+  }
+};
+
+void LpdStatic(uint32_t element, const uint8_t* base) {
+  if (t_lpd_light < 0 || !GuestPtrOk(element)) return;
+  LpdLight& l = g_lpd_lights[size_t(t_lpd_light)];
+  ++l.static_draws;
+  const uint32_t mesh = LoadBE32(base, element + 4);
+  const uint32_t psi = GuestPtrOk(mesh) && g_mesh_psi_off >= 0 ? MeshPsi(mesh, base) : 0;
+  float sphere[4];
+  const float strength =
+      ElementSphere(element, base, sphere) ? LpdStrength(l.sphere, sphere[0], sphere[1], sphere[2], sphere[3]) : 1.0f;
+  g_lpd_prims[psi ? psi : element].push_back({t_lpd_light, strength, 1});
+}
+
+void LpdDynamic(uint32_t psi, const uint8_t* base) {
+  if (t_lpd_light < 0) return;
+  LpdLight& l = g_lpd_lights[size_t(t_lpd_light)];
+  ++l.dynamic;
+  (void)psi, (void)base;
+}
+
+// Particles: [proxy + 16] = its FPrimitiveSceneInfo (checked: the scene info's proxy at +8 is this proxy), else the
+// offset is looked for once among the proxy's first 256 bytes.
+int32_t g_lpd_proxy_psi_off = -1;
+uint32_t LpdProxyPsi(uint32_t proxy, const uint8_t* base) {
+  const auto check = [&](uint32_t off) {
+    const uint32_t psi = LoadBE32(base, proxy + off);
+    return GuestPtrOk(psi) && LoadBE32(base, psi + 8) == proxy ? psi : 0u;
+  };
+  if (g_lpd_proxy_psi_off >= 0) return check(uint32_t(g_lpd_proxy_psi_off));
+  for (uint32_t off = 4; off < 256; off += 4)
+    if (const uint32_t psi = check(off)) {
+      g_lpd_proxy_psi_off = int32_t(off);
+      REXLOG_INFO("[lightpart] particle proxy -> scene info at +{}", off);
+      return psi;
+    }
+  return 0;
+}
+}  // namespace
+
+REX_EXTERN(__imp__sub_82707BE0);
+REX_HOOK_RAW(sub_82707BE0) {  // FParticleSystemSceneProxy::DrawDynamicElements(proxy, PDI, view, DPG, flags)
+  if (!LpdOn()) {
+    __imp__sub_82707BE0(ctx, base);
+    return;
+  }
+  const uint32_t proxy = ctx.r3.u32;
+  int bucket = -1;
+  uint32_t emitters = 0;
+  if (GuestPtrOk(proxy)) {
+    const uint32_t data = LoadBE32(base, proxy + 164);
+    if (GuestPtrOk(data)) emitters = LoadBE32(base, data + 4);
+    const uint32_t psi = LpdProxyPsi(proxy, base);
+    float cam[3];
+    if (psi && g_psi_bounds_off >= 0 && me2_occlusion_camera(cam)) {
+      const uint32_t b = psi + uint32_t(g_psi_bounds_off);
+      const float r = LoadF32(base, b + 24);
+      const float dx = LoadF32(base, b) - cam[0], dy = LoadF32(base, b + 4) - cam[1], dz = LoadF32(base, b + 8) - cam[2];
+      const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+      if (r >= 0.0f && std::isfinite(r)) {
+        if (d <= r) {
+          bucket = 0;
+        } else {
+          const float px = r / d / 0.7f * 360.0f;  // tan(35 degrees) ~ 0.7, 720 lines
+          bucket = px < 4.0f ? 1 : px < 16.0f ? 2 : px < 64.0f ? 3 : 4;
+        }
+      }
+    }
+  }
+  const uint64_t draws0 = g_me2_draws_total.load(std::memory_order_relaxed);
+  const auto t0 = std::chrono::steady_clock::now();
+  __imp__sub_82707BE0(ctx, base);
+  const uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+  const uint64_t draws = g_me2_draws_total.load(std::memory_order_relaxed) - draws0;
+  LpdWindow& w = g_lpd;
+  if (bucket < 0) {
+    ++w.p_no_bounds_calls, w.p_no_bounds_draws += draws, w.p_no_bounds_ns += ns;
+  } else {
+    ++w.p_calls[bucket], w.p_emitters[bucket] += emitters, w.p_draws[bucket] += draws, w.p_ns[bucket] += ns;
+  }
+}
 
 REX_EXTERN(__imp__sub_82688C70);
 REX_HOOK_RAW(sub_82688C70) {
@@ -822,6 +1203,15 @@ REX_HOOK_RAW(sub_82688C70) {
       return;
     }
   }
+  // me2-nx-deko (2026-11-06): me2_light_occlusion: the light's own box first (mode 2: an occluded light draws nothing).
+  struct OccScope {
+    ~OccScope() { t_lo = LightOcc{}; }
+  } occ_scope;
+  LightOccReport();
+  if (LightOccBegin(ctx.r4.u32, base)) {
+    ctx.r3.u64 = 0;  // bDirty FALSE, as for a light left out whole above
+    return;
+  }
   // me2-nx-deko (2026-11-04): the light's edge test (me2_light_edge) for this pass.
   struct SphereScope {
     explicit SphereScope(const LightSphere& s) { t_light_sphere = s; }
@@ -830,6 +1220,7 @@ REX_HOOK_RAW(sub_82688C70) {
   if (t_light_sphere.ok && t_light_sphere.min > 0.0f)
     ++g_light_edge_lights;
   LightEdgeReport();
+  const LpdLightScope lpd_scope(ctx.r4.u32, base);  // me2_lightpart_diag
   static const bool configured = REXCVAR_GET(me2_light_small_factor) > 0;
   if (!configured && !t_light_sphere.ok) {
     __imp__sub_82688C70(ctx, base);
@@ -896,6 +1287,11 @@ REX_HOOK_RAW(sub_82688C70) {
             small = true;
             ++g_light_edge_dynamic_left;
           }
+          // me2-nx-deko (2026-11-06): me2_light_occlusion.
+          float oc[3], oe[3];
+          if (!small && t_lo.ok && BoundsBox(base, b, oc, oe) && LightOccDraw(oc, oe, true) != 0 &&
+              LightOccMode() == 2)
+            small = true;
         }
         if (small) {
           ++g_light_left;
@@ -903,6 +1299,7 @@ REX_HOOK_RAW(sub_82688C70) {
           StoreBE32(base, data + kept * 4u, psi);
           ++kept;
           ++g_light_kept;
+          LpdDynamic(psi, base);  // me2_lightpart_diag
         }
       }
       if (kept != uint32_t(count)) {
@@ -959,6 +1356,17 @@ inline bool LightStaticSkip(uint32_t element, const uint8_t* base) {
     ++g_light_edge_static_left;
     return true;
   }
+  // me2-nx-deko (2026-11-06): me2_light_occlusion (the element's primitive bounds box clipped to the light's box).
+  if (!skip && t_lo.ok && g_psi_bounds_off >= 0 && g_mesh_psi_off >= 0) {
+    const uint32_t mesh = LoadBE32(base, element + 4);
+    const uint32_t psi = GuestPtrOk(mesh) ? MeshPsi(mesh, base) : 0;
+    float oc[3], oe[3];
+    if (GuestPtrOk(psi) && BoundsBox(base, psi + uint32_t(g_psi_bounds_off), oc, oe) &&
+        LightOccDraw(oc, oe, false) != 0 && LightOccMode() == 2) {
+      ++g_light_static_left;
+      return true;
+    }
+  }
   ++(skip ? g_light_static_left : g_light_static_kept);
   return skip;
 }
@@ -969,6 +1377,7 @@ inline bool LightStaticSkip(uint32_t element, const uint8_t* base) {
   REX_HOOK_RAW(fn) {                           \
     if (LightStaticSkip(ctx.r4.u32, base))     \
       return;                                  \
+    LpdStatic(ctx.r4.u32, base);               \
     __imp__##fn(ctx, base);                    \
   }
 ME2_LIGHT_STATIC_HOOK(sub_82329BE0)  // sub_82325DC8 +4 list

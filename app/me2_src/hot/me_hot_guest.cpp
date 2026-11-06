@@ -21,9 +21,13 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
+
+#include <fmt/format.h>
 
 #include "n/n_827EBC58.h"  // ME2: LZO1X decompressor
 #include "n/n_82D5F900.h"  // ME2: CRT wcsicmp
@@ -36,11 +40,13 @@
 #include "n/n_82D5F6D0.h"  // ME2: CRT wcslen
 #include "n/n_82E59DF8.h"  // ME2: Wwise resamplers, mono and stereo
 #include "n/n_82E94F28.h"  // ME2: Wwise delay line (2 functions)
+#include "n/n_82E95FC8.h"  // ME2 (2026-11-06): Wwise reverb core (4-line feedback delay network)
 #include "n/n_82993E40.h"  // ME2: TMap<FName,V>::Find, material parameters (2 functions)
 #include "n/n_825464E0.h"  // ME2: bone records <-> skeletal mesh bone data swap
 #include "n/n_82A92C50.h"  // ME2: XDK SetVertex/PixelShaderConstantF fast paths (2 functions)
 #include "n/n_822EB710.h"  // ME2: UE3 pixel shader parameter setters (2 functions, constant setter inlined)
 #include "n/n_827DB288.h"  // ME2: UE3 texture + sampler setter with XDK SetTexture / filter setters inlined
+#include "n/n_827DB818.h"  // ME2 (2026-11-06): UE3 static render-state setter with the nine XDK setters inlined
 #include "n/n_822CDFF0.h"  // ME2: grouped sphere/frustum test (InitViews)
 #include "n/n_8279B210.h"  // ME2: LZX of appDecompressMemory (libmspack lzxd)
 
@@ -252,6 +258,10 @@ ME_HOT_HOOK(82E59DF8, me2_hot_wwise_resample_mono, me::hot::n_82E59DF8)
 ME_HOT_CVAR(me2_hot_wwise_resample_stereo, "Native sub_82E5A180 (Wwise linear resampler, stereo s16), self-checked");
 ME_HOT_HOOK(82E5A180, me2_hot_wwise_resample_stereo, me::hot::n_82E5A180)
 // Wwise delay line (ring buffer of floats): swap in place / in -> ring -> out (n_82E94F28.h).
+// Wwise reverb core: four filtered delay lines mixed each sample (n_82E95FC8.h); 25.8 % of the Wwise thread at Kasumi's
+// party (console 11-06).
+ME_HOT_CVAR(me2_hot_wwise_reverb, "Native sub_82E95FC8 (Wwise reverb core, 4-line feedback delay network), self-checked");
+ME_HOT_HOOK(82E95FC8, me2_hot_wwise_reverb, me::hot::n_82E95FC8)
 ME_HOT_CVAR(me2_hot_wwise_delay_swap, "Native sub_82E94F28 (Wwise delay line, in-place swap), self-checked");
 ME_HOT_HOOK(82E94F28, me2_hot_wwise_delay_swap, me::hot::n_82E94F28)
 ME_HOT_CVAR(me2_hot_wwise_delay_copy, "Native sub_82E94FE8 (Wwise delay line, in -> ring -> out), self-checked");
@@ -279,6 +289,10 @@ ME_HOT_CVAR(me2_hot_ps_value, "Native sub_822EB710 (UE3 SetPixelShaderValue, one
 ME_HOT_HOOK(822EB710, me2_hot_ps_value, me::hot::n_822EB710)
 ME_HOT_CVAR(me2_hot_ps_values, "Native sub_822C8C10 (UE3 SetPixelShaderValues, a float4 array element), self-checked");
 ME_HOT_HOOK(822C8C10, me2_hot_ps_values, me::hot::n_822C8C10)
+// ME2 (2026-11-06): UE3's static render-state setter with the nine XDK render-state setters inlined, each device word
+// stored once (n_827DB818.h): 1.7-1.9 % of the UE3 render thread in the console stacks of 2026-11-06.
+ME_HOT_CVAR(me2_hot_render_states, "Native sub_827DB818 (UE3 static render-state setter, nine XDK setters inlined), self-checked");
+ME_HOT_HOOK(827DB818, me2_hot_render_states, me::hot::n_827DB818)
 // ME2 (2026-10-27): UE3's texture + sampler setter of the material parameters with the XDK SetTexture and the two
 // filter setters inlined (n_827DB288.h): 827DB288 + 82A9AF70 + 82A9D268/82A9D0C0 ~5.5 % of the UE3 render thread in the
 // console stacks of 22:2x / 22:5x.
@@ -290,8 +304,47 @@ namespace me::hot::n_827DB288 {
 bool ShadowNative(PPCContext&, uint8_t*);
 }
 REX_EXTERN(__imp__sub_827DB288);
+// ME2 (2026-11-06): the texture header cache of n_827DB288.h (texcache).
+REXCVAR_DEFINE_INT32(me2_texture_header_cache, 0, "ME2",
+                     "Texture binds (native sub_827DB288) keep a host copy of the texture header words, valid while the "
+                     "store cards of their pages stay clean: 1 = count only (the header is still read and compared; "
+                     "'[texcache]' every 10 s), 2 = use the copy (one use in 256 still compared; a difference falls back "
+                     "to 1); 0 = off")
+    .range(0, 2)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+extern "C" int32_t g_me2_texcache_mode = 0;
+static void TexCacheReport() {
+  using namespace me::hot::n_827DB288::texcache;
+  static auto last = std::chrono::steady_clock::now();
+  static uint64_t frame0 = g_sa2_game_frames.load(std::memory_order_relaxed);
+  static int32_t configured = REXCVAR_GET(me2_texture_header_cache);
+  const auto now = std::chrono::steady_clock::now();
+  if (now - last < std::chrono::seconds(10)) return;
+  const uint64_t frame = g_sa2_game_frames.load(std::memory_order_relaxed);
+  const double f = double(std::max<uint64_t>(1, frame - frame0));
+  const Stats& st = g_stats;
+  const double b = double(std::max<uint64_t>(1, st.binds));
+  REXLOG_INFO("[texcache] {:.0f} frames, mode {} (configured {}): {:.0f} binds/f; outside the cacheable pages {:.1f} %, "
+              "refills {:.1f} %, clean cards {:.1f} % (COPY USED {:.1f} %, checked {:.1f} %: equal {}, STALE {}); "
+              "entries confirmed {}",
+              f, g_me2_texcache_mode, configured, double(st.binds) / f, 100.0 * double(st.outside) / b,
+              100.0 * double(st.refills) / b, 100.0 * double(st.clean) / b, 100.0 * double(st.used) / b,
+              100.0 * double(st.checked) / b, st.equal, st.stale, st.confirmed);
+  if (st.stale)
+    REXLOG_WARN("[texcache] {} STALE copies under clean cards: a writer of texture headers that leaves the cards alone",
+                st.stale);
+  g_stats = Stats{};
+  last = now;
+  frame0 = frame;
+}
 static void Hot827DB288(PPCContext& ctx, uint8_t* base) {
   static thread_local uint32_t n_calls;
+  static const bool texcache_init = [] {
+    g_me2_texcache_mode = REXCVAR_GET(me2_texture_header_cache);
+    return true;
+  }();
+  (void)texcache_init;
+  if (g_me2_texcache_mode > 0 && (me::hot::n_827DB288::texcache::g_stats.binds & 4095u) == 0) TexCacheReport();
   static me::hot::Hook h{"sub_827DB288", &__imp__sub_827DB288, &me::hot::NativeB<&me::hot::n_827DB288::Native>,
                          &me::hot::n_827DB288::ShadowNative, &me::hot::n_827DB288::Writes, me::hot::n_827DB288::kCmp};
   const uint8_t st = h.state.load(std::memory_order_relaxed);
@@ -437,4 +490,141 @@ REX_HOOK_RAW(sub_8279B210) {  // appDecompressMemory(flags, dst, dst size, src, 
   if (ctx.r3.u32 == 0) g_lzx.failed.fetch_add(1, std::memory_order_relaxed);
   g_me2_lzx_total_us.fetch_add(us, std::memory_order_relaxed);
   LzxReport(t1);
+}
+
+
+// me2-nx-deko (2026-11-07): shader constant uploads with NaN / infinite / huge floats (n_82A92C50.h shader_consts::Set,
+// the native path of the XDK SetVertex/PixelShaderConstantF), and draws whose device constants hold such floats
+// (Me2BadConstsDraw, from the draw hooks: catches writers that bypass Set). Logged with the host callers: image offsets
+// (Switch: ELF addresses, the generated sub_XXXXXXXX functions; Windows: RVAs in sa2.exe / sa2.pdb). The guest link
+// registers are not usable here (the recompiled code does not keep them). FLT_MAX is left alone (UE3 uploads it on
+// purpose).
+REXCVAR_DEFINE_BOOL(me2_diag_bad_consts, false, "ME2/Diagnostics",
+                    "Log shader constant uploads and draws with NaN, infinite or huge floats in the constants, with "
+                    "the host callers ('[bad-consts]' lines)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+extern "C" int8_t g_me2_bad_consts = -1;
+
+#if defined(__SWITCH__)
+extern "C" char _start;  // the image's base
+#elif defined(_WIN32)
+extern "C" char __ImageBase;
+extern "C" __declspec(dllimport) unsigned short __stdcall RtlCaptureStackBackTrace(unsigned long, unsigned long, void**,
+                                                                                   unsigned long*);
+#endif
+
+namespace {
+
+bool BadFloatBits(uint32_t u) {
+  if (u == 0x7F7FFFFFu || u == 0xFF7FFFFFu) return false;  // +-FLT_MAX: deliberate
+  float f;
+  std::memcpy(&f, &u, 4);
+  return !std::isfinite(f) || std::fabs(f) > 1.0e15f;
+}
+
+__attribute__((noinline)) std::string HostCallers() {
+  std::string text;
+#if defined(__SWITCH__) && defined(__aarch64__)
+  const uintptr_t image = reinterpret_cast<uintptr_t>(&_start);
+  uintptr_t fp = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
+  for (int i = 0; i < 14 && fp; ++i) {
+    const uintptr_t* frame = reinterpret_cast<const uintptr_t*>(fp);
+    const uintptr_t next = frame[0], lr = frame[1];
+    if (!lr || lr < image) break;
+    text += fmt::format(" {:X}", lr - image);
+    if (next <= fp || next - fp > 0x10000 || (next & 7)) break;
+    fp = next;
+  }
+#elif defined(_WIN32)
+  void* frames[16] = {};
+  const unsigned short n = RtlCaptureStackBackTrace(1, 16, frames, nullptr);
+  const uintptr_t image = reinterpret_cast<uintptr_t>(&__ImageBase);
+  for (unsigned short i = 0; i < n; ++i) {
+    const uintptr_t a = reinterpret_cast<uintptr_t>(frames[i]);
+    text += a > image ? fmt::format(" +{:X}", a - image) : fmt::format(" ?{:X}", a);
+  }
+#endif
+  return text;
+}
+
+std::string RegText(const uint8_t* base, uint32_t va) {
+  using namespace me::hot;
+  std::string vals;
+  for (int j = 0; j < 4; ++j) {
+    const uint32_t u = Ld32(base, va + 4u * uint32_t(j));
+    float f;
+    std::memcpy(&f, &u, 4);
+    vals += fmt::format(" {:g}({:08X})", f, u);
+  }
+  return vals;
+}
+
+bool BadConstsOn() {
+  if (g_me2_bad_consts < 0) g_me2_bad_consts = REXCVAR_GET(me2_diag_bad_consts) ? 1 : 0;
+  return g_me2_bad_consts != 0;
+}
+
+}  // namespace
+
+extern "C" void Me2BadConstsCheck(const PPCContext& ctx, const uint8_t* base, bool vertex, uint32_t src, uint32_t count) {
+  if (!BadConstsOn()) return;
+  using namespace me::hot;
+  int first = -1;
+  for (uint32_t i = 0; i < count * 4 && first < 0; ++i)
+    if (BadFloatBits(Ld32(base, src + 4 * i))) first = int(i / 4);
+  if (first < 0) return;
+  // Logged per (shader stage, first register): the first 4 of each, then every 4096th (UE3 uploads some infinities
+  // on purpose all the time, e.g. PS c3.y; they must not use up the log before a rare bad upload elsewhere).
+  static std::atomic<uint32_t> per_key[512] = {}, total{0};
+  const uint32_t n = total.fetch_add(1, std::memory_order_relaxed) + 1;
+  const uint32_t key = (vertex ? 0u : 256u) + (ctx.r4.u32 & 255u);
+  const uint32_t seen = per_key[key].fetch_add(1, std::memory_order_relaxed);
+  if (seen >= 4 && (seen & 4095) != 0) return;
+  REXLOG_WARN("[bad-consts] set #{} ({} of this kind) {} c{}+{} from {:08X}: register c{} ={}; host callers{}", n,
+              seen + 1, vertex ? "VS" : "PS", ctx.r4.u32, count, src, ctx.r4.u32 + uint32_t(first),
+              RegText(base, src + uint32_t(first) * 16), HostCallers());
+}
+
+// At each draw (render thread): the device's constant registers (VS c0-c255 at device + (r + 120) * 16, PS at
+// device + (r + 376) * 16, see n_82A92C50.h). A register is logged the first time it is bad, and again each time it
+// turns bad after having been good (rate-limited), with the draw's callers; "[bad-consts] draws" every ~10 s counts
+// the draws that had any bad register.
+// device_host = the device's host address (the caller translates it; base + va for the registers below).
+extern "C" void Me2BadConstsDraw(const uint8_t* device_host, uint32_t device) {
+  if (!BadConstsOn() || device == 0 || device_host == nullptr) return;
+  using namespace me::hot;
+  const uint8_t* base = device_host - device;
+  static thread_local uint8_t was_bad[512] = {};
+  static thread_local uint32_t reg_logs[512] = {};
+  static thread_local uint64_t draws = 0, bad_draws = 0;
+  static thread_local auto since = std::chrono::steady_clock::now();
+  static std::atomic<uint32_t> logged{0};
+  ++draws;
+  bool any = false;
+  for (uint32_t k = 0; k < 512; ++k) {
+    const uint32_t va = device + (k < 256 ? k + 120 : k - 256 + 376) * 16;
+    const bool bad = BadFloatBits(Ld32(base, va)) || BadFloatBits(Ld32(base, va + 4)) ||
+                     BadFloatBits(Ld32(base, va + 8)) || BadFloatBits(Ld32(base, va + 12));
+    if (bad) {
+      any = true;
+      if (!was_bad[k] && reg_logs[k] < 6 && logged.load(std::memory_order_relaxed) < 400) {
+        ++reg_logs[k];
+        logged.fetch_add(1, std::memory_order_relaxed);
+        REXLOG_WARN("[bad-consts] draw {} {} c{} turned bad ={}; host callers{}", draws, k < 256 ? "VS" : "PS",
+                    k & 255, RegText(base, va), HostCallers());
+      }
+    }
+    was_bad[k] = bad;
+  }
+  bad_draws += any;
+  const auto now = std::chrono::steady_clock::now();
+  if (now - since >= std::chrono::seconds(10)) {
+    std::string regs;
+    for (uint32_t k = 0; k < 512; ++k)
+      if (was_bad[k]) regs += fmt::format(" {}c{}", k < 256 ? "VS" : "PS", k & 255);
+    REXLOG_WARN("[bad-consts] draws last ~10 s: {} of {} with a bad register; bad now:{}", bad_draws, draws, regs);
+    draws = bad_draws = 0;
+    since = now;
+  }
 }

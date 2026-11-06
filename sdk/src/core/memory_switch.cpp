@@ -44,6 +44,11 @@
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
+
+// me2-nx-deko (2026-11-06): defined at the end of this file.
+bool RexWindowBlocksOn();
+// me2-nx-deko (2026-11-06): what ui/switch_code_blocks.cpp did, before there was a log.
+extern "C" const char* RexCodeBlocksStatus(void);
 #include <rex/memory/utils.h>
 
 #include "guest_memory_switch.h"
@@ -275,12 +280,17 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
   // Horizon has no named shared memory and no sparse memory. The "file" is the
   // window of the guest memory core, and it is reserved here, empty. Real memory
   // arrives with AllocFixed(kCommit).
+  if (!RexGmBase()) RexGmSetWindowBlocks(RexWindowBlocksOn());  // me2-nx-deko (2026-11-06)
   if (!RexGmBase() && !RexGmInit(AlignUp(length))) {
     REXLOG_ERROR("Could not reserve the guest window of 0x{:X} bytes. "
                  "Title takeover is required: in applet mode there is no room.",
                  length);
     return kFileMappingHandleInvalid;
   }
+  REXLOG_INFO("[window blocks] guest window at 0x{:X}, {} a 2 MB boundary (switch_window_blocks)",
+              reinterpret_cast<uintptr_t>(RexGmBase()),
+              (reinterpret_cast<uintptr_t>(RexGmBase()) & 0x1FFFFF) ? "NOT on" : "on");
+  REXLOG_INFO("{}", RexCodeBlocksStatus());
   return kSwitchMapping;
 }
 
@@ -320,5 +330,21 @@ bool UnmapFileView(FileMappingHandle handle, void* base_address, size_t length) 
 }
 
 }  // namespace rex::memory
+
+// me2-nx-deko (2026-11-06, from renut-nx 1.0.2): at the end of the file, so that the other functions keep their PGO profile.
+REXCVAR_DEFINE_BOOL(switch_window_blocks, true, "Switch",
+                    "The guest window on a 2 MB boundary, so that the kernel can use 2 MB blocks for the game's memory "
+                    "(virtmemFindAslr's second argument is a guard, not an alignment). false: anywhere, on 4 KB pages, "
+                    "as before 2026-11-06");
+REXCVAR_DEFINE_BOOL(switch_code_blocks, true, "Switch",
+                    "The NRO's code and read-only data on 2 MB blocks (ui/switch_code_blocks.cpp, which reads this key "
+                    "from me2.toml next to the NRO itself, because it runs before the cvars; costs their size again in "
+                    "heap, ~60 MB). false: on 4 KB pages, as before 2026-11-06");
+REXCVAR_DEFINE_INT32(switch_tlb_test_s, 0, "Switch",
+                     "Once, this many seconds after the profiler starts: what a TLB miss costs in game memory and in the "
+                     "NRO's code, in rex_stderr.log ('[tlb]' lines; a few hundred ms on the profiler thread). Only the "
+                     "console's numbers mean anything. 0: never");
+
+bool RexWindowBlocksOn() { return REXCVAR_GET(switch_window_blocks); }
 
 #endif  // REX_PLATFORM_SWITCH

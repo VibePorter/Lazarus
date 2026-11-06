@@ -461,6 +461,13 @@ REXCVAR_DEFINE_BOOL(me2_renut_budget_chunk_free, false, "ME2",
                     "texture reserve rule (banjo_renut_textures_reserve_mb); off = the block arena's largest free "
                     "range only")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(me2_deko3d_arena_max_mb, 1024, "ME2",
+                     "deko3d: the largest size of the block arena the GPU's memory blocks come from (reserved from the "
+                     "heap at the first block, never given back). The heap's rest holds the game's memory: a smaller "
+                     "arena leaves the game more (blocks that do not fit come from the heap; the texture reserve rule "
+                     "evicts unused textures sooner). 1024 = as before 2026-11-06")
+    .range(256, 1024)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(me2_renut_budget_arena_floor_mb, 128, "ME2",
                      "me2_renut_budget_chunk_free: block arena space kept for buffers, rings and code (not counted as "
                      "texture headroom)")
@@ -1421,6 +1428,10 @@ bool UploadCached() {
 }
 
 void BeforeDeviceCreated() {
+#if defined(PLUME_DEKO3D)
+  // ME2 (2026-11-06): before the first block, which reserves the arena.
+  plume::g_deko3dArenaMax.store(uint64_t(REXCVAR_GET(me2_deko3d_arena_max_mb)) << 20, std::memory_order_relaxed);
+#endif
   // The two rules outside the enhancement table (no master switch), stated once.
   REXLOG_INFO("[renut] banjo_renut_exact_streams {}; banjo_renut_keep_gpu_written {}{}; banjo_renut_memory_policy {}{}",
               REXCVAR_GET(banjo_renut_exact_streams), REXCVAR_GET(banjo_renut_keep_gpu_written),

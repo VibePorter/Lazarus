@@ -123,6 +123,16 @@ REXCVAR_DEFINE_BOOL(me2_renut_watch_chunks, true, "ME2/Renderer",
                     "A draw's device delta compares only the chunks the instrumented D3D writers marked "
                     "(tools/watch_marks.py; needs a build with app/watch_writers.txt)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// me2-nx-deko (2026-11-06): the marked chunks go into the delta as they are, and the render thread (Renut's) compares them
+// with its rebuilt device instead (DeviceForDraw): the UE3 render thread no longer waits on the device / shadow loads of
+// the compare (console stacks 2026-11-06 19:44: CaptureDelta 4.1 % of that thread, its time on those loads). The rebuilt
+// device is the same (an unchanged chunk copied over itself changes nothing); the chain's "changed" chunks are the ones
+// that really changed, as before. Off with me2_renut_watch_verify (which needs the shadow). "delta_raw" in me2_ab_cycle
+// turns it off in its slots.
+REXCVAR_DEFINE_BOOL(me2_renut_watch_raw, false, "ME2/Renderer",  // 2026-11-06 console A/B: no fps gain
+                    "me2_renut_watch_chunks: the marked chunks are copied into the delta without comparing them on the "
+                    "UE3 render thread; Renut's render thread compares them")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(me2_renut_watch_verify, false, "ME2/Renderer",
                     "Tests (me2_renut_watch_chunks): every delta also compares the unmarked chunks, takes those that "
                     "changed anyway and reports them ([watch] unmarked lines; counts in the 10 s device snapshot line)")
@@ -134,6 +144,8 @@ REXCVAR_DEFINE_BOOL(sa2_renut_snapshot_deltas_verify, false, "SA2/Renderer",
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace renut::gpu {
+
+extern bool (*g_delta_raw_ab_off)();  // me2-nx-deko (2026-11-06): render/draw.cpp, set by me2_ab_cycle "delta_raw"
 
 namespace {
 
@@ -410,6 +422,7 @@ inline DeltaChunkMask TakeWatchMarks() {
 struct DeltaHeader {
   uint64_t chunks[2];  // chunk i follows: bit i % 64 of word i / 64
   uint64_t vs, ps;     // the float constant groups that follow (bit 63 - group), the vertex shader's first
+  uint64_t raw;        // me2-nx-deko (me2_renut_watch_raw): the chunks were not compared (may equal the device's)
 };
 // The most a delta holds: every chunk and every group.
 constexpr size_t kDeltaMaxBytes = sizeof(DeltaHeader) + d3d::kDeviceSnapshotSize;
@@ -444,6 +457,7 @@ struct DeltaChain {
   uint64_t vs = 0, ps = 0;              // groups whole captures consumed since its last draw: they follow
   uint64_t deltas = 0, rebases = 0, bytes = 0, chunks = 0, groups = 0;  // the 10 s report's
   uint64_t whole = 0;  // sa2-nx: whole captures outside the chain (Begin*Vertices draws), under the lock too
+  bool raw_since_rebase = false;  // me2_renut_watch_raw: a raw delta left the shadow behind (a compare must rebase)
   alignas(64) u8 shadow[d3d::kDeviceSnapshotSize];  // the device at its last draw (the chunks)
 };
 DeltaChain g_delta;
@@ -492,6 +506,10 @@ bool WatchVerifyOn() {
   static const bool on = WatchChunksOn() && REXCVAR_GET(me2_renut_watch_verify);
   return on;
 }
+bool WatchRawOn() {
+  static const bool on = WatchChunksOn() && !WatchVerifyOn() && REXCVAR_GET(me2_renut_watch_raw);
+  return on && !(g_delta_raw_ab_off && g_delta_raw_ab_off());
+}
 // The watch marks' 10 s counts (under g_delta.mutex): deltas, marked chunks, chunks the verify found changed unmarked.
 uint64_t g_watch_deltas = 0, g_watch_marked = 0, g_watch_unmarked = 0;
 bool DeltasVerifyOn() {
@@ -526,6 +544,9 @@ struct DeferAcc {
 std::shared_ptr<std::vector<u8>> g_defer_last;
 bool g_defer_replayed = false;
 
+// me2_renut_watch_raw's counts (Renut's render thread): chunks that came uncompared, and how many of them had changed.
+std::atomic<uint64_t> g_delta_raw_taken{0}, g_delta_raw_changed{0};
+
 // sa2-nx (sa2_renut_snapshot_deltas), on the render thread: the device a queued draw reads.
 const u8 *DeviceForDraw(const DrawCapture &capture) {
   if (g_defer_replayed) {
@@ -549,27 +570,39 @@ const u8 *DeviceForDraw(const DrawCapture &capture) {
     DeltaHeader h;
     std::memcpy(&h, from, sizeof(h));
     from += sizeof(h);
-    g_chain_hint.seq = ++g_chain_seq;
-    g_chain_hint.changed[0] = h.chunks[0];
-    g_chain_hint.changed[1] = h.chunks[1];
-    g_chain_hint.consts_changed = (h.vs | h.ps) != 0;
-    g_chain_vs_dirty |= h.vs;
-    g_chain_ps_dirty |= h.ps;
-    g_defer_acc.chunks[0] |= h.chunks[0];
-    g_defer_acc.chunks[1] |= h.chunks[1];
-    g_defer_acc.vs |= h.vs;
-    g_defer_acc.ps |= h.ps;
+    // me2-nx-deko (me2_renut_watch_raw): uncompared chunks are compared here; only those that differ count as changed.
+    uint64_t changed[2] = {h.chunks[0], h.chunks[1]};
     for (u32 word = 0; word < 2; ++word) {
       for (uint64_t bits = h.chunks[word]; bits; bits &= bits - 1) {
         const u32 i = word * 64 + u32(std::countr_zero(bits));
         const u32 size = DeltaChunkSize(i);
-        // Whole chunks as a fixed-size copy, which stays inline.
-        if (size == kDeltaUnitBytes)
-          std::memcpy(g_delta_device + DeltaChunkOffset(i), from, kDeltaUnitBytes);
-        else
-          std::memcpy(g_delta_device + DeltaChunkOffset(i), from, size);
+        u8 *const to = g_delta_device + DeltaChunkOffset(i);
+        if (h.raw && std::memcmp(to, from, size) == 0) {
+          changed[word] &= ~(uint64_t(1) << (i % 64));
+        } else if (size == kDeltaUnitBytes) {
+          // Whole chunks as a fixed-size copy, which stays inline.
+          std::memcpy(to, from, kDeltaUnitBytes);
+        } else {
+          std::memcpy(to, from, size);
+        }
         from += size;
       }
+    }
+    g_chain_hint.seq = ++g_chain_seq;
+    g_chain_hint.changed[0] = changed[0];
+    g_chain_hint.changed[1] = changed[1];
+    g_chain_hint.consts_changed = (h.vs | h.ps) != 0;
+    g_chain_vs_dirty |= h.vs;
+    g_chain_ps_dirty |= h.ps;
+    g_defer_acc.chunks[0] |= changed[0];
+    g_defer_acc.chunks[1] |= changed[1];
+    g_defer_acc.vs |= h.vs;
+    g_defer_acc.ps |= h.ps;
+    if (h.raw) {
+      g_delta_raw_taken.fetch_add(uint64_t(std::popcount(h.chunks[0]) + std::popcount(h.chunks[1])),
+                                  std::memory_order_relaxed);
+      g_delta_raw_changed.fetch_add(uint64_t(std::popcount(changed[0]) + std::popcount(changed[1])),
+                                    std::memory_order_relaxed);
     }
     for (const auto [dirty, base] : {std::pair{h.vs, kDeltaVertexF}, std::pair{h.ps, kDeltaPixelF}}) {
       ForEachGroupRun(dirty, [&](u32 first, u32 count) {
@@ -778,6 +811,10 @@ DrawCapture *CaptureDelta(u32 device_va, const DrawCall &call) {
   capture->call.up_vertices = nullptr;
   capture->call.up_indices = nullptr;
   const auto *bytes = reinterpret_cast<const u8 *>(device);
+  // me2_renut_watch_raw: raw deltas leave the shadow behind; a compare after them starts the chain again.
+  const bool raw = WatchRawOn();
+  if (!raw && c.raw_since_rebase)
+    c.device = nullptr;
   if (c.device != device) {
     // The chain's first draw (or a frame's): the whole device, which the render thread takes as its own.
     for (auto &mask : device->m_Pending)
@@ -795,6 +832,7 @@ DrawCapture *CaptureDelta(u32 device_va, const DrawCall &call) {
     }
     TakeWatchMarks();
     c.vs = c.ps = 0;
+    c.raw_since_rebase = false;
     capture->snapshot = SnapshotKind::Rebase;
     ++c.rebases;
     c.bytes += d3d::kDeviceSnapshotSize;
@@ -867,6 +905,26 @@ DrawCapture *CaptureDelta(u32 device_va, const DrawCall &call) {
         }
       }
       // Increasing i: the order DeviceForDraw reads them back.
+      if (raw) {
+        // Copied as they are (the shadow is left behind: compared on Renut's render thread).
+        for (u32 word = 0; word < 2; ++word) {
+          for (uint64_t bits = look.w[word]; bits; bits &= bits - 1) {
+            const u32 i = word * 64 + u32(std::countr_zero(bits));
+            const u32 at = DeltaChunkOffset(i), size = DeltaChunkSize(i);
+            if (size == kDeltaUnitBytes)
+              std::memcpy(to, bytes + at, kDeltaUnitBytes);
+            else
+              std::memcpy(to, bytes + at, size);
+            to += size;
+            ++chunks;
+          }
+        }
+        h.chunks[0] = look.w[0];
+        h.chunks[1] = look.w[1];
+        h.raw = 1;
+        c.raw_since_rebase = true;
+        look.w[0] = look.w[1] = 0;
+      }
       for (u32 word = 0; word < 2; ++word) {
         for (uint64_t bits = look.w[word]; bits; bits &= bits - 1) {
           const u32 i = word * 64 + u32(std::countr_zero(bits));
@@ -977,6 +1035,12 @@ std::string SnapshotDeltaReport() {
     line += fmt::format("; watch: {:.1f} marked chunks a delta", double(wm) / double(std::max<uint64_t>(wd, 1)));
     if (WatchVerifyOn())
       line += fmt::format(", {} changed unmarked", wu);
+    // me2_renut_watch_raw: chunks copied without a compare, and how many of them Renut's thread found changed.
+    const uint64_t rt = g_delta_raw_taken.exchange(0, std::memory_order_relaxed);
+    const uint64_t rc = g_delta_raw_changed.exchange(0, std::memory_order_relaxed);
+    if (rt)
+      line += fmt::format("; raw (me2_renut_watch_raw): {:.1f} chunks a delta uncompared, {:.1f} of them changed",
+                          double(rt) / double(std::max<uint64_t>(wd, 1)), double(rc) / double(std::max<uint64_t>(wd, 1)));
   }
   if (DeltasVerifyOn()) {
     line += fmt::format("; verify: {} draws checked, {} differ", g_delta_verified.exchange(0, std::memory_order_relaxed),

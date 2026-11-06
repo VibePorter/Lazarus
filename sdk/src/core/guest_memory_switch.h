@@ -71,6 +71,14 @@ typedef enum {
 /* Reserves the window. size is usually 0x120000000. Returns the base or NULL. */
 uint8_t* RexGmInit(size_t size);
 
+/* me2-nx-deko (2026-11-06, from renut-nx): false, before RexGmInit: the window anywhere, on 4 KB pages
+   (switch_window_blocks). */
+void RexGmSetWindowBlocks(bool on);
+
+/* me2-nx-deko (2026-11-06, from renut-nx): the TLB's cost in game memory and the NRO's code, a line of text at a time
+   (switch_tlb_test_s, run by the profiler thread, ui/switch_perf.cpp). */
+void RexGmLatencyTest(void (*emit)(const char*));
+
 /* * Releases everything. */
 void RexGmShutdown(void);
 

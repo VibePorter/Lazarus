@@ -189,6 +189,9 @@ if(MGR_RENUT_RENDERER)
             me2_src/me2_ab_cycle.cpp
             me2_src/me2_shadow_diag.cpp
             me2_src/me2_drawlist_diag.cpp
+            me2_src/me2_dynshared.cpp  # me2-nx-deko (2026-11-06): skinned-mesh DrawShared diagnostic
+            me2_src/me2_replay.cpp  # me2-nx-deko (2026-11-06): draw-setup replay, stage 1 (compare mode)
+            me2_src/me2_vsm_light.cpp  # me2-nx-deko (2026-11-07): shadowed point light's uninitialised VSM matrix
             me2_src/me2_relink.cpp
             me2_src/me2_crowd_cpu.cpp
             me2_src/me2_anim_lod.cpp
@@ -327,4 +330,14 @@ if(ME2_FAST_MATH AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND TARGET sa2_re
     if(REXGLUE_PLATFORM_SWITCH AND MGR_SWITCH_LTO)
         target_link_options(sa2 PRIVATE -fno-math-errno -fno-trapping-math)
     endif()
+endif()
+
+# ME2 (2026-11-06): the link-register half of tools/frame_traffic.py. With the generator's elide_lr_stores no guest call
+# sets ctx.lr, so a prologue's mflr reads a stale word, saves it to the guest stack and the epilogue writes it back:
+# a ctx load, a stack store, a stack load and a ctx store per call for a value nothing uses. Measured 2026-11-06 (console
+# stacks): ~0.7 % of the guest threads' time in ctx.lr traffic. SA2 passed a frame-exact capture with it; the register
+# saves (REX_NV_SAVES_ELIDE) stay on, they tinted SA2's characters blue.
+option(ME2_LR_MOVES_ELIDE "Leave out the guest link register's dead stack-frame moves (REX_LR_MOVES_ELIDE)" ON)
+if(ME2_LR_MOVES_ELIDE AND TARGET sa2_recomp)
+    target_compile_definitions(sa2_recomp PRIVATE REX_LR_MOVES_ELIDE)
 endif()

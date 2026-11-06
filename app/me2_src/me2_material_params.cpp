@@ -74,6 +74,12 @@ REXCVAR_DEFINE_BOOL(me2_material_params_expr, true, "ME2",
 REXCVAR_DEFINE_BOOL(me2_material_params_prefetch, true, "ME2",
                     "me2_material_params: find the textures first and prefetch what their binds read")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(me2_material_params_cache, true, "ME2",
+                    "me2_material_params: keep evaluated values (per expression / per parameter list). false = "
+                    "PREFETCH ONLY: every call evaluates everything as the original does (nothing kept, nothing to "
+                    "differ), the textures first so the memory their binds read is prefetched and the misses overlap "
+                    "(2026-11-06: the texture bind native n_827DB288 is 6.6 % of the render thread, on its loads)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(me2_material_params_ab_s, 0, "ME2",
                      "A/B: me2_material_params on and off in turn every this many seconds; 0 = always on")
     .range(0, 3600)
@@ -232,6 +238,11 @@ bool XOn() {
   static const bool on = REXCVAR_GET(me2_material_params_expr);
   return on && !g_x_off;
 }
+// me2-nx-deko (2026-11-06): false = prefetch only (no value kept by either cache).
+bool CacheOn() {
+  static const bool on = REXCVAR_GET(me2_material_params_cache);
+  return on;
+}
 XEntry& XSlot(uint32_t expr, uint32_t proxy, uint32_t time, uint32_t view, uint32_t kind) {
   uint64_t h = uint64_t(expr) * 0x9E3779B97F4A7C15ull ^ uint64_t(proxy) * 0xC2B2AE3D27D4EB4Full ^
                uint64_t(view) * 0x165667B19E3779F9ull ^ (uint64_t(time) << 29) ^ kind;
@@ -329,7 +340,7 @@ void EvalVector(PPCContext& ctx, uint8_t* base, uint32_t frame, uint32_t entry, 
     const uint32_t expr = Ld32(base, Ld32(base, material + data_off) + (index << 2));
     XEntry* slot = nullptr;
     uint32_t kept[4];
-    const int found = XOn() ? XFind(expr, context, base, 1, kept, &slot) : 0;
+    const int found = XOn() && CacheOn() ? XFind(expr, context, base, 1, kept, &slot) : 0;
     if (found == 1) {
       std::memcpy(w, kept, 16);
       return;  // SetVector stores it into buf before the setter, as the evaluation would have left it
@@ -366,7 +377,7 @@ uint32_t EvalTexture(PPCContext& ctx, uint8_t* base, uint32_t frame, uint32_t en
   const uint32_t expr = Ld32(base, Ld32(base, material + data_off) + (index << 2));
   XEntry* slot = nullptr;
   uint32_t kept[4] = {};
-  const int found = XOn() ? XFind(expr, context, base, 2, kept, &slot) : 0;
+  const int found = XOn() && CacheOn() ? XFind(expr, context, base, 2, kept, &slot) : 0;
   uint32_t tex;
   if (found == 1) {
     tex = kept[0];
@@ -486,7 +497,8 @@ void Native(PPCContext& ctx, uint8_t* base) {
                uint64_t(view) * 0x165667B19E3779F9ull ^ uint64_t(material) ^ (uint64_t(time) << 32);
   h ^= h >> 31;
   Entry& e = g_cache[h & (kEntries - 1)];
-  const bool excluded = xmode || Excluded(material);  // the expression cache replaces the params-level one
+  const bool cache = CacheOn();
+  const bool excluded = xmode || !cache || Excluded(material);  // the expression cache replaces the params-level one
   const bool hit = !excluded && e.frame == now_frame && e.params == params && e.proxy == proxy && e.material == material &&
                    e.time == time && e.real_time == real_time && e.view == view && e.vectors == vec_count &&
                    e.textures == tex_count && e.first + vec_count + tex_count <= g_values.size();
@@ -519,7 +531,7 @@ void Native(PPCContext& ctx, uint8_t* base) {
   static const bool prefetch = REXCVAR_GET(me2_material_params_prefetch);
   constexpr uint32_t kMaxPre = 32;
   uint32_t pre_tex[kMaxPre];
-  const bool pre = prefetch && xmode && !hit && tex_count <= kMaxPre;
+  const bool pre = prefetch && (xmode || !cache) && !hit && tex_count <= kMaxPre;
   if (pre) {
     for (uint32_t j = 0; j < tex_count; ++j) {
       const uint32_t entry = tex_data + 16u * j;

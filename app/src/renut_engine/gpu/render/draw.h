@@ -216,6 +216,9 @@ extern bool (*g_defer_draws)();
 extern void (*g_defer_push)(std::function<void(bool draw, u32 retarget_depth_va)> replay, u32 depth_va);
 extern void (*g_before_depth_resolve)(u32 depth_va);
 extern void (*g_frame_end)();
+// me2-nx-deko (2026-11-06, me2_renut_color_handover): true while the A/B rotation has the colour hand-over off.
+extern bool (*g_color_handover_ab_off)();
+extern bool (*g_delta_raw_ab_off)();  // me2-nx-deko (2026-11-06): me2_ab_cycle "delta_raw" (backend/queued.cpp)
 
 // ME2 (2026-10-28, me2_occlusion_umbra_cpu: app/me2_src/me2_occlusion.cpp): the frame's scene depth reduced to a grid
 // for Umbra's occlusion tests on the CPU. g_occlusion_depth_on: set by the game's side before the first frame. Each

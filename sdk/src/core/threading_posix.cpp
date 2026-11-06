@@ -44,6 +44,12 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 // libnx would (memalign) and sizes them the way libnx carves them (struct _reent).
 #include <malloc.h>
 #include <sys/reent.h>
+#include <unistd.h>                // sbrk (the heap census)
+extern "C" {
+#include <switch/kernel/thread.h>  // threadGetSelf: a thread's stack mirror (the heap census)
+}
+#include <cstring>
+#include <string>
 #else
 #include <sys/syscall.h>
 #endif
@@ -80,6 +86,11 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #define REX_HAS_SIGEV_THREAD_ID 0
 #endif
 
+REXCVAR_DEFINE_INT32(switch_stack_census_s, 0, "Threading",
+                     "Switch diagnostics: every this many seconds, log where the heap goes ([heap census]: the guest "
+                     "threads' 16 MB stacks and how deep each one really went, the guest memory backing, the GPU block "
+                     "arena, the rest of malloc). Paints each new guest thread stack (16 MB memset per creation). 0 = off")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(thread_yield_backoff_us, 100, "Threading",
                      "Switch: a thread yielding more than 16 times in a row, each within 20 us of the last, sleeps "
                      "this many microseconds per yield instead (polling loops); 0 = plain yields")
@@ -235,6 +246,14 @@ uint32_t current_thread_system_id() {
 #endif
 }
 
+// me2-nx-deko (2026-11-06): while non-zero, MaybeYield yields without the backoff sleep below. The app raises it for the
+// length of a UE3 garbage collection (me2_gc_fast_waits): a purge waits on the render thread once per destroyed render
+// resource (FRenderCommandFence, sub_82335A58), both threads polling, and the 100 us steps made a big purge 0.4-0.8 s
+// (console 2026-11-06, MSV Strontium Mule load: 73 % of the game thread's waiting in those fence waits).
+extern "C" {
+std::atomic<int> g_rex_yield_no_backoff{0};
+}
+
 void MaybeYield() {
 #if defined(__SWITCH__)
   // ME2 (2026-10-27, from ds2-nx sdk-patches/0005): polling loops sleep instead of spinning. Horizon's yield
@@ -244,7 +263,7 @@ void MaybeYield() {
   // thread and Wwise share. A thread that yields again within 20 us, more than 16 times in a row, is polling: from then
   // on it sleeps thread_yield_backoff_us per call. A lone yield, or the first few of a short wait, is unchanged.
   static const int32_t backoff_us = REXCVAR_GET(thread_yield_backoff_us);
-  if (backoff_us > 0) {
+  if (backoff_us > 0 && g_rex_yield_no_backoff.load(std::memory_order_relaxed) == 0) {
     thread_local std::chrono::steady_clock::time_point previous{};
     thread_local uint32_t in_a_row = 0;
     const auto now = std::chrono::steady_clock::now();
@@ -930,9 +949,11 @@ bool g_joining = false;             // Loop has taken an item and not joined it 
  * comes back here instead of to the heap. At most kPoolMaxBlocks blocks and kPoolMaxBytes are kept; any other block
  * goes back to the heap.
  */
-// Only the guest threads' 16 MB stacks. The SDK's own threads (4 MB by default, long-lived) stay with libnx as
-// before, and their blocks never take the pool's places.
-constexpr size_t kPoolMinStack = size_t(8) << 20;
+// Only the guest threads' stacks: 16 MB, since 2026-11-06 switch_guest_thread_stack_mb (1-16 MB, default 2). The SDK's
+// own threads (4 MB by default, long-lived) stay with libnx as before, and their blocks never take the pool's places:
+// told apart by size, 4 MB exactly is left out.
+constexpr size_t kPoolMinStack = size_t(1) << 20;
+constexpr size_t kSdkDefaultStack = size_t(4) << 20;
 constexpr size_t kPoolMaxBlocks = 4;
 constexpr size_t kPoolMaxBytes = size_t(80) << 20;  // four guest stacks (16 MB each, with their TLS)
 struct Stack {
@@ -965,7 +986,7 @@ size_t LibnxStackOverhead() {
 // leaves it `stack_size` minus those 48 bytes). A TLS segment as big as a pooled stack is not expected: left to libnx.
 size_t PooledStackBytes(size_t stack_size) {
   static const size_t overhead = LibnxStackOverhead();
-  if (stack_size < kPoolMinStack || overhead > kPoolMinStack) {
+  if (stack_size < kPoolMinStack || stack_size == kSdkDefaultStack || overhead > kPoolMinStack) {
     return 0;
   }
   return (stack_size + overhead + 0xFFF) & ~size_t(0xFFF);
@@ -1113,6 +1134,201 @@ void Queue(pthread_t thread, void* stack, size_t stack_bytes) {
 }  // namespace switch_reaper
 #endif
 
+#if defined(__SWITCH__)
+/*
+ * me2-nx-deko (2026-11-06, switch_stack_census_s): where the heap goes.
+ *
+ * Console 2026-11-06: the process heap is ~3.1 GB and ran dry at a level load (guest commit AllocFixed 0x398000 failed)
+ * while the known owners (the guest memory's backing, the GPU block arena) explain only part of it. Every guest thread
+ * runs on a 16 MB stack block from that heap (switch_reaper's pool), ~40 of them: ~640 MB, of which a recompiled game
+ * thread probably touches a small part. This measures it.
+ *
+ * Each pooled stack block is painted (kPaint) before its thread is created. The thread registers its stack as libnx
+ * mapped it (the mirror: the block itself is not accessible while mapped) when it starts, and unregisters itself before
+ * it ends (so before any join unmaps the mirror; a scan holds g_mutex, which the unregistering thread waits for). A
+ * scan finds each stack's lowest overwritten word: its high-water mark. The census thread logs every
+ * switch_stack_census_s seconds; finished threads are scanned once as they end (the deepest of them is kept).
+ */
+}  // namespace rex::thread
+// The GPU side of the heap (app thirdparty/plume plume_deko3d.cpp stores them), and the guest memory's backing.
+extern "C" {
+std::atomic<uint64_t> g_rex_gpu_arena_bytes{0};       // the block arena (one heap block)
+std::atomic<uint64_t> g_rex_gpu_arena_used{0};
+std::atomic<uint64_t> g_rex_gpu_heap_block_bytes{0};  // GPU blocks outside it (heap storage owned by plume)
+extern char* fake_heap_start;  // libnx: the heap
+extern char* fake_heap_end;
+size_t RexGmCommittedBytes(void);  // core/guest_memory_switch.cpp
+}
+namespace rex::thread {
+namespace stack_census {
+constexpr uint8_t kPaintByte = 0xA5;
+constexpr uint64_t kPaint = 0xA5A5A5A5A5A5A5A5ull;
+struct Entry {
+  const void* key;  // the PosixCondition<Thread>
+  const uint64_t* lo;
+  size_t bytes;
+  size_t deepest;  // bytes used at the last scan
+  char name[32];
+};
+std::mutex g_mutex;
+std::vector<Entry> g_live;  // under g_mutex
+size_t g_finished_deepest = 0;
+char g_finished_name[32] = "";
+uint64_t g_finished = 0;
+std::atomic<bool> g_started{false};
+
+int32_t Seconds() {
+  static const int32_t s = REXCVAR_GET(switch_stack_census_s);
+  return s;
+}
+
+// Bytes of the stack in use at its deepest: from its lowest overwritten word to its top.
+size_t Used(const uint64_t* lo, size_t bytes) {
+  const volatile uint64_t* p = lo;
+  const size_t words = bytes / 8;
+  size_t i = 0;
+  while (i + 4 <= words && p[i] == kPaint && p[i + 1] == kPaint && p[i + 2] == kPaint && p[i + 3] == kPaint) {
+    i += 4;
+  }
+  while (i < words && p[i] == kPaint) ++i;
+  return bytes - i * 8;
+}
+
+void Paint(void* block, size_t bytes) {
+  if (Seconds() > 0) std::memset(block, kPaintByte, bytes);
+}
+
+void* Loop(void*);
+
+void Register(const void* key) {
+  if (Seconds() <= 0) return;
+  ::Thread* const self = threadGetSelf();
+  if (!self || !self->stack_mirror) return;
+  const uintptr_t lo = reinterpret_cast<uintptr_t>(self->stack_mirror);
+  const uintptr_t sp = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
+  if (sp < lo || sp >= lo + self->stack_sz) return;  // not the stack it runs on
+  Entry e{key, reinterpret_cast<const uint64_t*>(lo), self->stack_sz, 0, "?"};
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_live.push_back(e);
+  }
+  if (!g_started.exchange(true)) {
+    pthread_attr_t attr;
+    pthread_t census;
+    if (pthread_attr_init(&attr) == 0) {
+      pthread_attr_setstacksize(&attr, 64 * 1024);
+      pthread_create(&census, &attr, Loop, nullptr);
+      pthread_attr_destroy(&attr);
+    }
+  }
+}
+
+void Rename(const void* key, const std::string& name) {
+  if (Seconds() <= 0) return;
+  std::lock_guard<std::mutex> lock(g_mutex);
+  for (Entry& e : g_live) {
+    if (e.key == key) {
+      std::snprintf(e.name, sizeof(e.name), "%s", name.c_str());
+    }
+  }
+}
+
+// On the thread itself, before it ends: its last scan.
+void Unregister(const void* key) {
+  if (Seconds() <= 0) return;
+  std::lock_guard<std::mutex> lock(g_mutex);
+  for (size_t i = 0; i < g_live.size(); ++i) {
+    if (g_live[i].key != key) continue;
+    const size_t used = Used(g_live[i].lo, g_live[i].bytes);
+    ++g_finished;
+    if (used > g_finished_deepest) {
+      g_finished_deepest = used;
+      std::memcpy(g_finished_name, g_live[i].name, sizeof(g_finished_name));
+    }
+    g_live[i] = g_live.back();
+    g_live.pop_back();
+    return;
+  }
+}
+
+void Report() {
+  const auto t0 = std::chrono::steady_clock::now();
+  struct Row {
+    size_t used, bytes;
+    char name[32];
+  };
+  std::vector<Row> rows;
+  size_t finished_deepest = 0;
+  uint64_t finished = 0;
+  char finished_name[32];
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    rows.reserve(g_live.size());
+    for (Entry& e : g_live) {
+      e.deepest = Used(e.lo, e.bytes);
+      Row r{e.deepest, e.bytes, {}};
+      std::memcpy(r.name, e.name, sizeof(r.name));
+      rows.push_back(r);
+    }
+    finished_deepest = g_finished_deepest;
+    finished = g_finished;
+    std::memcpy(finished_name, g_finished_name, sizeof(finished_name));
+  }
+  const double scan_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.used > b.used; });
+  size_t stack_bytes = 0, used_bytes = 0;
+  for (const Row& r : rows) {
+    stack_bytes += r.bytes;
+    used_bytes += r.used;
+  }
+  size_t kept = 0, kept_bytes = 0;
+  {
+    std::lock_guard<std::mutex> lock(switch_reaper::g_mutex);
+    kept = switch_reaper::g_pool_count;
+    kept_bytes = switch_reaper::g_pool_bytes;
+  }
+  const size_t awaiting = switch_reaper::Pending();
+
+  // The heap: what newlib's malloc took from it (arena), in use / free inside that, and what sbrk can still give.
+  const struct mallinfo mi = mallinfo();
+  char* const brk = static_cast<char*>(sbrk(0));
+  const size_t heap_total = size_t(fake_heap_end - fake_heap_start);
+  const size_t untaken = fake_heap_end > brk ? size_t(fake_heap_end - brk) : 0;
+  const size_t in_use = size_t(mi.uordblks);
+  const size_t guest = RexGmCommittedBytes();
+  const size_t gpu_arena = g_rex_gpu_arena_bytes.load(std::memory_order_relaxed);
+  const size_t gpu_arena_used = g_rex_gpu_arena_used.load(std::memory_order_relaxed);
+  const size_t gpu_heap_blocks = g_rex_gpu_heap_block_bytes.load(std::memory_order_relaxed);
+  const size_t known = guest + gpu_arena + gpu_heap_blocks + stack_bytes + kept_bytes;
+  const size_t rest = in_use > known ? in_use - known : 0;
+  REXSYS_INFO("[heap census] heap {} MB: {} MB in use, {} MB free inside, {} MB never taken | guest memory backing {} MB "
+              "| GPU arena {} MB ({} MB used) + GPU blocks outside it {} MB | guest thread stacks {} x {} MB = {} MB "
+              "live + {} MB kept in the pool ({} blocks; {} finished threads awaiting their join) | rest {} MB",
+              heap_total >> 20, in_use >> 20, size_t(mi.fordblks) >> 20, untaken >> 20, guest >> 20, gpu_arena >> 20,
+              gpu_arena_used >> 20, gpu_heap_blocks >> 20, rows.size(), rows.empty() ? 0 : (rows[0].bytes >> 20),
+              stack_bytes >> 20, kept_bytes >> 20, kept, awaiting, rest >> 20);
+  std::string top;
+  for (size_t i = 0; i < rows.size() && i < 12; ++i) {
+    char item[80];
+    std::snprintf(item, sizeof(item), "%s%s %zu KB", i ? ", " : "", rows[i].name, rows[i].used >> 10);
+    top += item;
+  }
+  REXSYS_INFO("[heap census]   stacks really used: {} MB of {} MB in all (deepest first: {}); finished threads: {}, "
+              "deepest {} KB ({}); scan {:.1f} ms",
+              used_bytes >> 20, stack_bytes >> 20, top, finished, finished_deepest >> 10, finished_name, scan_ms);
+}
+
+void* Loop(void*) {
+  pthread_setname_np(pthread_self(), "stack census");
+  for (;;) {
+    std::this_thread::sleep_for(std::chrono::seconds(Seconds()));
+    Report();
+  }
+  return nullptr;
+}
+}  // namespace stack_census
+#endif
+
 template <>
 class PosixCondition<Thread> : public PosixConditionBase {
   enum class State {
@@ -1180,6 +1396,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
       // happen before pthread_create returns here.
       stack_ = stack;
       stack_bytes_ = pooled_bytes;
+      stack_census::Paint(stack, pooled_bytes);  // switch_stack_census_s only
       int result = pthread_attr_setstack(&attr, stack, pooled_bytes);
       if (result == 0) {
         result = pthread_create(&thread_, &attr, ThreadStartRoutine, start_data);
@@ -1304,6 +1521,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
 
   void set_name(const std::string& name) {
     WaitStarted();
+#if defined(__SWITCH__)
+    stack_census::Rename(this, name);
+#endif
     std::unique_lock<std::mutex> lock(state_mutex_);
     if (state_ != State::kUninitialized && state_ != State::kFinished) {
 #if defined(__APPLE__)
@@ -1625,7 +1845,10 @@ class PosixCondition<Thread> : public PosixConditionBase {
       state_ = State::kFinished;
     }
 #if defined(__SWITCH__)
-    if (is_current_thread) ClaimJoin();  // ExitThread: this thread will not return to ThreadStartRoutine
+    if (is_current_thread) {
+      stack_census::Unregister(this);  // before the join can unmap its stack
+      ClaimJoin();                     // ExitThread: this thread will not return to ThreadStartRoutine
+    }
 #endif
 
     {
@@ -2186,6 +2409,9 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
 
   current_thread_ = thread;
   current_thread_condition_ = &thread->handle_;
+#if defined(__SWITCH__)
+  if (thread->handle_.stack_) stack_census::Register(&thread->handle_);  // before set_name can come (WaitStarted)
+#endif
   {
     std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
     thread->handle_.state_ = create_suspended ? State::kSuspended : State::kRunning;
@@ -2213,6 +2439,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
     thread->handle_.state_ = State::kFinished;
   }
 #if defined(__SWITCH__)
+  stack_census::Unregister(&thread->handle_);  // before the join can unmap its stack
   thread->handle_.ClaimJoin();  // before signaling: a waiter woken below must not join it too
 #endif
 

@@ -52,6 +52,9 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 #include <mutex>
 #include <thread>
 #include <cmath>
@@ -100,6 +103,18 @@ REXCVAR_DEFINE_INT32(me2_occlusion_raster_mem_mb, 96, "ME2",
                      "me2_occlusion_cpu_source 1: memory for the cached occluder geometry (MB); new meshes beyond it "
                      "are not used")
     .range(4, 1024)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// me2-nx-deko (2026-11-06): stricter occluder size limits, tried as the rotation kind "raster_lean" (or always, with
+// me2_occlusion_raster_lean). Console 11-06 (Kasumi's party): 212 occluders, 31,400 triangles, 13 ms a frame on the
+// worker; dense props and small objects hide little for their triangles.
+REXCVAR_DEFINE_BOOL(me2_occlusion_raster_lean, false, "ME2",
+                    "me2_occlusion_cpu_source 1: the lean limits below instead of min_px / min_px_per_tri")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_DOUBLE(me2_occlusion_raster_lean_px, 48.0, "ME2",
+                      "me2_occlusion_raster_lean: occluders covering fewer buffer pixels are not drawn")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_DOUBLE(me2_occlusion_raster_lean_px_per_tri, 3.0, "ME2",
+                      "me2_occlusion_raster_lean: occluders with fewer buffer pixels per triangle are not drawn")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_DOUBLE(me2_occlusion_raster_min_px, 24.0, "ME2",
                       "me2_occlusion_cpu_source 1: occluders whose screen rectangle covers fewer pixels (of the "
@@ -181,6 +196,23 @@ REXCVAR_DEFINE_INT32(me2_occlusion_raster_walk_full, 30, "ME2",
                      "me2_occlusion_cpu_source 1: while the depth draw lists read the same as at the last full walk, "
                      "the per-mesh checks run only every this many frames (0 = every frame)")
     .range(0, 100000)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// me2-nx-deko (2026-11-06): the worker's cores, not only its preferred one. Console 11-06 (combat, 23 fps): the worker
+// (28 % of a core) on all four cores at UE3's priority took turns on core 0 with UE3's render thread and on core 2 with
+// the game thread, which was ready but not running ~17 % of the time.
+REXCVAR_DEFINE_INT32(me2_occlusion_raster_mask, 0, "ME2",
+                     "me2_occlusion_raster_async on the Switch: the worker's core mask (e.g. 0xA = cores 1 and 3; its "
+                     "preferred core me2_occlusion_raster_core when inside it). 0 = every core, as before")
+    .range(0, 15)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// me2-nx-deko (2026-11-06, second core-plan run): the worker below UE3's game and render threads (0x3B) on every core.
+// With it on cores 1 and 3 (me2_occlusion_raster_mask 0xA) behind Wwise (0x3A), Renut (0x2C) and XMA (0x2B) the render
+// thread waited 6-16 ms a frame for its jobs in combat (0.25 ms before) and the game fell to 16-18 fps. Below them, it
+// runs whenever either of them waits (each ~50 % of the time) and never holds their core when they wake.
+REXCVAR_DEFINE_INT32(me2_occlusion_raster_prio, -1, "ME2",
+                     "me2_occlusion_raster_async on the Switch: the worker's thread priority (0x3C = just below UE3's "
+                     "threads at 0x3B; -1 = unchanged)")
+    .range(-1, 0x3F)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(me2_occlusion_raster_core, -1, "ME2",
                      "me2_occlusion_raster_async on the Switch: the worker's preferred core (-1 = the default)")
@@ -274,6 +306,7 @@ struct Stats {
   uint64_t take_ns = 0, inline_ns = 0, inline_frames = 0;  // async: render thread's wait / its own drawing
   uint64_t walk_skips = 0;  // walks whose lists read as at the last full walk (no per-mesh checks)
   uint64_t not_recent = 0;  // candidates the game did not render recently (me2_occlusion_raster_recent_s)
+  uint64_t off_fast = 0, lean_frames = 0;  // me2-nx-deko (2026-11-06): the centre / half-size rejections; lean frames
   uint64_t tile_accepts = 0, front_only = 0;                // fast tests: tile-level 'visible', boxes without back faces
   uint64_t verify = 0, verify_unsafe = 0, verify_more = 0;  // me2_occlusion_raster_test_verify
 } g_st;
@@ -633,26 +666,50 @@ void DrawTri(Buffer& b, const float* p0, const float* p1, const float* p2, int c
   // 1/w as a plane over the screen: zA x + zB y + zC.
   const float zA = A0 * z0 + A1 * z1 + A2 * z2, zB = B0 * z0 + B1 * z1 + B2 * z2, zC = C0 * z0 + C1 * z1 + C2 * z2;
   const float A[3] = {A0, A1, A2}, B[3] = {B0, B1, B2}, C[3] = {C0, C1, C2};
-  float invA[3];
-  for (int k = 0; k < 3; ++k) invA[k] = A[k] != 0.0f ? 1.0f / A[k] : 0.0f;
   const int stride = b.w + 1;
+  // me2-nx-deko (2026-11-06): the per-row span from per-edge lines x = slope * y + icpt, classified once per triangle
+  // (console 11-06: the per-row setup with its three sign branches cost twice the fill). An edge with A > 0 bounds the
+  // span from the left (A x + r >= 0 is x >= -r / A), A < 0 from the right; A == 0 bounds the rows instead (B y + C >= 0).
+  // Unused bound slots hold the bounding box's side, so the row loop has no branches. The bounds are the same lines as
+  // before (-(B y + C) / A, now as y * (-B / A) - C / A: ulp-level differences on a sample lying exactly on an edge).
+  float ls[2] = {0.0f, 0.0f}, li[2] = {float(x0), float(x0)};  // left bounds
+  float rs[2] = {0.0f, 0.0f}, ri[2] = {float(x1), float(x1)};  // right bounds
+  int nl = 0, nr = 0;
+  int ry0 = y0, ry1 = y1;
+  for (int k = 0; k < 3; ++k) {
+    if (A[k] > 0.0f || A[k] < 0.0f) {
+      const float inv = 1.0f / A[k];
+      const float slope = -B[k] * inv, icpt = -C[k] * inv;
+      if (A[k] > 0.0f) {
+        if (nl < 2) ls[nl] = slope, li[nl] = icpt, ++nl;
+      } else {
+        if (nr < 2) rs[nr] = slope, ri[nr] = icpt, ++nr;
+      }
+    } else {
+      // B y + C >= 0 over the rows (B == 0: C decides all of them)
+      // (clamped as floats first: -C / B can be far outside the int range)
+      if (B[k] > 0.0f) {
+        const float t = std::ceil(-C[k] / B[k]);
+        if (!(t <= float(y1))) return;
+        if (t > float(ry0)) ry0 = int(t);
+      } else if (B[k] < 0.0f) {
+        const float t = std::floor(-C[k] / B[k]);
+        if (!(t >= float(y0))) return;
+        if (t < float(ry1)) ry1 = int(t);
+      } else if (C[k] < 0.0f) {
+        return;
+      }
+    }
+  }
+  const float bx0 = float(x0), bx1 = float(x1);
   // 2026-11-05 (step 2): per row the span where all three edge functions are >= 0, computed from the edges (A x + r >= 0
   // is x >= -r / A for A > 0, x <= -r / A for A < 0), then a branch-free max over the span (vectorized by the compiler)
   // instead of three edge tests per pixel of the bounding box.
-  for (int y = y0; y <= y1; ++y) {
+  for (int y = ry0; y <= ry1; ++y) {
     const float fy = float(y);
-    float lo = float(x0), hi = float(x1);
-    bool empty = false;
-    for (int k = 0; k < 3; ++k) {
-      const float r = B[k] * fy + C[k];
-      if (A[k] > 0.0f)
-        lo = std::max(lo, -r * invA[k]);
-      else if (A[k] < 0.0f)
-        hi = std::min(hi, -r * invA[k]);
-      else if (r < 0.0f)
-        empty = true;
-    }
-    if (empty || !(lo <= hi)) continue;
+    const float lo = std::max(std::max(bx0, ls[0] * fy + li[0]), ls[1] * fy + li[1]);
+    const float hi = std::min(std::min(bx1, rs[0] * fy + ri[0]), rs[1] * fy + ri[1]);
+    if (!(lo <= hi)) continue;
     const int xs = int(std::ceil(lo)), xe = int(std::floor(hi));
     if (xs > xe) continue;
     const float zr = zB * fy + zC;
@@ -760,6 +817,7 @@ struct ScreenVert {
   float x, y, iz;  // contiguous: DrawTri takes &x as float[3]
   uint32_t out;
 };
+static_assert(sizeof(ScreenVert) == 16 && sizeof(V4) == 16, "the 4-wide vertex transform stores them as float4s");
 
 // 2026-11-05 (step 2): whether everything already drawn covers the box's whole screen rectangle nearer than the box's
 // nearest point (then none of its triangles can change the buffer). Corner samples, early exit at the first one that
@@ -783,8 +841,15 @@ bool HiddenAlready(const Buffer& b, const Candidate& c) {
 // Reads g_occ: the caller holds g_cache_mutex. Statistics go to *t_st.
 void Rasterize(const float* vp, const float cam[3], float lod_factor, Buffer* bufs, int nb) {
   static const uint64_t budget = uint64_t(REXCVAR_GET(me2_occlusion_raster_tris));
-  static const float min_px = float(REXCVAR_GET(me2_occlusion_raster_min_px));
-  static const float min_ppt = float(REXCVAR_GET(me2_occlusion_raster_min_px_per_tri));
+  static const float min_px_std = float(REXCVAR_GET(me2_occlusion_raster_min_px));
+  static const float min_ppt_std = float(REXCVAR_GET(me2_occlusion_raster_min_px_per_tri));
+  static const float min_px_lean = float(REXCVAR_GET(me2_occlusion_raster_lean_px));
+  static const float min_ppt_lean = float(REXCVAR_GET(me2_occlusion_raster_lean_px_per_tri));
+  static const bool lean_on = REXCVAR_GET(me2_occlusion_raster_lean);
+  // me2-nx-deko (2026-11-06): the lean limits always (me2_occlusion_raster_lean) or in the rotation's "on" slots.
+  const bool lean = (lean_on || Me2AbInRotation(Me2Ab::kRasterLean)) && !Me2AbOff(Me2Ab::kRasterLean);
+  const float min_px = lean ? min_px_lean : min_px_std, min_ppt = lean ? min_ppt_lean : min_ppt_std;
+  if (lean) ++t_st->lean_frames;
   static const int winding = REXCVAR_GET(me2_occlusion_raster_winding);
   static const bool lod = REXCVAR_GET(me2_occlusion_raster_lod);
   Stats& st = *t_st;
@@ -809,6 +874,31 @@ void Rasterize(const float* vp, const float cam[3], float lod_factor, Buffer* bu
       if (trace) o.d2 = d2;
       if (d2 < o.min_d2 || !(d2 < o.max_d2)) {
         ++st.lod_out;
+        continue;
+      }
+    }
+    // me2-nx-deko (2026-11-06): off-screen rejection from the box's centre and half-size first (console 11-06: 4,187 of
+    // 5,292 occluders off screen, each costing 8 corner transforms and divisions). For a linear function of the
+    // position, the largest value over the box is f(centre) + sum |coefficient| * half-size, reached at a corner: "all
+    // 8 corners outside one plane" is exactly "that maximum below 0". A small margin leaves close calls to the corners.
+    {
+      const float cx = 0.5f * (o.lo[0] + o.hi[0]), cy = 0.5f * (o.lo[1] + o.hi[1]), cz = 0.5f * (o.lo[2] + o.hi[2]);
+      const float ex = 0.5f * (o.hi[0] - o.lo[0]), ey = 0.5f * (o.hi[1] - o.lo[1]), ez = 0.5f * (o.hi[2] - o.lo[2]);
+      // the max over the box of a x + b y + c z + d, minus a margin of its spread
+      const auto top = [&](float a, float b, float c, float d) {
+        const float mid = a * cx + b * cy + c * cz + d;
+        const float spread = std::fabs(a) * ex + std::fabs(b) * ey + std::fabs(c) * ez;
+        return mid + spread + 1e-4f * (std::fabs(mid) + spread + 1.0f);
+      };
+      const float* m = vp;
+      // x + w < 0 (left), w - x < 0 (right), y + w < 0 (below), w - y < 0 (above), w - kNear <= 0 (near)
+      if (top(m[0] + m[3], m[4] + m[7], m[8] + m[11], m[12] + m[15]) < 0.0f ||
+          top(m[3] - m[0], m[7] - m[4], m[11] - m[8], m[15] - m[12]) < 0.0f ||
+          top(m[1] + m[3], m[5] + m[7], m[9] + m[11], m[13] + m[15]) < 0.0f ||
+          top(m[3] - m[1], m[7] - m[5], m[11] - m[9], m[15] - m[13]) < 0.0f ||
+          top(m[3], m[7], m[11], m[15] - kNear) < 0.0f) {
+        ++st.off;
+        ++st.off_fast;
         continue;
       }
     }
@@ -912,7 +1002,42 @@ void Rasterize(const float* vp, const float cam[3], float lod_factor, Buffer* bu
     const size_t nv = o.v.size() / 3;
     clip.resize(nv);
     sv.resize(nv);
-    for (size_t i = 0; i < nv; ++i) {
+    size_t i0 = 0;
+#if defined(__aarch64__)
+    // me2-nx-deko (2026-11-06): four vertices at a time, the same operations in the same order as the scalar loop below
+    // (separate multiplies and adds, -ffp-contract=off; IEEE division): bit-identical results. Vertices behind the near
+    // plane get screen values too, which nothing reads (as their unset fields before).
+    {
+      const float32x4_t m0 = vdupq_n_f32(vp[0]), m1 = vdupq_n_f32(vp[1]), m2 = vdupq_n_f32(vp[2]), m3 = vdupq_n_f32(vp[3]);
+      const float32x4_t m4 = vdupq_n_f32(vp[4]), m5 = vdupq_n_f32(vp[5]), m6 = vdupq_n_f32(vp[6]), m7 = vdupq_n_f32(vp[7]);
+      const float32x4_t m8 = vdupq_n_f32(vp[8]), m9 = vdupq_n_f32(vp[9]), m10 = vdupq_n_f32(vp[10]), m11 = vdupq_n_f32(vp[11]);
+      const float32x4_t m12 = vdupq_n_f32(vp[12]), m13 = vdupq_n_f32(vp[13]), m14 = vdupq_n_f32(vp[14]), m15 = vdupq_n_f32(vp[15]);
+      const float32x4_t half = vdupq_n_f32(0.5f), one = vdupq_n_f32(1.0f), vw = vdupq_n_f32(W), vh = vdupq_n_f32(H);
+      const float32x4_t nearv = vdupq_n_f32(kNear);
+      const float* src = o.v.data();
+      for (; i0 + 4 <= nv; i0 += 4) {
+        const float32x4x3_t p = vld3q_f32(src + 3 * i0);
+        const auto row = [&](float32x4_t a, float32x4_t b, float32x4_t c, float32x4_t d) {
+          return vaddq_f32(vaddq_f32(vaddq_f32(vmulq_f32(p.val[0], a), vmulq_f32(p.val[1], b)), vmulq_f32(p.val[2], c)), d);
+        };
+        const float32x4_t cx = row(m0, m4, m8, m12), cy = row(m1, m5, m9, m13);
+        const float32x4_t cz = row(m2, m6, m10, m14), cw = row(m3, m7, m11, m15);
+        const float32x4x4_t cl = {{cx, cy, cz, cw}};
+        vst4q_f32(reinterpret_cast<float*>(&clip[i0]), cl);
+        const float32x4_t negw = vnegq_f32(cw);
+        const uint32x4_t out = vorrq_u32(
+            vorrq_u32(vandq_u32(vcltq_f32(cx, negw), vdupq_n_u32(1)), vandq_u32(vcgtq_f32(cx, cw), vdupq_n_u32(2))),
+            vorrq_u32(vorrq_u32(vandq_u32(vcltq_f32(cy, negw), vdupq_n_u32(4)), vandq_u32(vcgtq_f32(cy, cw), vdupq_n_u32(8))),
+                      vandq_u32(vcleq_f32(cw, nearv), vdupq_n_u32(16))));
+        const float32x4_t iw = vdivq_f32(one, cw);
+        const float32x4_t sx = vmulq_f32(vaddq_f32(vmulq_f32(vmulq_f32(cx, iw), half), half), vw);
+        const float32x4_t sy = vmulq_f32(vsubq_f32(half, vmulq_f32(vmulq_f32(cy, iw), half)), vh);
+        const float32x4x4_t s4 = {{sx, sy, iw, vreinterpretq_f32_u32(out)}};
+        vst4q_f32(reinterpret_cast<float*>(&sv[i0]), s4);
+      }
+    }
+#endif
+    for (size_t i = i0; i < nv; ++i) {
       const V4 p = Xform(vp, o.v[3 * i], o.v[3 * i + 1], o.v[3 * i + 2]);
       clip[i] = p;
       ScreenVert& q = sv[i];
@@ -1161,9 +1286,24 @@ void WorkerBoxPass(int buf) {
   bp.ready.store(true, std::memory_order_release);
 }
 
+#if REX_PLATFORM_SWITCH
+extern "C" bool RexSwitchSetCurrentThreadMask(int preferred, unsigned long long mask);  // sdk core/threading_switch.cpp
+extern "C" bool RexSwitchSetCurrentThreadPriorityOk(int priority);                       // sdk core/threading_switch.cpp
+#endif
 void Worker() {
 #if REX_PLATFORM_SWITCH
-  if (const int core = REXCVAR_GET(me2_occlusion_raster_core); core >= 0) RexSwitchSetCurrentThreadCore(core);
+  if (const int mask = REXCVAR_GET(me2_occlusion_raster_mask); mask > 0) {
+    int core = REXCVAR_GET(me2_occlusion_raster_core);
+    if (core < 0 || !(mask & (1 << core))) core = __builtin_ctz(unsigned(mask));
+    const bool ok = RexSwitchSetCurrentThreadMask(core, unsigned(mask));
+    REXLOG_INFO("[occlusion-raster] worker on cores {:#x}, preferred {} ({})", mask, core, ok ? "set" : "FAILED");
+  } else if (const int core = REXCVAR_GET(me2_occlusion_raster_core); core >= 0) {
+    RexSwitchSetCurrentThreadCore(core);
+  }
+  if (const int prio = REXCVAR_GET(me2_occlusion_raster_prio); prio >= 0) {
+    const bool ok = RexSwitchSetCurrentThreadPriorityOk(prio);
+    REXLOG_INFO("[occlusion-raster] worker at priority {:#x} ({})", prio, ok ? "set" : "FAILED");
+  }
 #endif
   for (;;) {
     int j = -1;
@@ -1341,6 +1481,7 @@ Buffer* TakeJob(uint32_t renderer, const float* vp, Stats& merged) {
   merged.dense += s.dense, merged.covered_px += s.covered_px, merged.near_clipped += s.near_clipped;
   merged.hidden_occ += s.hidden_occ;
   merged.not_recent += s.not_recent;
+  merged.off_fast += s.off_fast, merged.lean_frames += s.lean_frames;
   merged.raster_ns += job.raster_ns;
   return &g_abuf[g_cur_abuf];
 }
@@ -2049,7 +2190,7 @@ extern "C" void Me2RasterReport() {
               "{:.0f} list elements a frame, {} occluders cached ({} usable, {} triangles, {:.1f} MB), {} new, {} "
               "changed, {} dropped; new meshes not usable:{}; a frame: {:.0f} occluders drawn, {:.0f} triangles "
               "({:.0f} back faces culled, {:.0f} near-clipped), left out: {:.0f} LOD, {:.0f} off screen, {:.0f} small, "
-              "{:.0f} dense, {:.0f} over budget, {:.0f} not rendered recently by the game; {:.1f} % of the pixels covered; per-pixel box tests {} ({} occluded, {} of them at "
+              "{:.0f} dense, {:.0f} over budget, {:.0f} not rendered recently by the game ({:.0f} off screen by the centre test; lean limits in {} frames); {:.1f} % of the pixels covered; per-pixel box tests {} ({} occluded, {} of them at "
               "the near plane; {} without usable triangles); fast tests: {} decided 'visible' by a tile, {} boxes by their "
               "front faces; verify {} (fast occluded / slow visible {}, fast visible / slow occluded {}); unreadable "
               "lists {}",
@@ -2058,8 +2199,8 @@ extern "C" void Me2RasterReport() {
               double(g_bytes) / 1048576.0, s.new_meshes, s.changed, s.dropped, bad.empty() ? " none" : bad.c_str(),
               double(s.drawn_occ) / f, double(s.drawn_tris) / f, double(s.culled_tris) / f,
               double(s.near_clipped) / f, double(s.lod_out) / f, double(s.off) / f, double(s.small) / f,
-              double(s.dense) / f, double(s.budget_cut) / f, double(s.not_recent) / f,
-              g_buf[0].w ? 100.0 * double(s.covered_px) / f / double(g_buf[0].w * g_buf[0].h) : 0.0, s.precise,
+              double(s.dense) / f, double(s.budget_cut) / f, double(s.not_recent) / f, double(s.off_fast) / f,
+              s.lean_frames, g_buf[0].w ? 100.0 * double(s.covered_px) / f / double(g_buf[0].w * g_buf[0].h) : 0.0, s.precise,
               s.precise_occ, s.precise_near, s.precise_none, s.tile_accepts, s.front_only, s.verify, s.verify_unsafe,
               s.verify_more, s.lists_bad);
   if (g_async_on) {

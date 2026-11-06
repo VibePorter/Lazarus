@@ -115,6 +115,24 @@ REXCVAR_DEFINE_BOOL(me2_occlusion_previous, false, "ME2",
                     "query when that one has its GPU result (one frame late) instead of 'visible'. OFF: on the PC "
                     "(2026-10-27) objects / textures disappeared at random with it")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// me2-nx-deko (2026-11-06): console 18:43 (moving through BioD_N7Spdr2): UE3's render thread waited 100-1,100 ms every
+// 10 s (8.9 s in a 9-minute session; up to ~4 ms a frame) in Answer for GPU results of last frame's queries that were
+// not done yet, spinning (sched_yield, occlusionResults: ~2 % of all its samples). With this, such a read is answered
+// 'visible' at once when the previous issue of the same query has its result and found the object visible: the
+// answer the GPU will most likely give, and 'visible' can only cost a draw, never hide anything (unlike
+// me2_occlusion_previous, which also reused hidden answers). A query whose previous answer was 'hidden' still waits.
+REXCVAR_DEFINE_BOOL(me2_occlusion_nowait_visible, false, "ME2",
+                    "A query read that would wait for its GPU result answers 'visible' at once when the previous issue "
+                    "of the same query found the object visible (no stall; at most a draw more). Off: waits as before")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// me2-nx-deko (2026-11-06): the same for the shadow readers' hidden answers. sub_82696780 / sub_826A7690 read the per-object
+// shadow occlusion queries (FSceneViewState's shadow query map, keyed by caster and light): a late result there whose
+// previous issue found the shadow volume hidden answers hidden at once. Worst case a shadow that just came into view
+// appears a frame later; objects are never affected (their readers are not these).
+REXCVAR_DEFINE_BOOL(me2_occlusion_nowait_shadows, false, "ME2",
+                    "A late shadow occlusion read (sub_82696780 / sub_826A7690) answers 'hidden' at once when the "
+                    "previous issue found the shadow hidden (a shadow coming into view can show a frame late). Off: waits")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(me2_occlusion_umbra_async, true, "ME2",
                     "deko3d only: Umbra's non-blocking result reads (sub_827486B8 opcode 130) of a query not on the GPU "
                     "yet force the render thread's open command list to the GPU (Video::KickLocked(true)) and answer "
@@ -451,12 +469,15 @@ thread_local bool t_reader_box = false;
 thread_local float t_reader_mn[3], t_reader_mx[3];
 std::atomic<uint64_t> st_reader_raster_occ{0}, st_reader_raster_vis{0}, st_reader_ready_first{0};
 std::atomic<uint64_t> st_tag[kTags][5];  // outcomes: unanswerable, not ready age 0, not ready age 1+, visible, occluded
+// me2-nx-deko (2026-11-06): the waits for a late GPU result by reader (count, us), and the shadow readers' late reads
+// answered from their previous hidden result (me2_occlusion_nowait_shadows).
+std::atomic<uint64_t> st_tag_waits[kTags], st_tag_wait_us[kTags], st_nowait_shadow{0};
 std::atomic<uint64_t> st_init_views{0}, st_frames_seen{0};
 
 // Stats (10 s report).
 std::atomic<uint64_t> st_begun{0}, st_draws{0}, st_real_visible{0}, st_real_hidden{0}, st_not_ready{0},
     st_no_draws{0}, st_unknown{0}, st_waited{0}, st_wait_us{0}, st_broken{0}, st_same_frame{0},
-    st_prev_visible{0}, st_prev_hidden{0};
+    st_prev_visible{0}, st_prev_hidden{0}, st_nowait_visible{0};
 // Answers from the GPU / not ready, by the query's age in guest frames (0, 1, 2, 3+).
 std::atomic<uint64_t> st_age_ready[4], st_age_late[4];
 
@@ -565,6 +586,10 @@ int32_t CurrentWaitUs() {
 }
 
 void NoteWait(uint64_t us) {
+  if (t_tag >= 0 && t_tag < kTags) {
+    st_tag_waits[t_tag].fetch_add(1, std::memory_order_relaxed);
+    st_tag_wait_us[t_tag].fetch_add(us, std::memory_order_relaxed);
+  }
   st_waited.fetch_add(1, std::memory_order_relaxed);
   st_wait_us.fetch_add(us, std::memory_order_relaxed);
   g_me2_occlusion_wait_total_us.fetch_add(us, std::memory_order_relaxed);
@@ -599,6 +624,9 @@ void Report() {
               ready[3], late[0], late[1], late[2], late[3]);
   REXLOG_INFO("[occlusion] {} s: {} draws made as repeats of the previous draw (me2_renut_repeat_draws)", now - prev,
               renut::gpu::g_repeat_draws.exchange(0));
+  REXLOG_INFO("[occlusion] {} s: {} late reads answered visible at once from the previous visible result "
+              "(me2_occlusion_nowait_visible); {} late shadow reads answered hidden from the previous hidden result "
+              "(me2_occlusion_nowait_shadows)", now - prev, st_nowait_visible.exchange(0), st_nowait_shadow.exchange(0));
   {
     const uint32_t steps = g_wait_steps.exchange(0, std::memory_order_relaxed);
     REXLOG_INFO("[occlusion] wait setting {} us at the end of this window{}", g_me2_occlusion_wait_setting_us.load(std::memory_order_relaxed),
@@ -610,9 +638,11 @@ void Report() {
     uint64_t any = 0;
     for (int k = 0; k < 5; ++k)
       any += (o[k] = st_tag[t][k].exchange(0));
+    const uint64_t tw = st_tag_waits[t].exchange(0), twus = st_tag_wait_us[t].exchange(0);
     if (any)
       tags += fmt::format(" {}: {} unanswerable / {} not ready (age 0) / {} not ready (age 1+) / {} visible / {} "
-                          "occluded;", kTagNames[t], o[0], o[1], o[2], o[3], o[4]);
+                          "occluded / waited {} times {:.1f} ms;", kTagNames[t], o[0], o[1], o[2], o[3], o[4], tw,
+                          double(twus) / 1000.0);
   }
   const uint64_t frames = g_sa2_game_frames.load(std::memory_order_relaxed);
   const uint64_t prev_frames = st_frames_seen.exchange(frames);
@@ -805,6 +835,25 @@ uint32_t Answer(uint32_t query, bool can_wait_later = false) {
           t_outcome = 3;
           return kVisible;
         }
+      }
+    }
+    // me2-nx-deko (2026-11-06, me2_occlusion_nowait_visible): before the first wait, the previous issue's visible result.
+    if (age >= 1 && !waiting && wait_us > 0) {
+      static const bool nowait = REXCVAR_GET(me2_occlusion_nowait_visible);
+      uint32_t prev_count = 0;
+      if ((nowait || Me2AbInRotation(Me2Ab::kOcclNoWait)) && !Me2AbOff(Me2Ab::kOcclNoWait) &&
+          PreviousCount(previous, 0, prev_count) && prev_count) {
+        st_nowait_visible.fetch_add(1, std::memory_order_relaxed);
+        t_outcome = 3;
+        return prev_count;
+      }
+      // me2-nx-deko (2026-11-06, me2_occlusion_nowait_shadows): the shadow readers (tags 3, 4), previous issue hidden.
+      static const bool nowait_shadows = REXCVAR_GET(me2_occlusion_nowait_shadows);
+      if ((t_tag == 3 || t_tag == 4) && (nowait_shadows || Me2AbInRotation(Me2Ab::kOcclNoWaitShadow)) &&
+          !Me2AbOff(Me2Ab::kOcclNoWaitShadow) && PreviousCount(previous, 0, prev_count) && prev_count == 0) {
+        st_nowait_shadow.fetch_add(1, std::memory_order_relaxed);
+        t_outcome = 4;
+        return 0;
       }
     }
     if (wait_us <= 0 || age == 0) {

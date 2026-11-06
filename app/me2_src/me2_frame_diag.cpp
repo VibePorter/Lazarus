@@ -135,6 +135,13 @@ REXCVAR_DEFINE_UINT32(me2_gc_pool_boost_mask, 0, "ME2",
                       "During each garbage collection, UE3's thread pool threads (its marking tasks) may run on these "
                       "cores (hex mask, e.g. 0xD = cores 0, 2, 3); 0 = their own cores")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(me2_gc_fast_waits, false, "ME2",
+                    "During a garbage collection, guest polling loops yield without their 100 us backoff sleep: the "
+                    "purge's per-resource waits on the render thread return at once (sdk thread_yield_backoff_us)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+#if REX_PLATFORM_SWITCH
+extern "C" std::atomic<int> g_rex_yield_no_backoff;  // sdk core/threading_posix.cpp
+#endif
 REXCVAR_DEFINE_INT32(me2_gc_pool_boost_prio, -1, "ME2",
                      "During each garbage collection, UE3's thread pool threads run at this Horizon priority (e.g. 58 = "
                      "0x3A, above the game threads' 0x3B); -1 = their own")
@@ -507,6 +514,14 @@ int32_t PhysicalFreeMb() {
 // The game thread (UE3's world tick and script run there).
 thread_local int t_world_tick = 0;  // inside UWorld::Tick sub_8247F790
 thread_local int t_perform = 0;     // inside UWorld::PerformGarbageCollection sub_82480988
+// me2-nx-deko (2026-11-06, me2_gc_fast_waits): inside UObject::CollectGarbage on this thread, and the render-command fence
+// waits (sub_82335A58) of the current collection (game thread only).
+thread_local bool t_in_gc = false;
+struct FenceStats {
+  uint32_t calls = 0, waited = 0;
+  uint64_t us = 0, max_us = 0;
+};
+FenceStats g_fence;
 std::atomic<uint64_t> g_last_gc_end_us{0};
 // 2026-10-31 (run 4: 97 of 136 collections came straight from other engine code, not the tick's GC block): the
 // innermost of the functions that call CollectGarbage directly (ME2_GC_CALLER wrappers below), 0 = none of them.
@@ -702,8 +717,80 @@ REX_HOOK_RAW(sub_82480988) {  // UWorld::PerformGarbageCollection(this): the ini
 }
 
 REX_EXTERN(__imp__sub_827B0160);
+// me2_gc_fast_waits (2026-11-06): for the length of the collection, guest polling loops (Sleep(0), NtYieldExecution ->
+// rex::thread::MaybeYield) yield without their 100 us backoff sleep (sdk threading_posix.cpp g_rex_yield_no_backoff). A
+// purge waits on the render thread once per destroyed render resource (sub_82919A78 -> fence wait sub_82335A58), both
+// threads polling; console 2026-11-06 (MSV Strontium Mule load, 1785 MHz): collections up to 820 ms, the game thread 54 %
+// of them in the kernel, 73 % of that in those fence waits, while the render thread did no release work to speak of.
+struct FastWaitScope {
+  bool on = false;
+  FastWaitScope() {
+    static const bool fast = REXCVAR_GET(me2_gc_fast_waits);
+    t_in_gc = true;
+    g_fence = FenceStats{};
+#if REX_PLATFORM_SWITCH
+    if (fast) {
+      on = true;
+      g_rex_yield_no_backoff.fetch_add(1, std::memory_order_relaxed);
+    }
+#else
+    (void)fast;
+#endif
+  }
+  ~FastWaitScope() {
+    t_in_gc = false;
+#if REX_PLATFORM_SWITCH
+    if (on) g_rex_yield_no_backoff.fetch_sub(1, std::memory_order_relaxed);
+#endif
+  }
+};
+
+// The render-command fence wait (FRenderCommandFence::Wait: while [r3] > r4, a virtual pump and Sleep(0)), counted during
+// collections only.
+#if REX_PLATFORM_SWITCH
+extern "C" int RexSwitchGetCurrentThreadPriority(void);  // sdk core/threading_switch.cpp
+#endif
+REX_EXTERN(__imp__sub_82335A58);
+REX_HOOK_RAW(sub_82335A58) {
+  if (!t_in_gc) {
+    __imp__sub_82335A58(ctx, base);
+    return;
+  }
+  const uint32_t counter = ctx.r3.u32, target = ctx.r4.u32;
+  const bool pending = counter && Load32(base, counter) > target;
+  const uint64_t t0 = pending ? NowUs() : 0;
+  __imp__sub_82335A58(ctx, base);
+  ++g_fence.calls;
+  if (pending) {
+    const uint64_t us = NowUs() - t0;
+    ++g_fence.waited;
+    g_fence.us += us;
+    g_fence.max_us = std::max(g_fence.max_us, us);
+    // me2-nx-deko (2026-11-06): the loads' long collections (console 11-06: 1.7 s, 44 waits of ~30 ms each behind the
+    // loading movie, UE3's rendering thread not running): what the wait loop pumps each time round ([0x8337BF0C]'s
+    // vtable slot 7, then Sleep(0)) and at what priority the game thread sleeps. A few lines a session.
+    static int logged = 0;
+    if (us >= 5000 && logged < 6) {
+      ++logged;
+      const uint32_t obj = Load32(base, 0x8337BF0Cu);
+      const uint32_t vt = obj ? Load32(base, obj) : 0;
+      const uint32_t fn = vt ? Load32(base, vt + 28) : 0;
+#if REX_PLATFORM_SWITCH
+      const int prio = RexSwitchGetCurrentThreadPriority();
+#else
+      const int prio = -1;
+#endif
+      REXLOG_INFO("[gc]   long fence wait {:.1f} ms: counter {:08X} {} -> {} (target {}); the loop pumps {:08X} (object "
+                  "{:08X}, vtable {:08X}); game thread host priority {:#x}",
+                  double(us) / 1000.0, counter, Load32(base, counter) > target ? "still above" : "done", Load32(base, counter),
+                  target, fn, obj, vt, prio);
+    }
+  }
+}
+
 REX_HOOK_RAW(sub_827B0160) {  // UObject::CollectGarbage(KeepFlags, bPerformFullPurge)
   PoolBoostScope pool_boost;  // me2_gc_pool_boost_mask: UE3's thread pool boosted for this collection
+  FastWaitScope fast_waits;   // me2_gc_fast_waits (2026-11-06)
   const bool on = GcOn() || GapS() > 0 || StreamGapS() > 0;
   if (!on) {
     __imp__sub_827B0160(ctx, base);
@@ -805,6 +892,10 @@ REX_HOOK_RAW(sub_827B0160) {  // UObject::CollectGarbage(KeepFlags, bPerformFull
               g_sa2_game_frames.load(std::memory_order_relaxed), g_deferred_since_gc,
               double(g_gc_max_us.load(std::memory_order_relaxed)) / 1000.0, free_before_mb, PhysicalFreeMb(),
               forced);
+  REXLOG_INFO("[gc]   render fence waits in it: {} calls, {} had to wait, {:.1f} ms in all (longest {:.2f} ms); fast "
+              "waits {}",
+              g_fence.calls, g_fence.waited, double(g_fence.us) / 1000.0, double(g_fence.max_us) / 1000.0,
+              fast_waits.on ? "on" : "off");
   g_deferred_since_gc = 0;
   Summary(end);
 }

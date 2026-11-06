@@ -125,12 +125,12 @@ me2_occlusion_umbra_latent_confirm = 2
 # counted VISIBLE skips its re-test box for up to 8 frames (its read answers that visible count; occluded nodes are
 # always re-tested, so nothing appears late). Was 2 (skipped only ~20 boxes a second). "[occlusion] Umbra retest" lines.
 me2_occlusion_umbra_retest_frames = 8
-me2_occlusion_umbra_retest_occluded = 2   # 2026-11-03 console A/B (Kasumi party, standing): +2-4 % fps, half the Umbra tests skipped, draws -11 %; a node found occluded is not re-tested for 2 frames while the camera is still
+me2_occlusion_umbra_retest_occluded = 4   # 2026-11-06: as the tested console config (was 2); 2026-11-03 console A/B (Kasumi party, standing): +2-4 % fps, half the Umbra tests skipped, draws -11 %; a node found occluded is not re-tested for 2 frames while the camera is still
 me2_occlusion_umbra_retest_occluded_ab_s = 0
 me2_occlusion_carry = true
 
 # CPU occlusion remains disabled (mode 0); preserve base fallback settings
-me2_occlusion_umbra_cpu = 0
+me2_occlusion_umbra_cpu = 2   # 2026-11-06: as the tested console config (was 0)
 me2_occlusion_cpu_unseen = false
 me2_occlusion_cpu_capture = 1
 me2_occlusion_cpu_unseen_min = 0.5
@@ -279,7 +279,7 @@ me2_occlusion_cut_visible_frames = 3
 # console): the final pass upscales bilinearly. 0 = FSR 1 EASU again.
 # 2026-11-02 (user): FSR 1 EASU for the upscale to the HUD's resolution (docked: 720p scene -> 1080p; handheld
 # is native 720p in this profile, so nothing is upscaled there). 1 = bilinear.
-me2_renut_ui_upscale = 0
+me2_renut_ui_upscale = 1   # 2026-11-06: as the tested console config (was 0)
 me2_renut_ui_upscale_ab_s = 0
 
 # --- 2026-10-31 fourth build (14:08): native LZX decompression ------------------------------------------------------------
@@ -331,7 +331,7 @@ me2_renut_lens_flares = true
 # up to me2_cull_small_max_radius, never closer than me2_cull_small_min_distance); characters / movable props / effects:
 # me2_cull_dynamic_*. "[cull] Umbra" lines every 10 s count them.
 me2_cull_small_factor = 80   # 2026-11-02: emulator-tested 60/60/15, no visible pop-in except distant lights (accepted)
-me2_cull_dynamic_factor = 80   # 2026-11-02: emulator-tested 60/60/15, no visible pop-in except distant lights (accepted)
+me2_cull_dynamic_factor = 0   # 2026-11-06: as the tested console config (was 80); 2026-11-02: emulator-tested 60/60/15, no visible pop-in except distant lights (accepted)
 # me2_cull_dynamic_max_radius = 512
 # me2_cull_dynamic_min_distance = 2000
 # Whole point / spot lights small for their distance are not drawn ("[light-cull] whole lights" lines).
@@ -343,3 +343,28 @@ me2_light_whole_factor = 20   # 2026-11-02: emulator-tested 60/60/15, no visible
 # (sdmc:/switch/me2-deko/ME1: Xbox 360 Char_* saves or PC .MassEffectSave files, converted on the fly).
 me2_menu_hide_import_me1 = false
 me2_me1_import_dir = "/switch/me2-deko/ME1"
+
+# 2026-11-06: settings of the render-thread / occlusion work of 11-05 and 11-06, as the tested console config
+me2_occlusion_cpu_source = 1
+me2_occlusion_raster_core = 3
+me2_occlusion_raster_mem_mb = 48
+me2_occlusion_raster_tris = 60000
+me2_occlusion_raster_lean = true
+me2_occlusion_reader_raster = true
+me2_occlusion_nowait_visible = true
+me2_native_vis = true
+me2_native_vis_worker = true
+me2_native_vis_shadow = true
+me2_native_vis_filter = false
+me2_relink_skip_same = true
+me2_gc_fast_waits = true
+me2_deko3d_arena_max_mb = 1024
+me2_physx_step_ms = 40
+kernel_deferred_overlapped_ms = 1
+switch_window_blocks = true
+me2_light_edge = 10
+me2_light_small_boost = 4
+me2_light_occlusion = 0
+me2_hot_render_states = false
+me2_renut_color_handover = false
+me2_renut_watch_raw = false

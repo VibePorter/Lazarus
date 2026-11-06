@@ -13,6 +13,7 @@
 //   same shadow (key: light scene info, viewport size, the light's pass ordinal in the frame) drew exactly the same
 //   thing again = what a cache could have kept. Upper bound: vertex buffers are hashed by address, not contents
 //   (CPU-written vertices would look unchanged).
+#include "me2_replay.h"  // me2-nx-deko (2026-11-06): draw-setup replay observers (ME2_TIMED_LEAF)
 #include <rex/cvar.h>
 #include <rex/hook.h>
 #include <rex/logging.h>
@@ -694,9 +695,12 @@ ME2_ELEMENT_DRAW(3, 826A0BF8)
 ME2_ELEMENT_DRAW(4, 826A0CC8)
 
 // The calls a replay would still make (me2_element_timing), timed only inside a timed element call.
-#define ME2_TIMED_LEAF(K, ADDR)                     \
-  REX_EXTERN(__imp__sub_##ADDR);                    \
-  REX_HOOK_RAW(sub_##ADDR) { TimedLeaf<K, __imp__sub_##ADDR>(ctx, base); }
+#define ME2_TIMED_LEAF(K, ADDR)                                                                    \
+  REX_EXTERN(__imp__sub_##ADDR);                                                                   \
+  REX_HOOK_RAW(sub_##ADDR) {                                                                       \
+    const auto me2_replay_scope = me2::replay::EnterAt<0x##ADDR##u>(ctx, base); /* me2_replay.h */ \
+    TimedLeaf<K, __imp__sub_##ADDR>(ctx, base);                                                    \
+  }
 ME2_TIMED_LEAF(0, 8266F820)  // vertex factory set (streams, declaration; calls sub_825A6118)
 ME2_TIMED_LEAF(0, 825A6118)  // vertex factory streams (SetStreamSource each)
 ME2_TIMED_LEAF(1, 827E16A8)  // RHISetRasterizerState (cull mode, depth bias)
@@ -719,12 +723,23 @@ ME2_TIMED_LEAF(9, 8267B0F0)
 ME2_TIMED_LEAF(9, 8267B1B8)
 ME2_TIMED_LEAF(9, 822E91F0)
 ME2_TIMED_LEAF(10, 822C92F8)  // reference release
-ME2_TIMED_LEAF(6, 827DB818)  // static render state set (five a DrawShared)
+// ME2 (2026-11-06): 827DB818 (static render state set, slot 6) is a hot native now (hot/n/n_827DB818.h): one hook per
+// function, so it is no longer timed here (slot 6 reads 0).
 ME2_TIMED_LEAF(7, 827DB1F0)  // bound shader state
 #define ME2_TIMED_SHARED(ADDR)                      \
   REX_EXTERN(__imp__sub_##ADDR);                    \
   REX_HOOK_RAW(sub_##ADDR) { TimedShared<__imp__sub_##ADDR>(ctx, base); }
-ME2_TIMED_SHARED(826B6678)  // DrawShared of 826A0990
+// me2-nx-deko (2026-11-06): 826B6678 is also the translucency pass's DrawShared (particles): me2_dynshared_diag
+// observes those calls (me2_dynshared.cpp).
+bool Me2DynSharedTranslucent();
+void Me2DynSharedObserveTranslucent(PPCFunc* original, PPCContext& ctx, uint8_t* base);
+REX_EXTERN(__imp__sub_826B6678);
+REX_HOOK_RAW(sub_826B6678) {  // DrawShared of 826A0990
+  if (Me2DynSharedTranslucent())
+    Me2DynSharedObserveTranslucent(&TimedShared<__imp__sub_826B6678>, ctx, base);
+  else
+    TimedShared<__imp__sub_826B6678>(ctx, base);
+}
 ME2_TIMED_SHARED(826B4400)  // of 826A0A58 / 826A0B28
 ME2_TIMED_SHARED(826B4C68)  // of 826A0BF8
 ME2_TIMED_SHARED(826B5938)  // of 826A0CC8
