@@ -32,6 +32,11 @@
 // the render resolution follows the console's mode (sa2::render::Docked: libnx's operation mode, Reverse-NX obeyed; the
 // PC's simulated one, F9) at the next frame, at the heights the native renderer's keys set. On deko3d the swapchain
 // takes the display's size with it (1920x1080 docked), and a GLSL package made for 1x only keeps 1280x720.
+// me2-nx-deko (2026-11-07): see LatchResolutionScaleLocked (the console-only halo after a docked/handheld switch).
+REXCVAR_DEFINE_BOOL(me2_renut_scale_switch_reset, false, "ME2/Renderer",
+                    "At a render-scale change (docked/handheld switch): drop every target image, GPU-drawn texture "
+                    "and resolve spare made at the old scale ('[scale-switch]' line); false = keep them as before")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(sa2_renut_dock_resolution, true, "SA2/Renderer",
                     "Renut's renderer: render at sa2_render_height_docked (1080 = 1920x1080) when docked and at "
                     "sa2_render_height_handheld (720 = the game's 1280x720) in handheld mode, switching at the next "
@@ -88,6 +93,21 @@ REXCVAR_DEFINE_STRING(me2_renut_ui_native_starters, "6056A9EA495B443E", "ME2/Ren
                       "Pixel shaders (hex hashes, comma-separated) that start the final pass at its own resolution "
                       "instead of the scene's (Bink movies); empty = off. Read at start")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// ME2 (2026-11-12, backported from the Dunwall port): see g_ui_not_starters below.
+REXCVAR_DEFINE_BOOL(me2_renut_ui_starter_check, true, "ME2/Renderer",
+                    "A final-pass starter whose pass is followed by draws into another target is dropped (and never "
+                    "learned again); off = starters stay once learned")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// Dunwall (2026-11-10, console: the HUD at 360p for the rest of the run): one frame at the level's start went on from
+// the gameplay final pass's starter into the HDR scene target, and the pair was dropped for good, while every later
+// frame's final pass began with it. A dropped starter is learned again once it has been the frame's last run (the final
+// pass) this many frames in a row without its pass going on; each further drop doubles the wait (up to 16x), so a shader
+// that keeps flipping stays out.
+REXCVAR_DEFINE_INT32(me2_renut_ui_starter_relearn_frames, 60, "ME2/Renderer",
+                     "Frames a dropped final-pass starter must end the frame (without its pass going on) before it is "
+                     "learned again; doubled at each further drop; 0 = dropped for good")
+    .range(0, 100000)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace renut::gpu {
 
@@ -106,14 +126,78 @@ struct UiRun {
   const HostSurface *surface = nullptr;
   uint64_t ps = 0;
   bool screen = false;
+  u32 va = 0;  // ME2 (from the Dunwall port): the device's colour target 0 (the surface header) at the run's first draw
 };
 UiRun g_ui_run;
+u32 g_ui_draw_color0_va = 0;  // UiPhaseBeforeDrawLocked's, for UiNoteDrawLocked of the same draw
 // me2_renut_ui_tonemap_low: the screen surface whose final pass started at the scene's scale (its first draw); the
 // switch to the final pass's scale waits for the next draw, clear or resolve (UiPendingFlushLocked).
 u32 g_ui_pending_va = 0;
 constexpr uint32_t kUiStarters = 8;
 uint64_t g_ui_starters[kUiStarters] = {};
 uint32_t g_ui_starter_next = 0;
+// ME2 (2026-11-12, backported from the Dunwall port; console there: textures switching between sharp and blurry every
+// frame): a learned starter that UE3 also uses earlier in the frame (into a screen-size target, then other targets
+// follow) turned the rest of the scene to the final pass's scale on some frames only; every target flipped between the
+// two scales. A starter is the pair (pixel shader, the colour target it drew into on the frame's last run): a shader UE3
+// also runs mid-frame draws into another target there and does not match. When the final pass it started then goes on
+// to a target the final pass cannot draw into, the pair leaves the starters (g_ui_not_starters) until it has ended
+// me2_renut_ui_starter_relearn_frames frames in a row again. "[me2-ui] ... not a final-pass starter there any more".
+uint64_t UiStarterKey(uint64_t ps_hash, u32 color0_va) {
+  return ps_hash ? ps_hash ^ (uint64_t(color0_va) * 0x9E3779B97F4A7C15ull) : 0;
+}
+uint64_t g_ui_trigger_ps = 0;   // the starter that began this frame's final pass (0: none)
+uint64_t g_ui_trigger_key = 0;  // ... its UiStarterKey
+u32 g_ui_trigger_va = 0;        // ME2 (2026-11-14, from the Dunwall port): ... the colour target it drew into
+// ME2 (2026-11-14, from the Dunwall port 2026-11-13; Dunwall console: the HUD dropped to the scene's resolution
+// for a moment, e.g. leaving water): after the tonemap a screen effect draws into a quarter-screen buffer (320x180) and
+// comes back to the same screen target for the HUD. That detour dropped the starter (1-16 frames of low-resolution
+// HUD, over and over). A detour into a small buffer is now judged at the end: the pass coming back to its starter's
+// target in the same frame keeps the starter; not coming back by the frame's end drops it as before. Big / HDR targets
+// drop at once.
+struct UiDetour {
+  bool pending = false;
+  uint64_t key = 0, ps = 0;
+  u32 run_va = 0, target_va = 0, width = 0, height = 0;
+};
+UiDetour g_ui_detour;
+constexpr uint32_t kUiNotStarters = 32;
+struct UiNotStarter {
+  uint64_t key = 0;
+  uint32_t streak = 0;  // frames in a row ending with this pair since its last drop
+  uint32_t drops = 0;
+  bool active = false;  // dropped right now (inactive: learned again, the drop count kept)
+};
+UiNotStarter g_ui_not_starters[kUiNotStarters] = {};
+uint32_t g_ui_not_starter_next = 0;
+UiNotStarter *FindNotStarter(uint64_t key) {
+  for (UiNotStarter &n : g_ui_not_starters)
+    if (key && n.key == key)
+      return &n;
+  return nullptr;
+}
+bool DroppedStarter(uint64_t key) {
+  const UiNotStarter *n = FindNotStarter(key);
+  return n && n->active;
+}
+
+// The pair 'bad' started a final pass that went on (me2_renut_ui_starter_check): out of the starters.
+void DropUiStarter(uint64_t bad, uint64_t bad_ps, u32 run_va, u32 target_va, u32 width, u32 height) {
+  for (uint64_t &starter : g_ui_starters)
+    if (starter == bad)
+      starter = 0;
+  if (UiNotStarter *n = FindNotStarter(bad)) {
+    n->active = true;
+    n->streak = 0;
+    ++n->drops;
+  } else {
+    g_ui_not_starters[g_ui_not_starter_next++ % kUiNotStarters] = {bad, 0, 1, true};
+  }
+  static uint32_t logged = 0;
+  if (logged++ < 32)
+    RGPU_INFO("[me2-ui] pixel shader {:016X} (into {:08X}) started a final pass that went on to another target "
+              "{:08X} ({}x{}): not a final-pass starter there any more", bad_ps, run_va, target_va, width, height);
+}
 
 // A colour target the final pass may draw into: the game's screen size, single-sample, 8-bit or 10-bit unorm.
 bool UiScreenTarget(u32 size_word, u32 info_word, u32 color_info) {
@@ -384,6 +468,10 @@ bool BuildTarget(HostSurface &surface, const d3d::SurfaceDesc &desc, uint32_t mi
 
 } // namespace
 
+// me2-nx-deko (2026-11-07): render-scale changes after the first latch (docked/handheld switches); draw.cpp's Zcull
+// invalidation (me2_deko3d_zcull_invalidate) watches it.
+uint64_t g_resolution_changes = 0;
+uint64_t ResolutionChangesLocked() { return g_resolution_changes; }
 uint64_t SurfaceEpochLocked() { return g_surface_epoch; }  // sa2-nx (2026-10-20, sa2_renut_chain_reuse)
 uint64_t FramebufferEpochLocked() { return g_framebuffer_epoch; }  // sa2-nx (2026-10-20, sa2_renut_chain_reuse)
 
@@ -449,6 +537,26 @@ void LatchResolutionScaleLocked() {
   if (!g_resolution_latched || scale != g_resolution_scale) {
     RGPU_INFO("Render resolution {}x{} ({:.3g}x)", scale.Size(GuestScreenWidth()), scale.Size(720),
               scale.Factor());
+    // me2-nx-deko (2026-11-07, me2_renut_scale_switch_reset): a console-only halo around characters after a
+    // docked/handheld switch changes the render scale (same scale in both modes: none; Ryujinx: none; no texture is
+    // sampled at an old scale). Experiment: everything drawn at the old scale goes at the switch (between frames: the
+    // Swap latches) - every target's image (made again at its next use), every GPU-drawn texture and resolve spare.
+    if (g_resolution_latched)
+      ++g_resolution_changes;
+    static const bool reset = REXCVAR_GET(me2_renut_scale_switch_reset);
+    if (reset && g_resolution_latched) {
+      size_t targets = 0, textures = 0, spares = 0;
+      for (auto &[key, surface] : g_targets) {
+        if (surface && surface->texture) {
+          RetireTarget(*surface);
+          ++targets;
+        }
+      }
+      DropGpuDrawnTexturesLocked(&textures, &spares);
+      RGPU_WARN("[scale-switch] {:.3g}x -> {:.3g}x: {} target images, {} GPU-drawn textures and {} resolve spares "
+                "dropped (me2_renut_scale_switch_reset)",
+                g_resolution_scale.Factor(), scale.Factor(), targets, textures, spares);
+    }
     g_resolution_scale = scale;
     ++g_surface_epoch;
     g_resolution_latched = true;
@@ -467,15 +575,41 @@ void LatchResolutionScaleLocked() {
       ui = scale;
     }
     g_ui_scale = ui;
-    if (g_ui_run.screen && g_ui_run.ps &&
-        std::find(std::begin(g_ui_starters), std::end(g_ui_starters), g_ui_run.ps) == std::end(g_ui_starters)) {
-      g_ui_starters[g_ui_starter_next++ % kUiStarters] = g_ui_run.ps;
+    // ME2 (2026-11-14, from the Dunwall port): a small detour that never came back to the starter's target: the
+    // scene went on.
+    if (g_ui_detour.pending) {
+      DropUiStarter(g_ui_detour.key, g_ui_detour.ps, g_ui_detour.run_va, g_ui_detour.target_va, g_ui_detour.width,
+                    g_ui_detour.height);
+      g_ui_detour = {};
+    }
+    const uint64_t run_key = UiStarterKey(g_ui_run.ps, g_ui_run.va);
+    // A dropped pair that ends the frame again: counted, and learned again after its wait.
+    if (UiNotStarter *n = g_ui_run.screen && run_key ? FindNotStarter(run_key) : nullptr; n && n->active) {
+      static const uint32_t relearn = uint32_t(std::max(REXCVAR_GET(me2_renut_ui_starter_relearn_frames), 0));
+      const uint32_t wait = relearn << std::min<uint32_t>(n->drops ? n->drops - 1 : 0, 4);
+      if (relearn && ++n->streak >= wait) {
+        n->active = false;
+        n->streak = 0;
+        static uint32_t logged = 0;
+        if (logged++ < 32)
+          RGPU_INFO("[me2-ui] pixel shader {:016X} into {:08X} ended {} frames in a row: a final-pass starter again "
+                    "(dropped {} times)", g_ui_run.ps, g_ui_run.va, wait, n->drops);
+      }
+    }
+    if (g_ui_run.screen && run_key &&
+        std::find(std::begin(g_ui_starters), std::end(g_ui_starters), run_key) == std::end(g_ui_starters) &&
+        !DroppedStarter(run_key)) {
+      g_ui_starters[g_ui_starter_next++ % kUiStarters] = run_key;
       static uint32_t logged = 0;
       if (logged++ < 32)
-        RGPU_INFO("[me2-ui] the frame's final pass starts with pixel shader {:016X}", g_ui_run.ps);
+        RGPU_INFO("[me2-ui] the frame's final pass starts with pixel shader {:016X} into {:08X}", g_ui_run.ps,
+                  g_ui_run.va);
     }
     g_ui_run = {};
     g_ui_pending_va = 0;
+    g_ui_trigger_ps = 0;
+    g_ui_trigger_key = 0;
+    g_ui_trigger_va = 0;
     if (g_ui_phase) {
       g_ui_phase = false;
       ++g_surface_epoch;
@@ -516,6 +650,7 @@ void UiPendingFlushLocked() {
 }
 
 void UiPhaseBeforeDrawLocked(u32 color0_va, uint64_t ps_hash) {
+  g_ui_draw_color0_va = color0_va;
   // me2-nx-deko (2026-11-01): draws of a Bink movie frame (the image hold in d3d hooks/device.cpp lets those frames
   // through: loading screens and cutscene movies are shown, never held).
   if (ps_hash && UiNativeStarter(ps_hash))
@@ -525,12 +660,16 @@ void UiPhaseBeforeDrawLocked(u32 color0_va, uint64_t ps_hash) {
     return;
   }
   if (g_ui_phase || g_ui_scale == g_resolution_scale || !color0_va || !ps_hash ||
-      std::find(std::begin(g_ui_starters), std::end(g_ui_starters), ps_hash) == std::end(g_ui_starters))
+      std::find(std::begin(g_ui_starters), std::end(g_ui_starters), UiStarterKey(ps_hash, color0_va)) ==
+          std::end(g_ui_starters))
     return;
   const auto *desc = GuestPtr<const d3d::SurfaceDesc>(color0_va + sizeof(d3d::Resource));
   if (!desc || d3d::IsDepthFormat(desc->Format) || !UiScreenTarget(desc->Size, desc->SurfaceInfo, desc->ColorInfo))
     return;
   static const bool tonemap_low = REXCVAR_GET(me2_renut_ui_tonemap_low);
+  g_ui_trigger_ps = ps_hash;
+  g_ui_trigger_key = UiStarterKey(ps_hash, color0_va);
+  g_ui_trigger_va = color0_va;
   if (tonemap_low && !UiNativeStarter(ps_hash)) {
     g_ui_pending_va = color0_va;  // this draw (the tonemap) at the scene's scale
     return;
@@ -543,6 +682,38 @@ void UiPhaseBeforeDrawLocked(u32 color0_va, uint64_t ps_hash) {
 void UiNoteDrawLocked(const HostSurface *color0, uint64_t ps_hash) {
   if (color0 == g_ui_run.surface)
     return;
+  // me2_renut_ui_starter_check: the final pass went on to another colour target: its starter was not the frame's last
+  // run. The rest of this frame stays as it is (its targets are made); the next frames do not start there. Only for a
+  // target the final pass cannot draw into (HDR targets, small buffers: the scene going on); the HUD moving between
+  // screen-size targets is the final pass.
+  static const bool check = REXCVAR_GET(me2_renut_ui_starter_check);
+  // ME2 (2026-11-14, from the Dunwall port): a pending small detour ends well when the pass comes back to its
+  // starter's target.
+  if (g_ui_detour.pending && color0 && g_ui_draw_color0_va == g_ui_trigger_va) {
+    static uint32_t logged = 0;
+    if (logged++ < 16)
+      RGPU_INFO("[me2-ui] final pass from {:016X} went through {:08X} ({}x{}) and came back to {:08X}: a screen effect, "
+                "the starter is kept", g_ui_detour.ps, g_ui_detour.target_va, g_ui_detour.width, g_ui_detour.height,
+                g_ui_trigger_va);
+    g_ui_detour = {};
+  }
+  if (check && g_ui_trigger_key && color0 && !color0->depth && g_ui_run.surface && (g_ui_phase || g_ui_pending_va) &&
+      !UiScreenTarget(color0->size_word, color0->info_word, color0->color_info)) {
+    const uint64_t bad = g_ui_trigger_key, bad_ps = g_ui_trigger_ps;
+    // A quarter-screen buffer or smaller (not a tiny lookup target): judged at the frame's end (g_ui_detour).
+    const bool small = color0->width > 64 && color0->width * 4 <= GuestScreenWidth() && color0->height * 4 <= 720;
+    if (small && g_ui_trigger_va) {
+      if (!g_ui_detour.pending)
+        g_ui_detour = {true, bad, bad_ps, g_ui_run.va, g_ui_draw_color0_va, color0->width, color0->height};
+    } else {
+      g_ui_detour = {};  // a big / HDR target: the scene went on, whatever a small detour before it was
+      g_ui_trigger_ps = 0;
+      g_ui_trigger_key = 0;
+      g_ui_trigger_va = 0;
+      DropUiStarter(bad, bad_ps, g_ui_run.va, g_ui_draw_color0_va, color0->width, color0->height);
+    }
+  }
+  g_ui_run.va = g_ui_draw_color0_va;
   g_ui_run.surface = color0;
   g_ui_run.ps = ps_hash;
   g_ui_run.screen = color0 && !color0->depth && UiScreenTarget(color0->size_word, color0->info_word, color0->color_info);

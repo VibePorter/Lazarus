@@ -65,6 +65,8 @@ The `ru/` profiles are the same plus `game_overlay_root` (the Russian files) and
 | `me2_menu_hide_import_me1`, `me2_me1_import_dir` | the ME1 import (see [me1-import.md](me1-import.md)) |
 | `me2_skip_relaunch` | the Xbox's "restart the game" path is skipped (default `true`; the port cannot restart itself) |
 | `me2_subtitle_size` | subtitle size in percent; also *Options → Gameplay* |
+| `me2_fps_limit` | frame-rate cap: `-1` the game's own pacing (default), `0` the display's refresh rate, `N` a cap |
+| `me2_me1_import_le1_latin_names` | Legendary Edition saves: a Cyrillic first name in Latin letters (automatic unless the game is Russian) |
 
 ### Logs and diagnostics
 

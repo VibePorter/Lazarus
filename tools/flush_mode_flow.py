@@ -314,7 +314,11 @@ def main():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     ap.add_argument('--image', help="the code generator's image dump: enables the entry modes")
     ap.add_argument('--sources', nargs='*', default=[os.path.join(root, 'app', 'src'), os.path.join(root, 'sdk', 'src'),
-                                                     os.path.join(root, 'sdk', 'include')])
+                                                     os.path.join(root, 'sdk', 'include'),
+                                                     # ME2 (2026-11-14, from the Dunwall port): ME2's own hooks
+                                                     # (app/me2_src); a function hooked there is not proven from
+                                                     # the guest code (tools/direct_calls.py lists it too).
+                                                     os.path.join(root, 'app', 'me2_src')])
     ap.add_argument('--tomls', default=os.path.join(root, 'app'))
     ap.add_argument('--check', action='store_true')
     ap.add_argument('--undo', action='store_true')

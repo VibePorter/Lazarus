@@ -34,6 +34,20 @@ then runs `importcharacter Char_Prep`. The port cannot start another program or 
 `me2_me1_import_no_restart` / `me2_me1_import_load_screen` select the other routes (one save without a list, or the
 Xbox's restart with a launch-data file); the load screen is the default and the tested one.
 
+## Legendary Edition saves (`.pcsav`)
+
+Since 2026-11-14 a Mass Effect 1 **Legendary Edition** save (`.pcsav`) in the import folder is converted too
+(`app/me2_src/me2_me1_le1.cpp`): its plot state is rebuilt as an ME1 Xbox `state.sav`, and its values are written
+into a template ME1 Xbox `player.sav`.
+
+- Male Shepard with the default face only; a female Shepard or a custom head is refused with a reason in the log.
+- A Cyrillic first name is written in Latin letters unless the game runs in Russian
+  (`me2_me1_import_le1_latin_names`).
+- **The template is not in this repository** (it is a real ME1 Xbox save). Generate
+  `app/me2_src/me2_me1_le1_template.inc` from an ME1 Xbox 360 `player.sav` of your own: `kTemplateSize` = its size,
+  `kTemplateZ` = `zlib.compress(player.sav, 9)` as bytes. Without the file the build works and `.pcsav` saves are
+  refused.
+
 ## Known limits
 
 - PC → Xbox conversion of ME1 data was checked on two PC saves; unusual saves (other versions, mods) may fail. The log

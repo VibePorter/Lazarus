@@ -23,6 +23,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SPIRV_CROSS = os.path.join(ROOT, 'out', 'deko3d_tools', 'spirv-cross-build', 'spirv-cross.exe')
 UAM = os.path.join(ROOT, 'out', 'deko3d_tools', 'uam-build', 'uam.exe')
 NO_UAM = False
+REUSE = False
 
 
 def one(spv, out):
@@ -31,14 +32,19 @@ def one(spv, out):
     vk = os.path.join(out, 'vk', stem + '.vk.glsl')
     glsl = os.path.join(out, 'glsl', stem + '.glsl')
     dksh = os.path.join(out, 'dksh', stem + '.dksh')
-    r = subprocess.run([SPIRV_CROSS, spv, '--version', '460', '--vulkan-semantics', '--relax-nan-checks',
-                        '--output', vk], capture_output=True, text=True, timeout=300)
-    if r.returncode != 0:
-        return stem, 'spirv-cross', (r.stderr or r.stdout).strip()[:300], 0, []
+    if not (REUSE and os.path.isfile(vk)):
+        r = subprocess.run([SPIRV_CROSS, spv, '--version', '460', '--vulkan-semantics', '--relax-nan-checks',
+                            '--output', vk], capture_output=True, text=True, timeout=300)
+        if r.returncode != 0:
+            return stem, 'spirv-cross', (r.stderr or r.stdout).strip()[:300], 0, []
     try:
         text, _ = deko3d_glsl.convert(open(vk, encoding='utf-8').read(), stage, deko3d_glsl.DEFAULT_UBO_MAP, 'handle')
     except deko3d_glsl.Unsupported as e:
         return stem, 'convert', str(e)[:300], 0, []
+    if REUSE and not NO_UAM and os.path.isfile(dksh) and os.path.isfile(glsl):
+        with open(glsl, encoding='utf-8', newline='') as f:
+            if f.read() == text:
+                return stem, None, '', os.path.getsize(dksh), []  # unchanged: its DKSH stays
     with open(glsl, 'w', encoding='utf-8', newline='\n') as f:
         f.write(text)
     if NO_UAM:
@@ -59,9 +65,13 @@ def main():
     ap.add_argument('--jobs', type=int, default=max(1, (os.cpu_count() or 4) - 2))
     ap.add_argument('--limit', type=int, default=0)
     ap.add_argument('--no-uam', action='store_true', help='convert only (the GLSL package needs no DKSH)')
+    ap.add_argument('--reuse', action='store_true',
+                    help='after a deko3d_glsl.py change: reuse <out>/vk (no SPIRV-Cross) and keep the DKSH of every '
+                         'shader whose GLSL comes out the same (uam only for the changed ones)')
     a = ap.parse_args()
-    global NO_UAM
+    global NO_UAM, REUSE
     NO_UAM = a.no_uam
+    REUSE = a.reuse
     for d in ('vk', 'glsl', 'dksh'):
         os.makedirs(os.path.join(a.out, d), exist_ok=True)
     spvs = sorted(os.path.join(a.spirv, f) for f in os.listdir(a.spirv) if f.endswith('.spv'))

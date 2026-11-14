@@ -19,6 +19,7 @@
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
 #include <rex/filesystem/devices/host_path_device.h>
+#include <rex/filesystem/devices/pack_device.h>
 #include <rex/filesystem/devices/stfs_container_device.h>
 #include <rex/logging.h>
 #include <rex/string.h>
@@ -216,6 +217,19 @@ ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view
   // me2-nx-deko (2026-11-06, content_marketplace_read_only): DLC read-only, with its own tree index.
   const bool marketplace = static_cast<uint32_t>(data.content_type.get()) == 2u;
   const bool read_only = marketplace && REXCVAR_GET(content_marketplace_read_only);
+  // me2-nx-deko (2026-11-07): a DLC package folder may hold just its asset pack, <name>/<name>.nxpack + .nxidx
+  // (tools/build_dlc_packs.py), the same format as the game's pack: 23 packages are then ~70 files on the SD card
+  // instead of ~1,400 (MTP uploads) and a mount reads one index instead of walking the folder.
+  if (read_only && rex::filesystem::PackDevice::Exists(package_path)) {
+    auto pack = std::make_unique<rex::filesystem::PackDevice>(device_path_, package_path);
+    if (pack->Initialize()) {
+      fs->RegisterDevice(std::move(pack));
+      fs->RegisterSymbolicLink(root_name_ + ":", device_path_);
+      return;
+    }
+    REXSYS_ERROR("[pack] DLC '{}': its pack could not be mounted, using the loose files of {}", data.file_name(),
+                 rex::path_to_utf8(package_path));
+  }
   auto device = std::make_unique<rex::filesystem::HostPathDevice>(device_path_, package_path, read_only,
                                                                   /*allow_share_delete=*/true);
   if (read_only) {

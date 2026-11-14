@@ -22,7 +22,54 @@
 #include <rex/system/user_module.h>
 #include <rex/system/xtypes.h>
 
+#include <ctime>
+
+#if defined(__SWITCH__)
+#include <switch.h>
+#endif
+
 namespace rex::kernel::xboxkrnl {
+
+namespace {
+// dunwall-nx (2026-11-10): the host's offset from UTC now, in minutes (east positive), daylight saving included.
+// The Switch: the console's time zone setting (libnx's time service; newlib's localtime knows no zone there).
+int32_t HostUtcOffsetMinutes() {
+#if defined(__SWITCH__)
+  u64 now = 0;
+  TimeCalendarTime calendar;
+  TimeCalendarAdditionalInfo info;
+  if (R_SUCCEEDED(timeGetCurrentTime(TimeType_Default, &now)) &&
+      R_SUCCEEDED(timeToCalendarTimeWithMyRule(now, &calendar, &info)))
+    return info.offset / 60;
+  return 0;
+#else
+  const std::time_t now = std::time(nullptr);
+  std::tm local{}, utc{};
+#if defined(_WIN32)
+  localtime_s(&local, &now);
+  gmtime_s(&utc, &now);
+#else
+  localtime_r(&now, &local);
+  gmtime_r(&now, &utc);
+#endif
+  int32_t days = local.tm_yday - utc.tm_yday;
+  if (local.tm_year != utc.tm_year) days = local.tm_year > utc.tm_year ? 1 : -1;
+  return days * 1440 + (local.tm_hour - utc.tm_hour) * 60 + (local.tm_min - utc.tm_min);
+#endif
+}
+
+// XCONFIG_USER_TIME_ZONE_BIAS as Windows' TIME_ZONE_INFORMATION.Bias: UTC = local time + bias (UTC+3: -180). The
+// standard / daylight dates stay 0 (no rule), so the guest's conversions use the bias alone: the host's offset now.
+int32_t GuestTimeZoneBias() {
+  static const int32_t bias = [] {
+    const int32_t b = -HostUtcOffsetMinutes();
+    REXKRNL_INFO("[time] time zone bias {} minutes (UTC{:+}:{:02}, the host's time zone)", b, -b / 60,
+                 (b < 0 ? -b : b) % 60);
+    return b;
+  }();
+  return bias;
+}
+}  // namespace
 
 X_STATUS xeExGetXConfigSetting(uint16_t category, uint16_t setting, void* buffer,
                                uint16_t buffer_size, uint16_t* required_size) {
@@ -49,6 +96,10 @@ X_STATUS xeExGetXConfigSetting(uint16_t category, uint16_t setting, void* buffer
       // XCONFIG_USER_CATEGORY
       switch (setting) {
         case 0x0001:  // XCONFIG_USER_TIME_ZONE_BIAS
+          // dunwall-nx (2026-11-10): the host's zone (it was 0: save times on the console 3 hours off in UTC+3).
+          setting_size = 4;
+          memory::store_and_swap<uint32_t>(value, uint32_t(GuestTimeZoneBias()));
+          break;
         case 0x0002:  // XCONFIG_USER_TIME_ZONE_STD_NAME
         case 0x0003:  // XCONFIG_USER_TIME_ZONE_DLT_NAME
         case 0x0004:  // XCONFIG_USER_TIME_ZONE_STD_DATE

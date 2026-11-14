@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <cstring>
 #include <atomic>
 #include <deque>
 #include <limits>
@@ -19,7 +20,9 @@
 
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
+#include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/logging.h>
 #include <rex/sys_counters.h>
 
 #if !defined(__SWITCH__)
@@ -38,6 +41,18 @@ std::deque<ExportEntry>& ExportEntries() {
   return entries;
 }
 }  // namespace
+
+std::atomic<bool> g_trace_exports{false};
+
+void TraceExport(const char* name, uint64_t n) {
+  // "__imp__" + the export's name.
+  const char* e = std::strncmp(name, "__imp__", 7) == 0 ? name + 7 : name;
+  static const char* const kPrefixes[] = {"Xam", "XNet", "XMsg", "XContent", "XUser", "XNotify", "XOnline"};
+  bool wanted = false;
+  for (const char* p : kPrefixes) wanted = wanted || std::strncmp(e, p, std::strlen(p)) == 0;
+  if (!wanted || (n > 40 && n % 1000 != 0)) return;
+  REXLOG_INFO("[xam-trace] {} #{}", e, n);
+}
 
 std::atomic<uint64_t>* ExportCounter(const char* name) {
   std::lock_guard<std::mutex> lock(g_export_mutex);
@@ -287,7 +302,27 @@ void Clock::set_guest_tick_frequency(uint64_t frequency) {
   RecomputeGuestTickScalar();
 }
 
+// ME2 backport from the Dunwall port (2026-11-10, console: every save dated 1970-01-01): guest_system_time_base_ is
+// taken by a static initialiser, before the Switch's time service is up, where gettimeofday gives 0: the guest's clock
+// started at 1970-01-01 plus the uptime. A base before 2000 is anchored again, once the host clock reads a real date, so
+// that the guest's time is the host's at that moment.
+namespace {
+constexpr uint64_t kFileTime2000 = 125911584000000000ull;  // 2000-01-01 as a FILETIME
+void FixSystemTimeBase() {
+  if (guest_system_time_base_ >= kFileTime2000) return;
+  const uint64_t host = Clock::QueryHostSystemTime();
+  if (host < kFileTime2000) return;  // still no clock
+  const uint64_t offset = QueryGuestSystemTimeOffset();
+  if (host <= offset) return;
+  guest_system_time_base_ = host - offset;
+  static std::atomic<bool> logged{false};
+  if (!logged.exchange(true))
+    REXLOG_INFO("[clock] guest system time anchored to the host clock (the base taken at start-up predated 2000)");
+}
+}  // namespace
+
 uint64_t Clock::guest_system_time_base() {
+  FixSystemTimeBase();
   return guest_system_time_base_;
 }
 
@@ -305,6 +340,7 @@ uint64_t Clock::QueryGuestSystemTime() {
     return Clock::QueryHostSystemTime();
   }
 
+  FixSystemTimeBase();
   auto guest_system_time_offset = QueryGuestSystemTimeOffset();
   return guest_system_time_base_ + guest_system_time_offset;
 }

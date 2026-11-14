@@ -126,6 +126,14 @@ struct FileInfo {
 bool GetInfo(const std::filesystem::path& path, FileInfo* out_info);
 std::vector<FileInfo> ListFiles(const std::filesystem::path& path);
 
+// dunwall-nx (2026-11-10): file times for a folder whose file system keeps none (the Switch's save data: stat gives
+// 0, which the games show as 1970-01-01). Under 'root', a file written through a FileHandle gets the time it was closed
+// (and its folders up to 'root' too), kept in 'store' (a file under 'root', hidden from listings); GetInfo and ListFiles
+// give these times where stat has none. POSIX only (no-ops elsewhere).
+void SetTimestampStore(const std::string& root, const std::string& store);
+// A renamed file or folder under the store's root keeps its time (host_path_entry.cpp).
+void RenameTimestamp(const std::filesystem::path& from, const std::filesystem::path& to);
+
 #if REX_PLATFORM_ANDROID
 void AndroidInitialize();
 void AndroidShutdown();

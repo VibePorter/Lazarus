@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <cctype>
+
 #include <rex/filesystem/vfs.h>
 #include <rex/logging.h>
 #include <rex/string.h>
@@ -21,6 +23,11 @@ REXCVAR_DEFINE_BOOL(allow_game_relative_writes, false, "Filesystem",
                     "generating test data to compare with original hardware.");
 
 namespace rex::filesystem {
+
+namespace {
+std::atomic<OpenObserver> g_open_observer{nullptr};
+}  // namespace
+void SetOpenObserver(OpenObserver observer) { g_open_observer.store(observer, std::memory_order_release); }
 
 VirtualFileSystem::VirtualFileSystem() {}
 
@@ -192,6 +199,45 @@ bool VirtualFileSystem::DeletePath(const std::string_view path) {
   return parent->Delete(entry);
 }
 
+void VirtualFileSystem::SetExtensionFallback(const std::string& from, const std::string& to) {
+  fallback_from_ = from;
+  fallback_to_ = to;
+  fallback_set_.store(!from.empty() && !to.empty(), std::memory_order_release);
+  REXFS_INFO("VFS: missing *.{} files open as *.{}", from, to);
+}
+
+void VirtualFileSystem::AddFileAlias(const std::string& from, const std::string& to) {
+  if (from.empty() || to.empty()) return;
+  std::string key = from;
+  for (char& c : key) c = char(std::tolower(static_cast<unsigned char>(c)));
+  aliases_.emplace_back(std::move(key), to);
+  aliases_set_.store(true, std::memory_order_release);
+  REXFS_INFO("VFS: {} opens as {}", from, to);
+}
+
+std::string VirtualFileSystem::AliasName(const std::string_view file_name) const {
+  for (const auto& [from, to] : aliases_) {
+    if (from.size() != file_name.size()) continue;
+    bool same = true;
+    for (size_t i = 0; i < from.size() && same; ++i)
+      same = std::tolower(static_cast<unsigned char>(file_name[i])) == static_cast<unsigned char>(from[i]);
+    if (same) return to;
+  }
+  return {};
+}
+
+std::string VirtualFileSystem::FallbackName(const std::string_view file_name) const {
+  const size_t dot = file_name.rfind('.');
+  if (dot == std::string_view::npos || file_name.size() - dot - 1 != fallback_from_.size()) return {};
+  for (size_t i = 0; i < fallback_from_.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(file_name[dot + 1 + i])) !=
+        std::tolower(static_cast<unsigned char>(fallback_from_[i]))) {
+      return {};
+    }
+  }
+  return std::string(file_name.substr(0, dot + 1)) + fallback_to_;
+}
+
 X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view path,
                                      FileDisposition creation_disposition, uint32_t desired_access,
                                      bool is_directory, bool is_non_directory, File** out_file,
@@ -224,7 +270,25 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
     }
 
     auto file_name = rex::string::utf8_find_name_from_guest_path(path);
-    entry = parent_entry->GetChild(file_name);
+    entry = nullptr;
+    // Dunwall (2026-11-09, AddFileAlias): a read of an aliased name opens its replacement when that exists.
+    if (aliases_set_.load(std::memory_order_acquire) &&
+        !(desired_access & (FileAccess::kFileWriteData | FileAccess::kFileAppendData)) &&
+        (creation_disposition == FileDisposition::kOpen || creation_disposition == FileDisposition::kOpenIf)) {
+      const std::string alias = AliasName(file_name);
+      if (!alias.empty() && (entry = parent_entry->GetChild(alias)) != nullptr) {
+        REXFS_DEBUG("VFS: '{}' opens '{}' (alias)", path, alias);
+      }
+    }
+    if (!entry) entry = parent_entry->GetChild(file_name);
+    if (!entry && fallback_set_.load(std::memory_order_acquire) &&
+        !(desired_access & (FileAccess::kFileWriteData | FileAccess::kFileAppendData)) &&
+        (creation_disposition == FileDisposition::kOpen || creation_disposition == FileDisposition::kOpenIf)) {
+      const std::string fallback = FallbackName(file_name);
+      if (!fallback.empty() && (entry = parent_entry->GetChild(fallback)) != nullptr) {
+        REXFS_DEBUG("VFS: '{}' does not exist, opening '{}'", path, fallback);
+      }
+    }
   } else {
     entry = !root_entry ? ResolvePath(path) : root_entry->GetChild(path);
   }
@@ -233,6 +297,8 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
     if (entry->attributes() & kFileAttributeDirectory && is_non_directory) {
       return X_STATUS_FILE_IS_A_DIRECTORY;
     }
+    if (const OpenObserver observer = g_open_observer.load(std::memory_order_acquire))
+      observer(rex::string::utf8_find_name_from_guest_path(path));
 
     /*
      * If the cached entry does not exist on host anymore, invalidate it.

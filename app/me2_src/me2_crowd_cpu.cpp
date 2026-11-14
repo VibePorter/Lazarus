@@ -13,8 +13,19 @@
 //   me2_dle_visible_every = N (2..8): each component's Tick runs only every N-th time it is called, with N times the
 //   delta time (so blends such as BlendTime keep their speed); the components are spread over the frames by address,
 //   and a component's first Tick runs at once. Character lighting reacts up to N-1 frames late (N = 2: one frame,
-//   33 ms at 30 fps). ME2 sets the force-full-update flag from script only (no native writer found), so it is not
-//   honoured here; with N = 2 a forced update is at most one frame late. 0/1 = every frame.
+//   33 ms at 30 fps). 0/1 = every frame.
+//
+// CUTSCENES (2026-11-12, user: in cutscenes the characters' lighting and shadows lagged behind; everywhere else the
+//   throttle is fine). Characters barely move in a cutscene while the cameras cut and the cinematic lights change, so
+//   the "moved" exception below never fired and they were lit at 15 Hz, a frame late. Two exceptions, found in TU2:
+//   - ResetInterpolation (script native UBioDynamicLightEnvironmentComponent::execResetInterpolation sub_824099E8 ->
+//     vtable slot 97 sub_82732B78) sets the state's (+100) word +728 to 1: "update without blending now". A component
+//     with it set runs at once (the update clears it).
+//   - Light environment quality: Matinee's USFXInterpTrackLightEnvQuality and Kismet's UBioSeqAct_SetLightEnvQuality
+//     call SetQuality (execSetQuality sub_82409A68 -> slot 98 sub_82732E30, a byte at +196 of the Bio component, 320
+//     bytes). Cutscenes give the characters in the shot another quality than the game's default; a Bio component whose
+//     quality is not the most common one at first ticks (the crowd's and squad's default) runs every frame.
+//   me2_dle_cutscene_every_frame = false turns both off.
 
 #include <rex/cvar.h>
 #include <rex/hook.h>
@@ -25,6 +36,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <unordered_map>
 
 REXCVAR_DEFINE_INT32(me2_dle_visible_every, 2, "ME2",
@@ -40,6 +52,10 @@ REXCVAR_DEFINE_INT32(me2_dle_visible_every, 2, "ME2",
 // has its bounds at +204, kept current by UE3 as the actor moves). A component whose primitive's bounds origin is more
 // than this many units from the state's runs at once (a walk is ~7-13 units a frame at 30 fps; a standing character's
 // idle animation moves its bounds a little).
+REXCVAR_DEFINE_BOOL(me2_dle_cutscene_every_frame, true, "ME2",
+                    "me2_dle_visible_every: cutscene characters (a light environment quality other than the default, "
+                    "or a ResetInterpolation from script) are updated every frame")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_DOUBLE(me2_dle_moving_units, 3.0, "ME2",
                       "me2_dle_visible_every: a character whose bounds moved more than this many units since its last "
                       "light environment update is updated at once (0 = no exception)")
@@ -96,6 +112,20 @@ int Every() {
 }
 
 uint64_t g_moving = 0;  // updates run early because the character moved (10 s count)
+uint64_t g_reset = 0, g_cinematic = 0;  // run early: ResetInterpolation asked / a cutscene quality (10 s counts)
+uint64_t g_quality_first[256] = {};     // Bio components' quality at their first tick (the default is the most common)
+uint64_t g_quality_seen[256] = {};      // Bio ticks by quality (10 s)
+
+bool CutsceneOn() {
+  static const bool on = REXCVAR_GET(me2_dle_cutscene_every_frame);
+  return on;
+}
+uint8_t g_default_quality = 0;  // the most common g_quality_first (NoteFirstQuality keeps it)
+void NoteFirstQuality(uint8_t quality) {
+  ++g_quality_first[quality];
+  if (g_quality_first[quality] > g_quality_first[g_default_quality]) g_default_quality = quality;
+}
+uint8_t DefaultQuality() { return g_default_quality; }
 
 uint32_t Load32(const uint8_t* base, uint32_t va) { return __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + va)); }
 float LoadF(const uint8_t* base, uint32_t va) {
@@ -127,10 +157,22 @@ bool Moved(const uint8_t* base, uint32_t component) {
 }
 
 // true: run the original now (with ctx.f1 scaled); false: skip this frame.
-bool Throttle(PPCContext& ctx, const uint8_t* base) {
+bool Throttle(PPCContext& ctx, const uint8_t* base, bool bio) {
   const int every = Every();
   if (every <= 1) return true;
   const uint32_t component = ctx.r3.u32;
+  // Cutscenes (see the header): the state's ResetInterpolation word, the Bio component's quality.
+  bool reset = false, cinematic = false;
+  if (CutsceneOn()) {
+    const uint32_t state = Load32(base, component + 100);
+    reset = GuestPointer(state) && Load32(base, state + 728) != 0;
+    if (bio) {
+      const uint8_t quality = base[component + 196];
+      ++g_quality_seen[quality];
+      if (!g_counters.count(component)) NoteFirstQuality(quality);
+      cinematic = quality != DefaultQuality();
+    }
+  }
   if (g_counters.size() > 8192) g_counters.clear();  // components come and go with levels
   auto [it, fresh] = g_counters.try_emplace(component);
   Slot& slot = it->second;
@@ -146,6 +188,13 @@ bool Throttle(PPCContext& ctx, const uint8_t* base) {
       ctx.f1.f64 = ctx.f1.f64 * double(slot.frames);  // the time since this component's last update
       slot.frames = 0;
       run = true;
+    } else if (reset || cinematic) {
+      // A cutscene character: now, every frame.
+      ctx.f1.f64 = ctx.f1.f64 * double(slot.frames);
+      slot.frames = 0;
+      slot.countdown = uint32_t(every);
+      ++(reset ? g_reset : g_cinematic);
+      run = true;
     } else if (Moved(base, component)) {
       // A moving character: now, and its turn starts over from here.
       ctx.f1.f64 = ctx.f1.f64 * double(slot.frames);
@@ -160,9 +209,16 @@ bool Throttle(PPCContext& ctx, const uint8_t* base) {
   if (run) ++g_ran; else ++g_skipped;
   const auto now = std::chrono::steady_clock::now();
   if (now - g_last >= std::chrono::seconds(10)) {
-    REXLOG_INFO("[crowd] 10 s: light environment ticks {} run ({} of them early: the character moved), {} skipped "
-                "(every {}), {} components", g_ran, g_moving, g_skipped, every, g_counters.size());
-    g_ran = g_skipped = g_moving = 0;
+    std::string qualities;
+    for (uint32_t q = 0; q < 256; ++q)
+      if (g_quality_seen[q]) qualities += fmt::format(" {}:{}", q, g_quality_seen[q]);
+    REXLOG_INFO("[crowd] 10 s: light environment ticks {} run ({} of them early: the character moved; cutscene: {} "
+                "ResetInterpolation, {} cinematic quality), {} skipped (every {}), {} components; Bio ticks by "
+                "quality (default {}):{}",
+                g_ran, g_moving, g_reset, g_cinematic, g_skipped, every, g_counters.size(), DefaultQuality(),
+                qualities.empty() ? std::string(" none") : qualities);
+    g_ran = g_skipped = g_moving = g_reset = g_cinematic = 0;
+    std::memset(g_quality_seen, 0, sizeof(g_quality_seen));
     g_last = now;
   }
   return run;
@@ -171,9 +227,9 @@ bool Throttle(PPCContext& ctx, const uint8_t* base) {
 }  // namespace
 
 REX_HOOK_RAW(sub_822F3538) {
-  if (Throttle(ctx, base)) __imp__sub_822F3538(ctx, base);
+  if (Throttle(ctx, base, false)) __imp__sub_822F3538(ctx, base);
 }
 
 REX_HOOK_RAW(sub_82732B90) {
-  if (Throttle(ctx, base)) __imp__sub_82732B90(ctx, base);
+  if (Throttle(ctx, base, true)) __imp__sub_82732B90(ctx, base);
 }

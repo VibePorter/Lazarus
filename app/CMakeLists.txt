@@ -194,6 +194,7 @@ if(MGR_RENUT_RENDERER)
             me2_src/me2_vsm_light.cpp  # me2-nx-deko (2026-11-07): shadowed point light's uninitialised VSM matrix
             me2_src/me2_relink.cpp
             me2_src/me2_crowd_cpu.cpp
+            me2_src/me2_constant_blocks.cpp
             me2_src/me2_anim_lod.cpp
             me2_src/me2_cerberus.cpp
             me2_src/me2_button_icons.cpp
@@ -203,7 +204,9 @@ if(MGR_RENUT_RENDERER)
             me2_src/me2_disc.cpp
             me2_src/me2_sound_diag.cpp
             me2_src/me2_startup_movies.cpp
+            me2_src/me2_audio_gate.cpp  # me2-nx-deko (2026-11-07): hold the mixer pass while Wwise's voice is empty
             me2_src/me2_me1_import.cpp
+            me2_src/me2_me1_le1.cpp  # ME2 (2026-11-14): ME1 Legendary Edition saves for the import
             me2_src/me2_selection.cpp
             me2_src/hot/me_hot_guest.cpp
             me2_src/hot/me_hot_shadow.cpp

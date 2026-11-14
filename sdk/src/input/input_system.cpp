@@ -31,6 +31,30 @@
 #include <rex/input/state_merge.h>
 #include <rex/input/xinput/xinput_input_driver.h>
 #include <rex/logging.h>
+#include <rex/filesystem/vfs.h>
+#include <cctype>
+#include <string>
+#include <vector>
+#include <cstdlib>
+
+// Dunwall (2026-11-12, unattended PC smoke tests): "seconds:buttons;..." (e.g. "30:start;36:a;40:a,start"):
+// each step presses its buttons (a b x y start back up down left right lb rb, comma separated) for 200 ms at that many
+// seconds after the first controller read, on top of the real controller (one is supplied if none is connected).
+REXCVAR_DEFINE_STRING(input_script, "", "Input",
+                      "Scripted button presses for unattended runs: \"seconds:buttons;...\" (a,b,x,y,start,back,"
+                      "up,down,left,right,lb,rb), each held 200 ms");
+
+REXCVAR_DEFINE_BOOL(input_hold_until_dlc_ready, false, "Input",
+                    "Pad buttons and triggers read as released until the game has opened the downloadable content its "
+                    "scan found (Dunwall's main menu said 'Required content unavailable' before that)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_STRING(input_hold_trigger_file, "", "Input",
+                      "input_hold_until_dlc_ready: the hold begins when the game opens a file of this name (no folder; "
+                      "Dunwall: its main menu's notice movie); empty = no hold")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(input_hold_max_s, 20, "Input", "input_hold_until_dlc_ready: release after this many seconds at most")
+    .range(5, 600)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 #if REX_PLATFORM_SWITCH
 REXCVAR_DEFINE_STRING(input_backend, "switch", "Input", "Input backend: switch")
@@ -265,6 +289,129 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
 namespace { std::atomic<ReadHook> g_read_hook{nullptr}; }
 void SetReadHook(ReadHook hook) { g_read_hook.store(hook, std::memory_order_release); }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Dunwall (2026-11-09, input_hold_until_dlc_ready). Dunwall's front end reads its downloadable content and saves
+// ~8 s after the main menu is up and usable (its script's own order: the XAM trace shows the game asking nothing
+// meanwhile); a Continue in that time says "Required content unavailable. Please ensure all storage devices are
+// properly connected or re-download content" and the menu is rebuilt once the DLC is mounted. With the option on, the
+// pad's buttons and triggers read as released from the moment the game opens input_hold_trigger_file (Dunwall:
+// the notice it opens as the main menu comes up, after the title screen's "Press Start") until it has scanned its DLC
+// and opened every package the scan found, plus 2 s (the menu's rebuild); at once when the scan finds none; at the
+// latest after input_hold_max_s. Sticks stay live. Once a run (the first time the file opens).
+// ---------------------------------------------------------------------------------------------------------------------
+namespace {
+std::atomic<int32_t> g_dlc_found{-1};   // the last scan's DLC count (-1: no scan since the hold began)
+std::atomic<int32_t> g_dlc_opened{0};   // DLC packages opened since that scan
+std::atomic<int64_t> g_dlc_ready_ms{0}; // when the last one opened (steady clock, ms)
+std::atomic<int64_t> g_hold_start_ms{0};  // 0: not holding (yet)
+std::atomic<bool> g_hold_done{false};
+
+int64_t SteadyMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+void HoldTriggerOpened(std::string_view file_name) {
+  static const std::string trigger = REXCVAR_GET(input_hold_trigger_file);
+  if (trigger.empty() || file_name.size() != trigger.size() || g_hold_done.load(std::memory_order_relaxed)) return;
+  for (size_t i = 0; i < trigger.size(); ++i)
+    if (std::tolower(static_cast<unsigned char>(file_name[i])) != std::tolower(static_cast<unsigned char>(trigger[i])))
+      return;
+  int64_t expected = 0;
+  if (g_hold_start_ms.compare_exchange_strong(expected, SteadyMs())) {
+    g_dlc_found.store(-1, std::memory_order_relaxed);
+    g_dlc_opened.store(0, std::memory_order_relaxed);
+    REXLOG_INFO("[input] {} opened: buttons held until the game's DLC is in (input_hold_until_dlc_ready)", trigger);
+  }
+}
+
+[[maybe_unused]] const bool g_hold_observer_set = [] {
+  rex::filesystem::SetOpenObserver(HoldTriggerOpened);
+  return true;
+}();
+
+bool HoldButtons() {
+  const int64_t start = g_hold_start_ms.load(std::memory_order_relaxed);
+  if (!start || g_hold_done.load(std::memory_order_relaxed)) return false;
+  static const bool on = REXCVAR_GET(input_hold_until_dlc_ready);
+  const int64_t now = SteadyMs();
+  const int32_t found = g_dlc_found.load(std::memory_order_acquire);
+  const char* why = nullptr;
+  if (!on) {
+    why = "off";
+  } else if (now - start >= int64_t(REXCVAR_GET(input_hold_max_s)) * 1000) {
+    why = "time limit";
+  } else if (found >= 0 && g_dlc_opened.load(std::memory_order_acquire) >= found &&
+             now - std::max(g_dlc_ready_ms.load(std::memory_order_relaxed), int64_t(0)) >= 2000) {
+    why = found ? "the game opened the DLC its scan found" : "the game's scan found no DLC";
+  }
+  if (!why) return true;
+  if (!g_hold_done.exchange(true, std::memory_order_relaxed) && on)
+    REXLOG_INFO("[input] buttons released after {:.1f} s: {} ({} found, {} opened; input_hold_until_dlc_ready)",
+                double(now - start) / 1000.0, why, found, g_dlc_opened.load());
+  return false;
+}
+}  // namespace
+
+void NoteGameDlcEnumerated(uint32_t count) {
+  g_dlc_opened.store(0, std::memory_order_relaxed);
+  g_dlc_ready_ms.store(SteadyMs(), std::memory_order_relaxed);
+  g_dlc_found.store(int32_t(count), std::memory_order_release);
+}
+
+void NoteGameDlcOpened() {
+  g_dlc_ready_ms.store(SteadyMs(), std::memory_order_relaxed);
+  g_dlc_opened.fetch_add(1, std::memory_order_acq_rel);
+}
+
+namespace {
+// input_script: the buttons to press now (0 when none, or the script is empty).
+uint16_t ScriptedButtons() {
+  struct Step {
+    uint64_t at_ms;
+    uint16_t buttons;
+  };
+  static const std::vector<Step> steps = [] {
+    std::vector<Step> out;
+    const std::string script = REXCVAR_GET(input_script);
+    size_t at = 0;
+    while (at < script.size()) {
+      size_t end = script.find(';', at);
+      if (end == std::string::npos) end = script.size();
+      const std::string item = script.substr(at, end - at);
+      at = end + 1;
+      const size_t colon = item.find(':');
+      if (colon == std::string::npos) continue;
+      Step step{uint64_t(std::atof(item.substr(0, colon).c_str()) * 1000.0), 0};
+      std::string names = item.substr(colon + 1);
+      size_t n = 0;
+      while (n < names.size()) {
+        size_t e = names.find(',', n);
+        if (e == std::string::npos) e = names.size();
+        const std::string name = names.substr(n, e - n);
+        n = e + 1;
+        static const std::pair<const char*, uint16_t> kNames[] = {
+            {"a", X_INPUT_GAMEPAD_A}, {"b", 0x2000}, {"x", 0x4000}, {"y", 0x8000}, {"start", X_INPUT_GAMEPAD_START},
+            {"back", 0x0020}, {"up", 0x0001}, {"down", 0x0002}, {"left", 0x0004}, {"right", 0x0008},
+            {"lb", 0x0100}, {"rb", 0x0200}};
+        for (const auto& [k, v] : kNames)
+          if (name == k) step.buttons |= v;
+      }
+      if (step.buttons) out.push_back(step);
+    }
+    if (!out.empty()) REXLOG_INFO("[input-script] {} scripted presses", out.size());
+    return out;
+  }();
+  if (steps.empty()) return 0;
+  static const uint64_t start = SteadyMs();
+  const uint64_t now = SteadyMs() - start;
+  uint16_t buttons = 0;
+  for (const Step& step : steps)
+    if (now >= step.at_ms && now < step.at_ms + 200) buttons |= step.buttons;
+  return buttons;
+}
+}  // namespace
+
 X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   std::lock_guard lock(mutex_);
   if (const ReadHook hook = g_read_hook.load(std::memory_order_acquire)) hook();
@@ -297,6 +444,13 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
     }
   }
 
+  // input_script: on top of the real controller (a pad of its own for user 0 when none is connected).
+  const uint16_t scripted = user_index == 0 ? ScriptedButtons() : 0;
+  if (!any && user_index == 0 && !REXCVAR_GET(input_script).empty()) {
+    merged = {};
+    any = true;
+  }
+  if (scripted) merged.gamepad.buttons = uint16_t(uint16_t(merged.gamepad.buttons) | scripted);
   if (!any) {
     if (user_index < kMaxGuestUsers)
       state_seen_[user_index] = false;
@@ -313,6 +467,11 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
       ++state_packets_[user_index];
     }
     merged.packet_number = state_packets_[user_index];
+  }
+  if (HoldButtons()) {  // input_hold_until_dlc_ready (above): the game only sees the sticks yet
+    merged.gamepad.buttons = 0;
+    merged.gamepad.left_trigger = 0;
+    merged.gamepad.right_trigger = 0;
   }
   if (out_state) {
     *out_state = merged;

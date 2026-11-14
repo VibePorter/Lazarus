@@ -124,14 +124,17 @@ def compute_ud(lines):
                 break
             covered |= bits
             j += 1
+            if covered == 0xFFFF:
+                break
         if ok and covered == 0xFFFF:
             b = 1 << IDX[reg]
             for t in range(i, j):
                 u, d = ud[t]
                 ud[t] = (u & ~b, d | b)
-            i = j
-        else:
-            i += 1
+        # Dunwall (2026-11-09): the next line, not j: a run of another register's element writes can sit inside the
+        # range scanned for this one (vlogefp128 v55 then vlogefp128 v54, sub_82B5D500); jumping to j skipped it, and
+        # its four writes counted as partial ones (reads): a false ENTRY up the whole Wwise call chain.
+        i += 1
     return ud
 
 

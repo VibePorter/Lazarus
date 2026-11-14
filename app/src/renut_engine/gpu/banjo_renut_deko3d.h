@@ -53,4 +53,8 @@ void SaveShaderCache();
 // One line for the renderer's report: compiles, cache hits, memory.
 std::string Report();
 
+// Dunwall (2026-11-12): the DKSH cache's reads since the last call (count, time reading, time waiting for its lock,
+// the slowest), for the pipelines' 10 s report.
+std::string DkshReadReport();
+
 }  // namespace banjo::renut_gpu::deko3d

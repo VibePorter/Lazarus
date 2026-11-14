@@ -214,6 +214,9 @@ std::unique_ptr<FileHandle> FileHandle::OpenExisting(const std::filesystem::path
 
 #define COMBINE_TIME(t) (((uint64_t)t.dwHighDateTime << 32) | t.dwLowDateTime)
 
+void SetTimestampStore(const std::string&, const std::string&) {}  // NTFS keeps file times
+void RenameTimestamp(const std::filesystem::path&, const std::filesystem::path&) {}
+
 bool GetInfo(const std::filesystem::path& path, FileInfo* out_info) {
   *out_info = FileInfo{};
   WIN32_FILE_ATTRIBUTE_DATA data = {};

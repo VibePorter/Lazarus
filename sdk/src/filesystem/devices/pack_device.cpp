@@ -30,6 +30,12 @@ namespace rex::filesystem {
 namespace {
 
 constexpr uint32_t kPackVersion = 2;
+// me2-nx-deko (2026-11-07): version 3 = the same logical pack split into parts for FAT32 SD cards (one file must stay
+// under 4 GB, and an MTP upload pays per file): PackHeader.reserved = part size in MB; <folder>.nxpack holds logical
+// bytes [0, part), <folder>.nxpack.1 [part, 2 part), ... (tools/build_asset_pack.py --split-mb). Offsets in the index
+// stay logical; a read crossing a part boundary is split by PackStorageParts.
+constexpr uint32_t kPackVersionSplit = 3;
+constexpr uint32_t kMaxParts = 64;
 constexpr uint32_t kMaxEntries = 100000;
 constexpr uint64_t kMaxPathsSize = 64ull << 20;
 constexpr size_t kCacheSize = 64 * 1024;       // asset_pack.c PACK_CACHE_SIZE
@@ -120,18 +126,52 @@ class PackStorageFile final : public PackStorage {
   std::mutex mutex_;
 };
 
+// Version 3: logical bytes spread over several part files of part_size bytes each (the last one shorter).
+class PackStorageParts final : public PackStorage {
+ public:
+  PackStorageParts(std::vector<std::unique_ptr<PackStorage>> parts, uint64_t part_size)
+      : parts_(std::move(parts)), part_size_(part_size) {}
+  bool ReadAt(uint64_t offset, void* buffer, size_t size) override {
+    auto* out = static_cast<uint8_t*>(buffer);
+    while (size) {
+      const uint64_t part = offset / part_size_;
+      if (part >= parts_.size()) return false;
+      const uint64_t local = offset - part * part_size_;
+      const size_t piece = size_t(std::min<uint64_t>(size, part_size_ - local));
+      if (!parts_[size_t(part)]->ReadAt(local, out, piece)) return false;
+      out += piece;
+      offset += piece;
+      size -= piece;
+    }
+    return true;
+  }
+
+ private:
+  std::vector<std::unique_ptr<PackStorage>> parts_;
+  uint64_t part_size_;
+};
+
 struct LoadedIndex {
   IndexHeader header{};
   std::vector<DiskEntry> entries;
   std::vector<char> paths;
+  std::vector<std::filesystem::path> parts;  // the pack's files, part 0 first (one for version 2)
+  uint64_t part_size = 0;                    // version 3 only
 };
+
+std::filesystem::path PartPath(const std::filesystem::path& pack_path, uint32_t part) {
+  if (!part) return pack_path;
+  auto path = pack_path;
+  path += "." + std::to_string(part);
+  return path;
+}
 
 // asset_pack.c load_pair: the pack header and the index must come from one run of the packer, the index checksum
 // must match, and every entry must be in bounds, valid and in strictly increasing path order.
 bool LoadIndex(const std::filesystem::path& pack_path, const std::filesystem::path& index_path, LoadedIndex* out,
                std::string* error) {
   std::error_code ec;
-  const uint64_t pack_size = std::filesystem::file_size(pack_path, ec);
+  const uint64_t first_size = std::filesystem::file_size(pack_path, ec);
   if (ec) return *error = "no asset pack", false;
   const uint64_t index_size = std::filesystem::file_size(index_path, ec);
   if (ec) return *error = "no asset index", false;
@@ -140,11 +180,38 @@ bool LoadIndex(const std::filesystem::path& pack_path, const std::filesystem::pa
   if (!f) return *error = "the asset pack cannot be opened", false;
   const bool pack_read = std::fread(&pack, sizeof(pack), 1, f) == 1;
   std::fclose(f);
+  // The logical size: the one file, or (version 3) every part, each but the last exactly the part size.
+  uint64_t pack_size = first_size;
+  out->parts.assign(1, pack_path);
+  if (pack_read && pack.version == kPackVersionSplit) {
+    const uint64_t part_size = uint64_t(pack.reserved) << 20;
+    if (!part_size || part_size >= (4ull << 30) || !pack.file_size) {
+      return *error = "the split asset pack header is invalid", false;
+    }
+    const uint64_t count = (pack.file_size + part_size - 1) / part_size;
+    if (count > kMaxParts) return *error = "the split asset pack has too many parts", false;
+    pack_size = 0;
+    out->parts.clear();
+    for (uint32_t i = 0; i < count; ++i) {
+      const auto path = PartPath(pack_path, i);
+      const uint64_t size = std::filesystem::file_size(path, ec);
+      const uint64_t expected = i + 1 < count ? part_size : pack.file_size - part_size * (count - 1);
+      if (ec) return *error = "part " + std::to_string(i) + " of the asset pack is missing", false;
+      if (size != expected) {
+        return *error = "part " + std::to_string(i) + " of the asset pack has the wrong size (" +
+                        std::to_string(size) + " bytes, expected " + std::to_string(expected) + ")", false;
+      }
+      out->parts.push_back(path);
+      pack_size += size;
+    }
+    out->part_size = part_size;
+  }
   f = rex::filesystem::OpenFile(index_path, "rb");
   if (!f) return *error = "the asset index cannot be opened", false;
   IndexHeader& h = out->header;
   bool ok = pack_read && std::fread(&h, sizeof(h), 1, f) == 1 && !std::memcmp(pack.magic, "SSNXPAK1", 8) &&
-            !std::memcmp(h.magic, "SSNXIDX1", 8) && pack.version == kPackVersion && h.version == kPackVersion &&
+            !std::memcmp(h.magic, "SSNXIDX1", 8) &&
+            (pack.version == kPackVersion || pack.version == kPackVersionSplit) && h.version == pack.version &&
             pack.pack_id == h.pack_id && pack.file_size == pack_size && pack.data_checksum == h.data_checksum &&
             h.pack_size == pack_size && h.count && h.count <= kMaxEntries && h.paths_size &&
             h.paths_size <= kMaxPathsSize;
@@ -206,15 +273,19 @@ X_STATUS PackEntry::Open(uint32_t desired_access, File** out_file) {
   return X_STATUS_SUCCESS;
 }
 
-PackFile::PackFile(uint32_t file_access, PackEntry* entry) : File(file_access, entry), pack_entry_(entry) {}
+// host_path_file.cpp's exact-range cache (sa2_io_ranges_mb), shared with the host folder's files.
+uint32_t RangeCacheFileId(const std::string& path);
+
+PackFile::PackFile(uint32_t file_access, PackEntry* entry) : File(file_access, entry), pack_entry_(entry) {
+  if (!(entry->attributes() & kFileAttributeDirectory)) {
+    cache_id_ = RangeCacheFileId(entry->pack()->cache_prefix() + entry->path());
+  }
+}
 PackFile::~PackFile() = default;
 
 void PackFile::Destroy() {
   delete this;
 }
-
-// host_path_file.cpp's exact-range cache (sa2_io_ranges_mb), shared with the host folder's files.
-uint32_t RangeCacheFileId(const std::string& path);
 bool RangeCacheEligible(size_t request);
 bool RangeCacheLookup(uint32_t id, uint64_t offset, uint8_t* out, size_t request, size_t* out_bytes);
 void RangeCacheStore(uint32_t id, uint64_t offset, uint32_t request, const uint8_t* data, size_t bytes);
@@ -226,12 +297,11 @@ X_STATUS PackFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset, size_
       byte_offset >= pack_entry_->size()) {
     return ReadSyncPack(buffer, byte_offset, out_bytes_read);
   }
-  if (!readahead_id_) readahead_id_ = RangeCacheFileId("pack:" + pack_entry_->path());
   readahead::Source source;
-  source.storage = pack_entry_->pack()->storage();
+  source.storage = pack_entry_->pack()->shared_storage();
   source.base = pack_entry_->data_offset();
   source.size = pack_entry_->size();
-  const size_t head = readahead::Take(readahead_id_, byte_offset, buffer.data(), buffer.size());
+  const size_t head = readahead::Take(cache_id_, byte_offset, buffer.data(), buffer.size());
   size_t rest = 0;
   X_STATUS state = X_STATUS_SUCCESS;
   if (head < buffer.size() && byte_offset + head < pack_entry_->size()) {
@@ -248,7 +318,7 @@ X_STATUS PackFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset, size_
     readahead::ReportVerify(source.storage->ReadAt(source.base + byte_offset, check.data(), head) &&
                             std::memcmp(check.data(), buffer.data(), head) == 0);
   }
-  readahead::Note(readahead_id_, byte_offset, *out_bytes_read, source);
+  readahead::Note(cache_id_, byte_offset, *out_bytes_read, source);
   return state;
 }
 
@@ -266,17 +336,11 @@ X_STATUS PackFile::ReadSyncPack(std::span<uint8_t> buffer, size_t byte_offset, s
   const uint64_t base = pack_entry_->data_offset();
   if (n > kCacheSize / 2) {
     // me2-nx-deko (2026-11-01): exact repeats come from RAM (UE3's texture streaming rereads 128 KB blocks). The id is
-    // per pack entry ("pack:" + its path, never the same as a host file's).
+    // per pack entry (cache_id_: "pack:<pack file>|" + its path, never the same as a host file's).
     const bool eligible = RangeCacheEligible(n);
     uint32_t id = 0;
     if (eligible) {
-      static thread_local const PackEntry* last_entry = nullptr;
-      static thread_local uint32_t last_id = 0;
-      if (last_entry != pack_entry_) {
-        last_entry = pack_entry_;
-        last_id = RangeCacheFileId("pack:" + pack_entry_->path());
-      }
-      id = last_id;
+      id = cache_id_;
       size_t got = 0;
       if (id && RangeCacheLookup(id, byte_offset, buffer.data(), n, &got)) {
         *out_bytes_read = got;
@@ -312,15 +376,35 @@ PackDevice::PackDevice(const std::string_view mount_path, const std::filesystem:
     : Device(mount_path), folder_(folder) {}
 PackDevice::~PackDevice() = default;
 
-std::filesystem::path PackDevice::PackPath(const std::filesystem::path& folder) {
+// me2-nx-deko (2026-11-07): the pack may also live INSIDE the data folder, named after it (game/game.nxpack,
+// game/game.nxpack.1 ..., game/game.nxidx), so an SD card's game/ folder can hold just the pack files. That place
+// wins when both of its files are there; otherwise <folder>.nxpack/.nxidx next to the folder (the console builder
+// writes there).
+namespace {
+std::filesystem::path InsidePath(const std::filesystem::path& folder, const char* extension) {
+  auto name = folder.filename();
+  if (name.empty()) name = folder.parent_path().filename();  // "game/" with a trailing separator
+  name += extension;
+  return folder / name;
+}
+std::filesystem::path BesidePath(const std::filesystem::path& folder, const char* extension) {
   auto path = folder;
-  path += ".nxpack";
+  if (!path.has_filename()) path = path.parent_path();
+  path += extension;
   return path;
 }
+bool InsideExists(const std::filesystem::path& folder) {
+  std::error_code ec;
+  return std::filesystem::is_regular_file(InsidePath(folder, ".nxpack"), ec) &&
+         std::filesystem::is_regular_file(InsidePath(folder, ".nxidx"), ec);
+}
+}  // namespace
+
+std::filesystem::path PackDevice::PackPath(const std::filesystem::path& folder) {
+  return InsideExists(folder) ? InsidePath(folder, ".nxpack") : BesidePath(folder, ".nxpack");
+}
 std::filesystem::path PackDevice::IndexPath(const std::filesystem::path& folder) {
-  auto path = folder;
-  path += ".nxidx";
-  return path;
+  return InsideExists(folder) ? InsidePath(folder, ".nxidx") : BesidePath(folder, ".nxidx");
 }
 bool PackDevice::Exists(const std::filesystem::path& folder) {
   std::error_code ec;
@@ -336,11 +420,25 @@ bool PackDevice::Initialize() {
     REXFS_ERROR("[pack] {}: {}", rex::path_to_utf8(PackPath(folder_)), error);
     return false;
   }
-  storage_ = PackStorage::Open(PackPath(folder_));
-  if (!storage_) {
-    REXFS_ERROR("[pack] cannot open {}", rex::path_to_utf8(PackPath(folder_)));
-    return false;
+  if (index.parts.size() == 1) {
+    storage_ = PackStorage::Open(PackPath(folder_));
+    if (!storage_) {
+      REXFS_ERROR("[pack] cannot open {}", rex::path_to_utf8(PackPath(folder_)));
+      return false;
+    }
+  } else {
+    std::vector<std::unique_ptr<PackStorage>> parts;
+    for (const auto& path : index.parts) {
+      parts.push_back(PackStorage::Open(path));
+      if (!parts.back()) {
+        REXFS_ERROR("[pack] cannot open {}", rex::path_to_utf8(path));
+        return false;
+      }
+    }
+    storage_ = std::make_unique<PackStorageParts>(std::move(parts), index.part_size);
+    REXFS_INFO("[pack] split pack: {} parts of {} MB", index.parts.size(), index.part_size >> 20);
   }
+  cache_prefix_ = "pack:" + rex::path_to_utf8(PackPath(folder_)) + "|";
   // Every entry gets the pack's own timestamps (the format keeps none per file).
   rex::filesystem::FileInfo info{};
   rex::filesystem::GetInfo(PackPath(folder_), &info);
@@ -419,6 +517,11 @@ bool PackDevice::Build(const std::filesystem::path& folder, std::string* error,
     if (ec || !ValidRelative(item.path.c_str(), item.path.size())) {
       return *error = "the game folder cannot be enumerated (" + item.path + ")", false;
     }
+    // A pack kept inside the folder (game/game.nxpack, .nxpack.N, .nxidx, and their .tmp) is not game data.
+    if (item.path.find('/') == std::string::npos &&
+        (item.path.find(".nxpack") != std::string::npos || item.path.find(".nxidx") != std::string::npos)) {
+      continue;
+    }
     items.push_back(std::move(item));
   }
   if (ec || items.empty() || items.size() > kMaxEntries) {
@@ -438,12 +541,12 @@ bool PackDevice::Build(const std::filesystem::path& folder, std::string* error,
     pack_id = Fnv(pack_id, &item.size, sizeof(item.size));
   }
   if (paths_size > kMaxPathsSize) return *error = "the game folder's paths are too long", false;
-  // One plain file: FAT32 (the usual Switch SD format) cannot hold 4 GB or more. A bigger game would need a
-  // concatenation file (FsCreateOption_BigFile) or a split pack; games whose data is already in a few big archives
-  // gain little from a pack anyway.
+  // One plain file: FAT32 (the usual Switch SD format) cannot hold 4 GB or more. The console builder only writes
+  // single-file packs; a bigger game gets a split pack (version 3) from tools/build_asset_pack.py --split-mb on a PC.
   if (pack_size >= (4ull << 30)) {
     return *error = "the game data is " + std::to_string(pack_size >> 20) +
-                    " MB, over FAT32's 4 GB file limit: no asset pack", false;
+                    " MB, over FAT32's 4 GB file limit: no asset pack (build a split pack on a PC: "
+                    "tools/build_asset_pack.py --split-mb 3072)", false;
   }
   const uint64_t nonce = (uint64_t(std::time(nullptr)) << 32) ^
                          uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());

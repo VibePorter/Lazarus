@@ -700,7 +700,9 @@ int GuestEntryPriority(uint32_t entry) {
       if (colon == std::string::npos) continue;
       const uint32_t e = uint32_t(std::strtoul(item.substr(0, colon).c_str(), nullptr, 16));
       const int prio = int(std::strtol(item.substr(colon + 1).c_str(), nullptr, 16));
-      if (e && prio >= 0x2C && prio <= 0x3F) t.emplace_back(e, prio);  // never above the host service threads
+      // Never above the host audio threads (Audio Worker, XMA Decoder, audio output: 0x2B). ME2 (2026-11-07): 0x2B
+      // allowed so the game's audio threads (Wwise, XAudio2) can rank above Renut's render thread (0x2C) on cores 1-2.
+      if (e && prio >= 0x2B && prio <= 0x3F) t.emplace_back(e, prio);
     }
     return t;
   }();

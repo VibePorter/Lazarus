@@ -13,6 +13,7 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <cstring>
+#include <vector>
 
 #include <rex/cvar.h>
 #include <rex/kernel/xam/private.h>
@@ -382,8 +383,10 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value) 
     }
   }
 
-  // If we deny everything, games should hopefully not try to do stuff.
-  *out_value = 0;
+  // If we deny everything, games should hopefully not try to do stuff. Dunwall (2026-11-09): a profile that reports
+  // itself signed in to LIVE (xam_signed_in_live) has every privilege, as a Gold profile would; there is still no
+  // network behind it (stats, sessions and the like fail as before).
+  *out_value = REX_KERNEL_STATE()->user_profile()->signin_state() == 2 ? 1 : 0;
   return X_ERROR_SUCCESS;
 }
 
@@ -595,6 +598,71 @@ class XStaticAchievementEnumerator : public XEnumerator {
   size_t current_item_ = 0;
 };
 
+// Dunwall (2026-11-13, PC crash opening the Dunwall City Trials leaderboards): XamUserCreateStatsEnumerator was a bare
+// stub (success, no handle, no buffer size), and XUserReadStats wrote nothing; the game sorted garbage row pointers.
+// Without Xbox Live a leaderboard is empty: the enumerator gives one XUSER_STATS_READ_RESULTS with a view per spec
+// (dwViewId from the spec) and 0 rows, pointers inside the caller's buffer, then ERROR_NO_MORE_FILES.
+// Called as XamUserCreateStatsEnumerator(title, type (0 by rank, 1 by xuid / rating), pivot, rows, specs count, specs,
+// pcbBuffer, phEnum) (the game's wrappers sub_82DA5430 / sub_82DA53D0).
+class XEmptyStatsEnumerator : public XEnumerator {
+ public:
+  XEmptyStatsEnumerator(KernelState* kernel_state, std::vector<uint32_t> view_ids, uint32_t bytes)
+      : XEnumerator(kernel_state, 1, bytes), view_ids_(std::move(view_ids)) {}
+
+  uint32_t WriteItems(uint32_t buffer_ptr, uint8_t* buffer_data, uint32_t* written_count) override {
+    if (done_) {
+      return X_ERROR_NO_MORE_FILES;
+    }
+    done_ = true;
+    const uint32_t views = static_cast<uint32_t>(view_ids_.size());
+    memory::store_and_swap<uint32_t>(buffer_data + 0, views);
+    memory::store_and_swap<uint32_t>(buffer_data + 4, views ? buffer_ptr + 8 : 0);
+    for (uint32_t i = 0; i < views; ++i) {
+      uint8_t* view = buffer_data + 8 + i * 16;
+      memory::store_and_swap<uint32_t>(view + 0, view_ids_[i]);
+      memory::store_and_swap<uint32_t>(view + 4, 0);   // dwTotalViewRows
+      memory::store_and_swap<uint32_t>(view + 8, 0);   // dwNumRows
+      memory::store_and_swap<uint32_t>(view + 12, 0);  // pRows
+    }
+    if (written_count) {
+      *written_count = 1;
+    }
+    return X_ERROR_SUCCESS;
+  }
+
+ private:
+  std::vector<uint32_t> view_ids_;
+  bool done_ = false;
+};
+
+u32 XamUserCreateStatsEnumerator_entry(u32 title_id, u32 type, u32 pivot, u32 num_rows, u32 num_specs,
+                                       mapped_void specs, mapped_u32 buffer_size_ptr, mapped_u32 handle_ptr) {
+  if (!handle_ptr || !num_specs || num_specs > 64) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  std::vector<uint32_t> view_ids;
+  const auto* spec_bytes = specs ? specs.as<const uint8_t*>() : nullptr;
+  for (uint32_t i = 0; i < num_specs; ++i)  // XUSER_STATS_SPEC: dwViewId first, 136 bytes each
+    view_ids.push_back(spec_bytes ? memory::load_and_swap<uint32_t>(spec_bytes + i * 136) : 0);
+  const uint32_t bytes = 8 + num_specs * 16;
+  if (buffer_size_ptr) {
+    *buffer_size_ptr = bytes;
+  }
+  auto e = object_ref<XEmptyStatsEnumerator>(
+      new XEmptyStatsEnumerator(REX_KERNEL_STATE(), std::move(view_ids), bytes));
+  auto result = e->Initialize(0xFF, 0xFB, 0, 0, 0);
+  if (XFAILED(result)) {
+    return result;
+  }
+  *handle_ptr = e->handle();
+  static uint32_t logged = 0;
+  if (logged++ < 16)
+    REXKRNL_INFO("[stats] XamUserCreateStatsEnumerator(title {:08X}, type {}, pivot {}, {} rows, {} views): an empty "
+                 "leaderboard (no Xbox Live)", uint32_t(title_id), uint32_t(type), uint32_t(pivot),
+                 uint32_t(num_rows), uint32_t(num_specs));
+  return X_ERROR_SUCCESS;
+}
+
 u32 XamUserCreateAchievementEnumerator_entry(u32 title_id, u32 user_index, u32 xuid, u32 flags,
                                              u32 offset, u32 count, mapped_u32 buffer_size_ptr,
                                              mapped_u32 handle_ptr) {
@@ -761,7 +829,7 @@ REX_EXPORT_STUB(__imp__XamUserAddRecentPlayer);
 REX_EXPORT_STUB(__imp__XamUserAllowedToPostToSocialNetwork);
 REX_EXPORT_STUB(__imp__XamUserCreateAvatarAssetEnumerator);
 REX_EXPORT_STUB(__imp__XamUserCreatePlayerEnumerator);
-REX_EXPORT_STUB(__imp__XamUserCreateStatsEnumerator);
+REX_EXPORT(__imp__XamUserCreateStatsEnumerator, rex::kernel::xam::XamUserCreateStatsEnumerator_entry)
 REX_EXPORT_STUB(__imp__XamUserCreateTitlesPlayedEnumerator);
 REX_EXPORT_STUB(__imp__XamUserFlushLogonQueue);
 REX_EXPORT_STUB(__imp__XamUserGetAge);

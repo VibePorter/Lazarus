@@ -43,6 +43,20 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
       memory::store_and_swap<uint32_t>(buffer + 0, 1);  // XONLINE_NAT_OPEN
       return X_E_SUCCESS;
     }
+    case 0x00058009: {
+      // Dunwall (2026-11-09): XContentGetMarketplaceCounts (sub_82BC5510: user index, content categories, ?, the
+      // XOFFERING_CONTENTAVAILABLE_RESULT {new offers, total offers} it zeroed first). It failed (X_E_FAIL, the game's
+      // 1627) at the first Continue, right before the DLC / save scan. No marketplace: no offers, success.
+      if (buffer && buffer_length >= 16) {
+        const uint32_t results = memory::load_and_swap<uint32_t>(buffer + 12);
+        if (auto* out = results ? memory_->TranslateVirtual(results) : nullptr) {
+          memory::store_and_swap<uint32_t>(out + 0, 0);
+          memory::store_and_swap<uint32_t>(out + 4, 0);
+        }
+      }
+      REXKRNL_DEBUG("XContentGetMarketplaceCounts({:08X}, {:08X}): no offers", buffer_ptr, buffer_length);
+      return X_E_SUCCESS;
+    }
     case 0x00058007: {
       // Occurs if title calls XOnlineGetServiceInfo, expects dwServiceId
       // and pServiceInfo. pServiceInfo should contain pointer to

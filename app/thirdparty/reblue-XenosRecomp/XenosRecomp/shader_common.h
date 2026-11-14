@@ -51,7 +51,15 @@
     X(TexCoord,  7, 19) \
     X(TexCoord,  8, 20) \
     X(TexCoord,  9, 21) \
-    X(TexCoord, 10, 22)
+    X(TexCoord, 10, 22) \
+    X(Position,  5, 23) \
+    X(Position,  6, 24) \
+    X(Position,  7, 25)
+// Dunwall (2026-11-08): POSITION5-7 (locations 23-25, appended so the others keep theirs). A global vertex shader
+// (GlobalShaderCache-Xbox360, XenosRecomp hash 0FF548D34E454B3D) reads POSITION0-7; without rows for 5-7 those inputs
+// had no [[vk::location]] (the translator's assert is compiled out) and DXC refused the shader ("partial explicit
+// stage input location assignment"), so the shader was left out and its draws never rendered. 26 locations: within
+// the 32 vertex inputs of Vulkan, D3D12 and deko3d.
 
 // SPEC_CONSTANTS_ONLY keeps the HLSL below out of host C++ TUs, which IntelliSense would otherwise parse.
 #if (!defined(__cplusplus) || defined(__INTELLISENSE__)) && !defined(SHADER_COMMON_SPEC_CONSTANTS_ONLY)
@@ -239,12 +247,22 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
 // host renders at a ratio of the guest resolution, and the textures resolved from its render
 // targets are that ratio of their guest size (rounded); texel offsets and texel coordinates are in
 // guest texels, so the sizes the fetches use are the guest's.
-#define RENUT_DESCRIPTOR_INDEX_MASK 0x03FFFFFFu
+// Dunwall (2026-11-08): bits 20-25 the fetch constant's exponent adjust (signed); the index is the bits below.
+#define RENUT_DESCRIPTOR_INDEX_MASK 0x000FFFFFu
 #define RENUT_RESOLUTION_SCALE_SHIFT 26u
+#define RENUT_EXP_ADJUST_SHIFT 20u
 
 uint renutDescriptor(uint resourceDescriptorIndex)
 {
     return resourceDescriptorIndex & RENUT_DESCRIPTOR_INDEX_MASK;
+}
+
+// The texel scale of the fetch constant's exponent adjust: 2^adjust (the translator multiplies each texture fetch by
+// it). The Xbox 360's FXAA reads one image through three fetch constants with adjusts 0, -1 and -2.
+float renutExpScale(uint resourceDescriptorIndex)
+{
+    const int adjust = int(resourceDescriptorIndex << 6) >> 26;  // bits 20-25, sign-extended
+    return exp2(float(adjust));
 }
 
 // Host texels per guest texel, by the host's RenderScale code (render_scale.h): 1x, 2/3 (480p),

@@ -637,6 +637,12 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
     printDstSwizzle(instr.dstSwizzle, false);
 
     out += " = ";
+#ifdef RENUT_RECOMP
+    // Dunwall (2026-11-08): the fetch constant's exponent adjust scales the texel (2^adjust, renutExpScale): the
+    // whole fetch is wrapped, then swizzled. The Xbox 360's FXAA reads its image through fetch constants with adjusts
+    // -1 and -2; without the scale its edge samples were 2x / 4x too bright (outlines on every edge).
+    const bool expScaled = instr.opcode == FetchOpcode::TextureFetch;
+#endif
     switch (instr.opcode)
     {
     case FetchOpcode::TextureFetch:
@@ -646,7 +652,11 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
             out += "1.0 - ";
     #endif
 
+    #ifdef RENUT_RECOMP
+        out += "(tfetch";
+    #else
         out += "tfetch";
+    #endif
         break;
     }
     case FetchOpcode::GetTextureWeights:
@@ -749,9 +759,13 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
 #ifdef RENUT_RECOMP
     if (explicitLod)
         out += instr.useRegLod ? ", lod" : ", 0.0";
-#endif
-
+    if (expScaled)
+        print(") * renutExpScale({}_Texture{}DescriptorIndex)).", constNamePtr, dimension);
+    else
+        out += ").";
+#else
     out += ").";
+#endif
 
     printDstSwizzle(instr.dstSwizzle, true);
 
@@ -2557,34 +2571,56 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
     bool printedRegisters[128]{};  // mgr-nx-deko: MGR uses temporaries through r58.
 
-    // Preserve MGR's established hardware-register linkage. Container semantics do
-    // not describe the final linked pair; Direct3D can patch those export indices.
-    if (!isPixelShader)
-        for (uint32_t i = 0; i < 16; ++i)
-            interpolators.emplace(i, fmt::format("oTexCoord{}", i));
-
     uint32_t interpolatorCount = (shader->interpolatorInfo >> 5) & 0x1F;
 
-    for (uint32_t i = 0; i < interpolatorCount; i++)
-    {
-        union
-        {
-            Interpolator interpolator;
-            uint32_t value;
-        };
-    
+    // Dunwall (2026-11-08): link the stages by semantic, as D3DVertexShader_Bind does on the Xbox: it rewrites the
+    // vertex shader's export registers to the registers where the pixel shader expects each semantic. UE3 packs
+    // both tables in order, so a vertex shader exporting TEXCOORD0,4,5,6,7,COLOR0 to r0-r5 feeds a pixel shader
+    // reading TEXCOORD0,4,6,7,COLOR0,COLOR1 from r0-r5 the wrong values by register (the swirl in capture 13359:
+    // its fade scalar got a world-space vector). Each semantic is its own host location on both sides (the
+    // INTERPOLATORS list). MGR kept the register linkage: XENOS_RECOMP_REGISTER_INTERPOLATORS=1 restores it, and a
+    // shader without a table (or with a semantic not in the list) still links by register.
+    const auto interpolatorAt = [&](uint32_t i) {
+        union { Interpolator interpolator; uint32_t value; } entry;
         if (isPixelShader)
-        {
-            value = reinterpret_cast<const PixelShader*>(shader)->interpolators[i];
-            println("\tfloat4 r{0} = iTexCoord{0};", uint32_t(interpolator.reg));
-            printedRegisters[interpolator.reg] = true;
-        }
+            entry.value = reinterpret_cast<const PixelShader*>(shader)->interpolators[i];
         else
         {
             auto vertexShader = reinterpret_cast<const VertexShader*>(shader);
-            value = vertexShader->vertexElementsAndInterpolators[vertexShader->field18 + vertexShader->vertexElementCount + i];
-            // The register map above is authoritative even when this table is empty.
+            entry.value = vertexShader->vertexElementsAndInterpolators[vertexShader->field18 + vertexShader->vertexElementCount + i];
         }
+        return entry.interpolator;
+    };
+    const char* registerEnv = std::getenv("XENOS_RECOMP_REGISTER_INTERPOLATORS");
+    bool semanticLinkage = !(registerEnv && registerEnv[0] == '1') && interpolatorCount != 0;
+    for (uint32_t i = 0; semanticLinkage && i < interpolatorCount; i++)
+    {
+        const Interpolator interpolator = interpolatorAt(i);
+        bool declared = false;
+        for (auto& [usage, usageIndex] : INTERPOLATORS)
+            declared = declared || (usage == interpolator.usage && usageIndex == interpolator.usageIndex);
+        semanticLinkage = declared;
+    }
+
+    // Register linkage (MGR's): export i is TEXCOORDi, pixel input register i reads TEXCOORDi.
+    if (!isPixelShader && !semanticLinkage)
+        for (uint32_t i = 0; i < 16; ++i)
+            interpolators.emplace(i, fmt::format("oTexCoord{}", i));
+
+    for (uint32_t i = 0; i < interpolatorCount; i++)
+    {
+        const Interpolator interpolator = interpolatorAt(i);
+        const auto semantic = fmt::format("{}{}", USAGE_VARIABLES[uint32_t(interpolator.usage)], uint32_t(interpolator.usageIndex));
+        if (isPixelShader)
+        {
+            if (semanticLinkage)
+                println("\tfloat4 r{} = i{};", uint32_t(interpolator.reg), semantic);
+            else
+                println("\tfloat4 r{0} = iTexCoord{0};", uint32_t(interpolator.reg));
+            printedRegisters[interpolator.reg] = true;
+        }
+        else if (semanticLinkage)
+            interpolators.emplace(uint32_t(interpolator.reg), "o" + semantic);
     }
 
     if (!isPixelShader)
@@ -2603,6 +2639,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         out += "\toPointCoord = 0.0;\n";
         out += "\toPointSize = 0.0;\n";
     #endif
+        // Exports with no semantic in the table reach no pixel shader input (D3D leaves them out of the link).
+        for (uint32_t i = 0; semanticLinkage && i < 16; ++i)
+            if (interpolators.emplace(i, fmt::format("oUnlinked{}", i)).second)
+                println("\tfloat4 oUnlinked{} = 0.0;", i);
 
         out += "\n";
     }

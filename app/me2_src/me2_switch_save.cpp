@@ -344,6 +344,9 @@ void Setup(rex::Runtime* runtime) {
     std::lock_guard<std::mutex> lock(g_mutex);
     g_mounted = true;
   }
+  // dunwall-nx (2026-11-10): the save data's file system keeps no file times (stat gives 0: the saves showed
+  // 1970-01-01); they are kept in a file of the save data, committed with the saves.
+  rex::filesystem::SetTimestampStore(kRoot, std::string(kRoot) + ".rex_times");
   content->SetSavedGameRoot(kRoot, Written);
   REXLOG_INFO("[switch-save] saves of '{}' in the console's save data of {:016X}", nickname, program);
 }

@@ -37,7 +37,19 @@ XFile::XFile() : XObject(kObjectType) {
 XFile::~XFile() {
   // TODO(benvanik): signal that the file is closing?
   async_event_->Set();
+  // ME2 (2026-11-14, user: overwriting a save made a new one): NtSetInformationFile(FileDispositionInformation) marks
+  // the entry for deletion on close, but nothing deleted it. ME2 overwrites a save by writing the next Save_NNNN and
+  // deleting the old file that way, so every overwrite left the old save in the list. As Windows does: the entry goes
+  // when its file is closed (after the host handle is, so the host delete is not refused for an open file).
+  rex::filesystem::Entry* const entry = file_ ? file_->entry() : nullptr;
   file_->Destroy();
+  if (entry && entry->delete_on_close()) {
+    const std::string path = entry->path();
+    if (entry->Delete())
+      REXSYS_INFO("[save] {} deleted on close (FileDispositionInformation)", path);
+    else
+      REXSYS_WARN("[save] {} was marked for deletion on close, but the delete failed", path);
+  }
 }
 
 uint64_t XFile::position() const {

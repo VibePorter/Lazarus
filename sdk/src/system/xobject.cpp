@@ -275,7 +275,12 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
   ApplyGuestCoreLayoutAtWait();  // sa2-nx (2026-10-20)
   WaitProfileScope wait_profile("WaitMulti");  // me2-nx-deko: diag_wait_sites
   GuestBoostAroundWait boost_around;  // me2-nx-deko (2026-11-01)
-  std::vector<rex::thread::WaitHandle*> wait_handles(count);
+  // Dunwall (2026-11-12): on the stack up to 64 handles (the Xbox 360's limit): one heap vector less per wait
+  // (Wwise's event thread waits all the time; newlib has one malloc lock, see threading_posix.cpp).
+  rex::thread::WaitHandle* inline_handles[64];
+  std::vector<rex::thread::WaitHandle*> heap_handles;
+  if (count > std::size(inline_handles)) heap_handles.resize(count);
+  rex::thread::WaitHandle** const wait_handles = count > std::size(inline_handles) ? heap_handles.data() : inline_handles;
   for (size_t i = 0; i < count; ++i) {
     wait_handles[i] = objects[i]->GetWaitHandle();
     assert_not_null(wait_handles[i]);
@@ -288,7 +293,7 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
   XThread::CheckTitleTermination();
   if (wait_type) {
     auto result =
-        rex::thread::WaitAny(std::move(wait_handles), alertable ? true : false, timeout_ms);
+        rex::thread::WaitAny(wait_handles, count, alertable ? true : false, timeout_ms);
     XThread::CheckTitleTermination();
     switch (result.first) {
       case rex::thread::WaitResult::kSuccess:
@@ -309,7 +314,7 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
     }
   } else {
     auto result =
-        rex::thread::WaitAll(std::move(wait_handles), alertable ? true : false, timeout_ms);
+        rex::thread::WaitAll(wait_handles, count, alertable ? true : false, timeout_ms);
     XThread::CheckTitleTermination();
     switch (result) {
       case rex::thread::WaitResult::kSuccess:

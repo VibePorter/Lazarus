@@ -60,6 +60,11 @@ public:
     uint64_t begin, end;
   };
   void HandOff(std::vector<Range> &out);
+  // Dunwall (2026-11-13, the rainbow textures): cleans one allocation of this ring now, on the calling thread (the
+  // one that just wrote it), whatever Publish / HandOff do with it later. For a texture's staging bytes: a copy that
+  // reads them before they left the CPU's cache puts the ring's old bytes into the image for good, where a draw's
+  // constants would be wrong for one frame. Nothing unless host_cached.
+  void CleanNow(const UploadAllocation &alloc);
   // The slot's fence has been waited: nothing uses the ring's memory.
   void Reset();
   UploadAllocation Allocate(uint64_t size, uint64_t alignment = 256);

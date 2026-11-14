@@ -3,6 +3,9 @@
  */
 #include "renut_engine/gpu/render/pipeline.h"
 #include "renut_engine/gpu/render/occlusion_bias.h"
+#if defined(PLUME_DEKO3D)
+#include "renut_engine/gpu/banjo_renut_deko3d.h"  // Dunwall (2026-11-12): DkshReadReport
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -17,6 +20,8 @@
 #include <mutex>
 #include <string>
 #include <chrono>
+
+#include <fmt/format.h>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -383,6 +388,10 @@ std::unique_ptr<plume::RenderPipeline> Build(const PipelineKey &key, const Pipel
     desc.depthBiasClamp = std::bit_cast<float>(key.depth_bias_clamp);
     desc.slopeScaledDepthBias = std::bit_cast<float>(key.depth_bias_slope);
   }
+  // ME2 (2026-11-12, me2_renut_poly_offset_dynamic): the draw sets the guest's offset (dkCmdBufSetDepthBias), the
+  // pipeline does not.
+  if (key.reserved & kKeyDynamicBias)
+    desc.dynamicDepthBiasEnabled = true;
 
   // RB_DEPTHCONTROL.
   const u32 dc = key.depth_control;
@@ -629,12 +638,68 @@ std::vector<char> EncodeRecord(const PipelineKey &key, const HostVertexLayout &l
   return w.Bytes();
 }
 
+// Dunwall (2026-11-14): a set of 64-bit hashes in one allocation (open addressing, linear probing, doubled at half
+// full), for LoadList's "seen" sets and the list's 'listed': an unordered_set allocates a node per insert (2 x 65,561
+// at the load), and newlib's malloc is what made the load take 30 s on the console. 0 is kept apart (free slot).
+class FlatHashSet {
+public:
+  explicit FlatHashSet(size_t most = 0) { Reset(most); }
+  bool insert(uint64_t h) {  // true: not there before
+    if (h == 0) {
+      const bool fresh = !zero_;
+      zero_ = true;
+      return fresh;
+    }
+    if ((count_ + 1) * 2 > slots_.size())
+      Grow();
+    for (size_t i = Home(h);; i = (i + 1) & mask_) {
+      if (slots_[i] == h)
+        return false;
+      if (slots_[i] == 0) {
+        slots_[i] = h;
+        ++count_;
+        return true;
+      }
+    }
+  }
+
+private:
+  void Reset(size_t most) {
+    size_t n = 64;
+    while (n < most * 2)
+      n <<= 1;
+    slots_.assign(n, 0);
+    mask_ = n - 1;
+    count_ = 0;
+  }
+  size_t Home(uint64_t h) const { return size_t(h ^ (h >> 29)) & mask_; }
+  void Grow() {
+    std::vector<uint64_t> old = std::move(slots_);
+    Reset(old.size());  // twice the slots
+    for (const uint64_t h : old) {
+      if (!h)
+        continue;
+      size_t i = Home(h);
+      while (slots_[i])
+        i = (i + 1) & mask_;
+      slots_[i] = h;
+      ++count_;
+    }
+  }
+  std::vector<uint64_t> slots_;
+  size_t mask_ = 0, count_ = 0;
+  bool zero_ = false;
+};
+
 // A listed pipeline, as the worker threads build it.
 struct Job {
   PipelineKey key{};
   uint64_t hash = 0;
   HostVertexLayout layout;
-  std::deque<std::string> names;  // the elements' semantic names point here
+  // The elements' semantic names point here. Dunwall (2026-11-14): a vector reserved to the element count before the
+  // first name (DecodeRecord), so it never moves its strings; a deque cost two allocations (map and block) a job even
+  // for one name, and newlib's malloc made the 65,561-record list take 30 s on the console (see LoadList).
+  std::vector<std::string> names;
   enum class Stage { Pending, Building, Done } stage = Stage::Pending;
   std::unique_ptr<plume::RenderPipeline> pipeline;  // Done: nullptr if taken or failed
   // Its shaders the game has not made yet (PipelineShaderLoaded); queued at 0.
@@ -669,7 +734,7 @@ bool DecodeRecord(const char *data, size_t size, Job &job) {
     std::memset(job.key.bool_mask, 0, sizeof(job.key.bool_mask));
     std::memset(job.key.bool_values, 0, sizeof(job.key.bool_values));
   }
-  job.key.reserved = 0;
+  job.key.reserved &= kKeyDynamicBias;  // a pipeline of the draws that set their bias stays one
   job.hash = HashKey(job.key);
   for (u32 s = 0; s < kMaxVertexStreams; ++s) {
     u8 used;
@@ -682,6 +747,12 @@ bool DecodeRecord(const char *data, size_t size, Job &job) {
   u32 count;
   if (!r.Get(count) || count > 64)
     return false;
+  // Exactly 'count' names follow: reserved, the vector never reallocates, so the c_str() pointers the layout keeps
+  // stay valid (short names live inside the string objects).
+  job.names.clear();
+  job.names.reserve(count);
+  job.layout.input_elements.clear();
+  job.layout.input_elements.reserve(count);
   for (u32 i = 0; i < count; ++i) {
     u8 length;
     std::string name;
@@ -707,42 +778,87 @@ bool DecodeRecord(const char *data, size_t size, Job &job) {
 // same pipelines (and their shader variants) were built again at every start. The file is synced to the card at most
 // once a second (kListSyncNs: the records of the last second may still be lost), not per record (a new area appends
 // hundreds).
+// Dunwall (2026-11-12, the 13 fps / 768 ms frames for ~10 s after Press Start): the render thread appended each
+// new pipeline's record with fwrite (records of ~600 bytes against stdio's ~1 KB buffer: an SD write through the FS
+// service every second record, the file opened and its size asked at the first) and synced the file once a second
+// itself. With ~220 new specialised pipelines as the main menu's scene first draws, the specialised lookups took
+// 4.9 s of the render thread in 10 s. Now the render thread only queues the encoded record; a writer thread of its
+// own (the background compile core, low priority) opens, appends and syncs (fsync at most once a second, as before).
 struct PipelineList {
-  std::FILE *out = nullptr;
-  bool failed = false;
-  std::unordered_set<uint64_t> listed;  // key hashes in the file
-  std::chrono::steady_clock::time_point last_sync{};
-  bool unsynced = false;
+  FlatHashSet listed;  // key hashes in the file (render thread, and the load at the start)
   static constexpr auto kListSync = std::chrono::seconds(1);
-
-  void Sync() {
-    if (!out || !unsynced)
-      return;
-    std::fflush(out);
-#if defined(_WIN32)
-    _commit(_fileno(out));
-#else
-    fsync(fileno(out));
-#endif
-    unsynced = false;
-    last_sync = std::chrono::steady_clock::now();
-  }
+  // The writer's side.
+  std::mutex mutex;
+  std::condition_variable wake;
+  std::vector<char> pending;  // records not written yet: (u32 size, record) each
+  bool started = false;
+  std::atomic<bool> failed{false};
+  std::atomic<uint64_t> queued_ns{0}, queued{0}, written{0}, write_ns{0}, sync_ns{0}, syncs{0}, max_io_ns{0};
 
   void Append(const PipelineKey &key, uint64_t hash, const HostVertexLayout &layout) {
-    if (failed || !listed.insert(hash).second)
+    if (failed.load(std::memory_order_relaxed) || !listed.insert(hash))
       return;
-    if (!out) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::vector<char> record = EncodeRecord(key, layout);
+    const u32 size = u32(record.size());
+    bool start = false;
+    {
+      std::lock_guard lock(mutex);
+      const size_t at = pending.size();
+      pending.resize(at + sizeof(size) + record.size());
+      std::memcpy(pending.data() + at, &size, sizeof(size));
+      std::memcpy(pending.data() + at + sizeof(size), record.data(), record.size());
+      start = !started;
+      started = true;
+    }
+    if (start)
+      banjo::renut_gpu::StartLongLivedThread(&PipelineList::Writer, 256 * 1024);
+    wake.notify_one();
+    queued.fetch_add(1, std::memory_order_relaxed);
+    queued_ns.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - t0).count()),
+                        std::memory_order_relaxed);
+  }
+
+  static void Writer();
+};
+std::string PipelineWaitReport();  // below
+PipelineList g_list;
+
+void NoteIo(std::atomic<uint64_t> &total, std::chrono::steady_clock::time_point t0) {
+  const uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now() - t0).count());
+  total.fetch_add(ns, std::memory_order_relaxed);
+  uint64_t max = g_list.max_io_ns.load(std::memory_order_relaxed);
+  while (ns > max && !g_list.max_io_ns.compare_exchange_weak(max, ns, std::memory_order_relaxed)) {
+  }
+}
+
+void PipelineList::Writer() {
+  banjo::renut_gpu::OnBackgroundThreadStart("pipeline list writer");
+  PipelineList &l = g_list;
+  std::FILE *out = nullptr;
+  bool unsynced = false;
+  auto last_sync = std::chrono::steady_clock::now();
+  std::vector<char> batch;
+  std::unique_lock lock(l.mutex);
+  for (;;) {
+    // Records to write, or the sync a second after the last one.
+    if (l.pending.empty())
+      l.wake.wait_for(lock, PipelineList::kListSync, [&] { return !l.pending.empty(); });
+    batch.clear();
+    batch.swap(l.pending);
+    lock.unlock();
+    if (!batch.empty() && !out && !l.failed.load(std::memory_order_relaxed)) {
+      const auto t0 = std::chrono::steady_clock::now();
       const std::filesystem::path path = banjo::renut_gpu::NextToExecutable(REXCVAR_GET(renut_pipeline_list));
       std::error_code ec;
       const bool fresh = !std::filesystem::exists(path, ec) || std::filesystem::file_size(path, ec) == 0;
       out = std::fopen(path.string().c_str(), "ab");
       if (!out) {
-        failed = true;
-        RGPU_WARN("Pipeline list {} cannot be written; pipelines are not built ahead next time",
-                  path.string());
-        return;
-      }
-      if (fresh) {
+        l.failed.store(true, std::memory_order_relaxed);
+        RGPU_WARN("Pipeline list {} cannot be written; pipelines are not built ahead next time", path.string());
+      } else if (fresh) {
         ListHeader header{};
         std::memcpy(header.magic, kListMagic, 4);
         header.version = kListVersion;
@@ -750,39 +866,133 @@ struct PipelineList {
         header.streams = kMaxVertexStreams;
         std::fwrite(&header, sizeof(header), 1, out);
       }
+      NoteIo(l.write_ns, t0);
     }
-    const std::vector<char> record = EncodeRecord(key, layout);
-    const u32 size = u32(record.size());
-    std::fwrite(&size, sizeof(size), 1, out);
-    std::fwrite(record.data(), 1, record.size(), out);
-    // ME2 (2026-11-02, from naruto-nx aa0f750): no fflush / fsync in the middle of a frame (an SD write per new
-    // pipeline on the render thread); SyncPipelineListLocked flushes and syncs once a frame, at most once a second.
-    unsynced = true;
+    if (!batch.empty() && out) {
+      const auto t0 = std::chrono::steady_clock::now();
+      std::fwrite(batch.data(), 1, batch.size(), out);
+      NoteIo(l.write_ns, t0);
+      size_t records = 0;
+      for (size_t at = 0; at + sizeof(u32) <= batch.size(); ++records) {
+        u32 size;
+        std::memcpy(&size, batch.data() + at, sizeof(size));
+        at += sizeof(size) + size;
+      }
+      l.written.fetch_add(records, std::memory_order_relaxed);
+      unsynced = true;
+    }
+    if (out && unsynced && std::chrono::steady_clock::now() - last_sync >= PipelineList::kListSync) {
+      const auto t0 = std::chrono::steady_clock::now();
+      std::fflush(out);
+#if defined(_WIN32)
+      _commit(_fileno(out));
+#else
+      fsync(fileno(out));
+#endif
+      NoteIo(l.sync_ns, t0);
+      l.syncs.fetch_add(1, std::memory_order_relaxed);
+      unsynced = false;
+      last_sync = std::chrono::steady_clock::now();
+    }
+    // ME2 (2026-11-12, backported from the Dunwall port): the list's writer, the specialised lookups and the DKSH
+    // cache's reads, every 10 s while anything was written.
+    static auto last_report = std::chrono::steady_clock::now();
+    if (std::chrono::steady_clock::now() - last_report >= std::chrono::seconds(10)) {
+      last_report = std::chrono::steady_clock::now();
+      if (l.queued.load(std::memory_order_relaxed))
+        RGPU_INFO("[pipelines] 10 s{}", PipelineWaitReport());
+    }
+    lock.lock();
   }
-};
-PipelineList g_list;
+}
 
 }  // namespace
 
-// banjo-nx (2026-10-20): the list's last records synced to the card a second after they were written, if no record
-// came after them (the render thread, once a frame).
-void SyncPipelineListLocked() {
-  if (g_list.unsynced && std::chrono::steady_clock::now() - g_list.last_sync >= PipelineList::kListSync)
-    g_list.Sync();
-}
+// banjo-nx (2026-10-20): the list's last records synced to the card a second after they were written. Dunwall
+// (2026-11-12): the list's writer thread does that now (PipelineList::Writer); nothing to do on the render thread.
+void SyncPipelineListLocked() {}
 
 namespace {
+
+// Dunwall (2026-11-14, the user's console list: 115 MB, but every start loaded the same 21,903 pipelines): a
+// session closed while the writer was appending (HOME, power) leaves a part record at the end; the next session
+// appends after it, and the load stopped at that spot for good: the 97 MB after it (the pipelines of every later
+// session, many listed again and again since they never reached 'listed') were never read. A record is now taken only
+// when its bytes parse exactly as EncodeRecord writes them (size, 16 streams with used 0/1, at most 64 elements with
+// short printable names, nothing left over); at a damaged spot the load scans on to the next well-formed record. A
+// list with damage, a cut-short end or repeated records is written again with each good record once (".tmp", then
+// renamed), so the next session appends to a clean file.
+bool WellFormedRecord(const char *data, size_t avail, size_t &record_end) {
+  if (avail < sizeof(u32))
+    return false;
+  u32 size;
+  std::memcpy(&size, data, sizeof(size));
+  constexpr size_t kMin = sizeof(PipelineKey) + kMaxVertexStreams * 5 + sizeof(u32);
+  if (size < kMin || size > 65536 || size > avail - sizeof(u32))
+    return false;
+  const char *p = data + sizeof(u32) + sizeof(PipelineKey);
+  const char *end = data + sizeof(u32) + size;
+  for (u32 s = 0; s < kMaxVertexStreams; ++s, p += 5) {
+    if (u8(p[0]) > 1)
+      return false;
+  }
+  u32 count;
+  std::memcpy(&count, p, sizeof(count));
+  p += sizeof(count);
+  if (count > 64)
+    return false;
+  for (u32 i = 0; i < count; ++i) {
+    if (end - p < 1)
+      return false;
+    const u8 length = u8(*p++);
+    if (length > 64 || end - p < ptrdiff_t(length) + 20)
+      return false;
+    for (u8 c = 0; c < length; ++c) {
+      const char ch = p[c];
+      if (!((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_'))
+        return false;
+    }
+    p += length + 20;
+  }
+  if (p != end)
+    return false;
+  record_end = sizeof(u32) + size;
+  return true;
+}
 
 // The records of the list file; empty (and the file started over) when it
 // is missing or from another version.
 std::vector<std::unique_ptr<Job>> LoadList() {
   std::vector<std::unique_ptr<Job>> jobs;
   const std::filesystem::path path = banjo::renut_gpu::NextToExecutable(REXCVAR_GET(renut_pipeline_list));
-  std::ifstream in(path, std::ios::binary);
-  if (!in)
-    return jobs;
-  const std::vector<char> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-  in.close();
+  // Dunwall (2026-11-12, the boot: 13-18 s between the device and the prebuild worker on the console, the main
+  // thread 87 % waiting in the kernel inside this read): the file was read through std::istreambuf_iterator, a
+  // stream buffer's worth (a few KB) per SD read for a list of many MB. Now in blocks of 4 MB.
+  const auto t_read = std::chrono::steady_clock::now();
+  std::vector<char> bytes;
+  {
+    std::FILE *in = std::fopen(path.string().c_str(), "rb");
+    if (!in)
+      return jobs;
+    long length = -1;
+    if (std::fseek(in, 0, SEEK_END) == 0)
+      length = std::ftell(in);
+    std::fseek(in, 0, SEEK_SET);
+    if (length > 0) {
+      bytes.resize(size_t(length));
+      size_t got = 0;
+      while (got < bytes.size()) {
+        const size_t n = std::fread(bytes.data() + got, 1, std::min<size_t>(4u << 20, bytes.size() - got), in);
+        if (n == 0)
+          break;
+        got += n;
+      }
+      bytes.resize(got);
+    }
+    std::fclose(in);
+  }
+  const double read_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_read).count();
   ListHeader header{};
   if (bytes.size() >= sizeof(header))
     std::memcpy(&header, bytes.data(), sizeof(header));
@@ -798,7 +1008,13 @@ std::vector<std::unique_ptr<Job>> LoadList() {
     std::filesystem::remove(path, ec);
     return jobs;
   }
-  std::unordered_set<uint64_t> seen;
+  // Dunwall (2026-11-14, the console's 30 s at startup, core 0 at 100 %: 97.6 % of it inside newlib's _malloc_r, the
+  // decoding itself 0.5 %): every container here grew a node or a doubling at a time over 65,561 records (~1 KB each),
+  // and newlib's allocator slows down with each of the hundreds of thousands of small blocks. Sized once from the file:
+  // records are at least a few hundred bytes, so bytes / 256 is a safe upper bound.
+  const size_t records_max = bytes.size() / 256 + 16;
+  FlatHashSet seen(records_max);
+  jobs.reserve(records_max);
   std::vector<char> converted;
   if (v3) {
     ListHeader h4 = header;
@@ -809,7 +1025,35 @@ std::vector<std::unique_ptr<Job>> LoadList() {
   }
   size_t at = sizeof(header);
   std::vector<char> record;
+  // Dunwall (2026-11-14): damaged spots skipped (WellFormedRecord), each good record kept once for the rewrite.
+  std::vector<char> compact;
+  FlatHashSet stored_seen(v3 ? 0 : records_max);
+  u32 damaged = 0, repeated = 0;
+  size_t damaged_bytes = 0;
+  if (!v3) {
+    compact.reserve(bytes.size());  // at most the file (2026-11-14: was doubled up to 68 MB, each old block freed)
+    compact.resize(sizeof(header));
+    std::memcpy(compact.data(), &header, sizeof(header));
+  }
   while (bytes.size() - at >= sizeof(u32)) {
+    if (!v3) {
+      size_t record_end = 0;
+      if (!WellFormedRecord(bytes.data() + at, bytes.size() - at, record_end)) {
+        size_t next = at + 1;
+        while (next < bytes.size() && !WellFormedRecord(bytes.data() + next, bytes.size() - next, record_end))
+          ++next;
+        ++damaged;
+        damaged_bytes += next - at;
+        at = next;
+        if (at >= bytes.size())
+          break;
+      }
+      const uint64_t stored_hash = XXH3_64bits(bytes.data() + at + sizeof(u32), record_end - sizeof(u32));
+      if (stored_seen.insert(stored_hash))
+        compact.insert(compact.end(), bytes.data() + at, bytes.data() + at + record_end);
+      else
+        ++repeated;
+    }
     u32 size;
     std::memcpy(&size, bytes.data() + at, sizeof(size));
     at += sizeof(size);
@@ -831,7 +1075,7 @@ std::vector<std::unique_ptr<Job>> LoadList() {
       std::memcpy(converted.data() + o + sizeof(u32), data, data_size);
     }
     auto job = std::make_unique<Job>();
-    if (DecodeRecord(data, data_size, *job) && seen.insert(job->hash).second)
+    if (DecodeRecord(data, data_size, *job) && seen.insert(job->hash))
       jobs.push_back(std::move(job));
     at += size;
   }
@@ -842,9 +1086,38 @@ std::vector<std::unique_ptr<Job>> LoadList() {
     RGPU_INFO("Pipeline list {}: version 3, {} pipelines kept as version 4 (generic alpha test)", path.string(),
               jobs.size());
   }
+  if (!v3 && (damaged || repeated || at != bytes.size())) {
+    const std::string tmp = path.string() + ".tmp";
+    bool ok = false;
+    if (std::FILE *out = std::fopen(tmp.c_str(), "wb")) {
+      ok = std::fwrite(compact.data(), 1, compact.size(), out) == compact.size();
+      ok = std::fflush(out) == 0 && ok;
+#if defined(_WIN32)
+      _commit(_fileno(out));
+#else
+      fsync(fileno(out));
+#endif
+      ok = std::fclose(out) == 0 && ok;
+    }
+    std::error_code ec;
+    if (ok) {
+      std::filesystem::remove(path, ec);
+      std::filesystem::rename(tmp, path, ec);
+      ok = !ec;
+    } else {
+      std::filesystem::remove(tmp, ec);
+    }
+    RGPU_INFO("Pipeline list {}: {} damaged spots ({:.1f} MB) skipped, {} repeated records dropped; {} ({:.1f} MB "
+              "-> {:.1f} MB)",
+              path.string(), damaged, damaged_bytes / 1e6, repeated, ok ? "written again clean" : "NOT rewritten",
+              bytes.size() / 1e6, compact.size() / 1e6);
+  }
   // Records of shaders this build lacks stay out of 'listed': a later build
   // that has them lists the pipelines again.
   g_list.listed = std::move(seen);
+  RGPU_INFO("Pipeline list {}: {} pipelines, {:.1f} MB read in {:.0f} ms, all loaded in {:.0f} ms", path.string(),
+            jobs.size(), bytes.size() / 1e6, read_ms,
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_read).count());
   return jobs;
 }
 
@@ -955,10 +1228,21 @@ void StartWorkersLocked() {
 
 // banjo-nx (banjo_gpu_bool_spec): a specialised pipeline, without waiting. Ready: built (moved to 'out'); Pending:
 // queued or building (a job made now if there was none); Failed: its build failed. Render thread.
-enum class SpecState { Ready, Pending, Failed };
+// 2026-11-10 (console, the rats: the render thread blocked in the pipeline lookup, 80-92 % of its draw time, while uam
+// compiled the specialised pipelines' variants): Busy, the prebuild lock is held by another thread; the draw takes the
+// generic pipeline and the next one asks again (the render thread never waits for the lock here).
+enum class SpecState { Ready, Pending, Failed, Busy };
+std::atomic<uint64_t> g_pl_spec_calls{0}, g_pl_spec_ns{0}, g_pl_spec_busy{0}, g_pl_slow_calls{0}, g_pl_slow_ns{0};
+// Dunwall (2026-11-12): the time in SpecialisedPipeline itself (the rest of a specialised lookup is the generic
+// pipeline's lookup or build, and the list's record).
+std::atomic<uint64_t> g_pl_spec_request_ns{0};
 SpecState SpecialisedPipeline(const PipelineKey &key, uint64_t hash, const HostVertexLayout &layout,
                               std::unique_ptr<plume::RenderPipeline> &out) {
-  std::lock_guard lock(g_prebuild.mutex);
+  std::unique_lock lock(g_prebuild.mutex, std::try_to_lock);
+  if (!lock.owns_lock()) {
+    g_pl_spec_busy.fetch_add(1, std::memory_order_relaxed);
+    return SpecState::Busy;
+  }
   if (g_prebuild.stop)
     return SpecState::Failed;
   auto &jobs = g_prebuild.by_hash[hash];
@@ -1002,10 +1286,16 @@ std::unordered_set<uint64_t> g_spec_failed;
 // The listed pipeline for the key, when the list has it: built by a worker
 // (waited for when one is building it), or nullptr with 'claimed' set when no
 // worker has started it, which the caller then builds itself. Render thread.
+// 2026-11-10 (renut_draw_stage_timing): the render thread's waits for a prebuild worker's pipeline and its own builds.
+std::atomic<uint64_t> g_pl_waits{0}, g_pl_wait_ns{0}, g_pl_builds{0}, g_pl_build_ns{0}, g_pl_lock_ns{0};
+
 plume::RenderPipeline *TakePrebuilt(const PipelineKey &key, uint64_t hash,
                                     std::unique_ptr<plume::RenderPipeline> &out, bool &claimed) {
   claimed = false;
+  const auto t_lock = std::chrono::steady_clock::now();
   std::unique_lock lock(g_prebuild.mutex);
+  g_pl_lock_ns.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - t_lock).count()), std::memory_order_relaxed);
   auto it = g_prebuild.by_hash.find(hash);
   if (it == g_prebuild.by_hash.end())
     return nullptr;
@@ -1021,7 +1311,11 @@ plume::RenderPipeline *TakePrebuilt(const PipelineKey &key, uint64_t hash,
     claimed = true;
     return nullptr;
   }
+  const auto t0 = std::chrono::steady_clock::now();
   g_prebuild.done.wait(lock, [job] { return job->stage == Job::Stage::Done; });
+  g_pl_waits.fetch_add(1, std::memory_order_relaxed);
+  g_pl_wait_ns.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - t0).count()), std::memory_order_relaxed);
   out = std::move(job->pipeline);
   return out.get();
 }
@@ -1109,7 +1403,11 @@ plume::RenderPipeline *GetPipelineLocked(const PipelineKey &key, const PipelineI
   }
   uint8_t kind = 0;
   uint64_t memo_epoch = 0;
+  const auto t_slow = std::chrono::steady_clock::now();
   plume::RenderPipeline *result = GetPipelineSlow(key, inputs, kind, memo_epoch);
+  g_pl_slow_calls.fetch_add(1, std::memory_order_relaxed);
+  g_pl_slow_ns.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - t_slow).count()), std::memory_order_relaxed);
   if (memo_on && result) {
     // The least recent (way 1) goes; the new one takes way 0. (GetPipelineSlow may have filled this set for a generic
     // key: both are kept.)
@@ -1149,9 +1447,22 @@ static plume::RenderPipeline *GetPipelineSlow(const PipelineKey &key, const Pipe
       return pend->second.generic;
     }
     std::unique_ptr<plume::RenderPipeline> ready;
+    const auto t_spec = std::chrono::steady_clock::now();
+    struct SpecTimer {
+      std::chrono::steady_clock::time_point t;
+      ~SpecTimer() {
+        g_pl_spec_calls.fetch_add(1, std::memory_order_relaxed);
+        g_pl_spec_ns.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now() - t).count()), std::memory_order_relaxed);
+      }
+    } spec_timer{t_spec};
+    const auto t_request = std::chrono::steady_clock::now();
     const SpecState state = g_spec_failed.contains(hash) ? SpecState::Failed
                                                          : SpecialisedPipeline(key, hash, *inputs.layout, ready);
-    if (state != SpecState::Pending)
+    g_pl_spec_request_ns.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                std::chrono::steady_clock::now() - t_request).count()),
+                                   std::memory_order_relaxed);
+    if (state != SpecState::Pending && state != SpecState::Busy)
       g_spec_pending.erase(hash);
     if (state == SpecState::Ready && ready) {
       g_list.Append(key, hash, *inputs.layout);
@@ -1176,6 +1487,9 @@ static plume::RenderPipeline *GetPipelineSlow(const PipelineKey &key, const Pipe
       p.generic = pipeline;
       kind = 1;
       memo_epoch = epoch;
+    } else if (state == SpecState::Busy) {
+      kind = 1;
+      memo_epoch = epoch - 1;  // never the current epoch: the next draw asks again
     } else {
       kind = 2;  // failed: the generic one from now on
     }
@@ -1184,7 +1498,11 @@ static plume::RenderPipeline *GetPipelineSlow(const PipelineKey &key, const Pipe
   std::unique_ptr<plume::RenderPipeline> pipeline;
   bool claimed = false;
   if (!TakePrebuilt(key, hash, pipeline, claimed)) {
+    const auto t0 = std::chrono::steady_clock::now();
     pipeline = Build(key, inputs);
+    g_pl_builds.fetch_add(1, std::memory_order_relaxed);
+    g_pl_build_ns.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - t0).count()), std::memory_order_relaxed);
     if (pipeline && !claimed)
       g_list.Append(key, hash, *inputs.layout);
   }
@@ -1271,3 +1589,34 @@ PipelineCounts PipelineCountsLocked() {
 }
 
 } // namespace renut::gpu
+
+namespace renut::gpu {
+namespace {
+// The 10 s report (PipelineList::Writer): counts since the last call.
+std::string PipelineWaitReport() {
+  const auto take = [](std::atomic<uint64_t> &a) { return a.exchange(0, std::memory_order_relaxed); };
+  const uint64_t waits = take(g_pl_waits), wait_ns = take(g_pl_wait_ns), builds = take(g_pl_builds),
+                 build_ns = take(g_pl_build_ns), lock_ns = take(g_pl_lock_ns);
+  const uint64_t spec = take(g_pl_spec_calls), spec_ns = take(g_pl_spec_ns), busy = take(g_pl_spec_busy),
+                 slow = take(g_pl_slow_calls), slow_ns = take(g_pl_slow_ns);
+  // Dunwall (2026-11-12): where a specialised lookup's time goes, the list's writer, the DKSH cache's reads.
+  const uint64_t request_ns = take(g_pl_spec_request_ns), queued = take(g_list.queued),
+                 queued_ns = take(g_list.queued_ns), written = take(g_list.written), write_ns = take(g_list.write_ns),
+                 syncs = take(g_list.syncs), sync_ns = take(g_list.sync_ns), max_io_ns = take(g_list.max_io_ns);
+#if defined(PLUME_DEKO3D)
+  const std::string dksh = banjo::renut_gpu::deko3d::DkshReadReport();
+#else
+  const std::string dksh = "no DKSH cache";
+#endif
+  return fmt::format("; pipelines: {} waits for a prebuild worker ({:.1f} ms), {} built on the render thread "
+                     "({:.1f} ms), {:.1f} ms taking the prebuild lock; {} slow lookups ({:.1f} ms), {} of them "
+                     "specialised ({:.1f} ms, {:.1f} ms of it asking for the specialised one, {} found the prebuild "
+                     "lock busy); list: {} records queued ({:.1f} ms on the render thread), writer {} written "
+                     "({:.1f} ms), {} syncs ({:.1f} ms, slowest write or sync {:.1f} ms); {}",
+                     waits, double(wait_ns) / 1e6, builds, double(build_ns) / 1e6, double(lock_ns) / 1e6, slow,
+                     double(slow_ns) / 1e6, spec, double(spec_ns) / 1e6, double(request_ns) / 1e6, busy, queued,
+                     double(queued_ns) / 1e6, written, double(write_ns) / 1e6, syncs, double(sync_ns) / 1e6,
+                     double(max_io_ns) / 1e6, dksh);
+}
+}  // namespace
+}  // namespace renut::gpu

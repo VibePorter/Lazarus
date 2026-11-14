@@ -465,8 +465,9 @@ REXCVAR_DEFINE_INT32(me2_deko3d_arena_max_mb, 1024, "ME2",
                      "deko3d: the largest size of the block arena the GPU's memory blocks come from (reserved from the "
                      "heap at the first block, never given back). The heap's rest holds the game's memory: a smaller "
                      "arena leaves the game more (blocks that do not fit come from the heap; the texture reserve rule "
-                     "evicts unused textures sooner). 1024 = as before 2026-11-06")
-    .range(256, 1024)
+                     "evicts unused textures sooner). 1024 = as before 2026-11-06. Dunwall (2026-11-12): 0 = no "
+                     "arena at all (every block from the heap; plume reserves none below 256 MB)")
+    .range(0, 1024)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(me2_renut_budget_arena_floor_mb, 128, "ME2",
                      "me2_renut_budget_chunk_free: block arena space kept for buffers, rings and code (not counted as "

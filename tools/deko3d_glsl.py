@@ -91,7 +91,11 @@ def strip_index_mask(expr):
     for _ in range(4):
         while e.startswith('(') and matching(e, 0, '(', ')') == len(e) - 1:
             e = e[1:-1].strip()
-        m = re.match(r'^(.*?)\s*&\s*67108863u$', e, re.S)
+        # 67108863u = 0x03FFFFFF (ME2's mask); 1048575u = 0x000FFFFF (Dunwall, 2026-11-08: bits 20-25 carry the
+        # texture fetch exponent adjust). Without the second, every game texture became a computed bindless handle,
+        # which Ryujinx's shader translator cannot follow ("Failed to find handle source"): it read zeros (green
+        # movies) and the bound-texture path was never used on the console either.
+        m = re.match(r'^(.*?)\s*&\s*(?:67108863u|1048575u)$', e, re.S)
         if not m:
             break
         left = m.group(1).strip()

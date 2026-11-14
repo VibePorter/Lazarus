@@ -49,6 +49,15 @@ REXCVAR_DEFINE_BOOL(mgr_renut_vsync_relaxed, true, "MGR",
 
 REXCVAR_DECLARE(bool, me2_unlock_framerate);  // me2_src/me2_hooks.cpp
 
+// ME2 (2026-11-14, user: a frame cap of one's own, or the display's refresh rate): -1 keeps the game's pacing (its
+// presentation interval on the 60 Hz grid, or none with me2_unlock_framerate); 0 or more replaces it (also with
+// me2_unlock_framerate on). A late frame goes at once (relaxed). Read every frame: a change applies at once.
+REXCVAR_DEFINE_INT32(me2_fps_limit, -1, "ME2",
+                     "Frame rate cap: -1 = the game's own (its presentation interval: 30 / 60 fps; none with "
+                     "me2_unlock_framerate); 0 = the display's refresh rate (the PC's primary monitor, 60 Hz on the "
+                     "Switch); N = at most N frames a second")
+    .range(-1, 1000);
+
 namespace sa2::renut {
 
 namespace {
@@ -157,8 +166,71 @@ void SleepUntil(Clock::time_point t) {
 // sa2-nx (2026-10-20, banjo_display_sync): the last release taken from the display's refresh (steady_clock ns).
 uint64_t g_display_previous_ns = 0;
 
+namespace {
+
+// The display's refresh rate (Hz) for me2_fps_limit = 0: the primary monitor's current mode on the PC (asked again every
+// 5 s, so a mode change is followed), 60 on the Switch (its screen and TV output).
+uint32_t DisplayRefreshHz() {
+#if defined(_WIN32)
+  static uint32_t hz = 0;
+  static Clock::time_point asked{};
+  const auto now = Clock::now();
+  if (!hz || now - asked > std::chrono::seconds(5)) {
+    asked = now;
+    DEVMODEW mode{};
+    mode.dmSize = sizeof(mode);
+    const uint32_t found = EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode) && mode.dmDisplayFrequency > 1
+                               ? uint32_t(mode.dmDisplayFrequency)
+                               : 60;
+    if (found != hz) REXLOG_INFO("[renut] display refresh rate {} Hz (me2_fps_limit = 0 paces to it)", found);
+    hz = found;
+  }
+  return hz;
+#else
+  return 60;
+#endif
+}
+
+// me2_fps_limit >= 0: frames released 1 / hz apart on a grid of their own; a late frame goes at once (under half a
+// period late the grid is kept, more and the next is due a period after this one).
+void PaceAtRate(uint32_t hz) {
+  static Clock::time_point due{};
+  static Clock::duration current{};
+  static uint32_t logged_hz = 0;
+  hz = std::clamp<uint32_t>(hz, 10, 1000);
+  const auto period =
+      std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(1.0 / double(hz)));
+  const auto now = Clock::now();
+  if (hz != logged_hz) {
+    logged_hz = hz;
+    REXLOG_INFO("[renut] frame cap {} fps (me2_fps_limit {})", hz, REXCVAR_GET(me2_fps_limit));
+  }
+  if (period != current || due == Clock::time_point{}) {
+    current = period;
+    due = now + period;
+    NoteRelease(now, now, false);
+    return;
+  }
+  if (now <= due) {
+    SleepUntil(due);
+    due += period;
+    NoteRelease(now, Clock::now(), false);
+    return;
+  }
+  due = now - due < period / 2 ? due + period : now + period;
+  NoteRelease(now, now, true);
+}
+
+}  // namespace
+
 void PaceSwap(uint32_t device_va) {
-  static const bool on = REXCVAR_GET(sa2_renut_vblank_pacing) && !REXCVAR_GET(me2_unlock_framerate);
+  static const bool pacing = REXCVAR_GET(sa2_renut_vblank_pacing);
+  static const bool on = pacing && !REXCVAR_GET(me2_unlock_framerate);
+  if (const int32_t limit = REXCVAR_GET(me2_fps_limit); limit >= 0 && pacing && device_va) {
+    PaceAtRate(limit == 0 ? DisplayRefreshHz() : uint32_t(limit));  // ME2 (2026-11-14): me2_fps_limit
+    g_started = false;  // the game's own pacing starts afresh if the cap is taken off
+    return;
+  }
   if (!on || !device_va) return;
   const auto *interval_word = ::renut::gpu::GuestPtr<const be_u32>(device_va + kDeviceOffsetPresentationInterval);
   const uint32_t refreshes = RefreshesPerFrame(interval_word ? uint32_t(*interval_word) : 1);

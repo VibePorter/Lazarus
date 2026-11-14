@@ -27,6 +27,7 @@
 #include <fmt/format.h>
 #include <xxhash.h>
 
+#include <rex/memory/utils.h>
 #include <rex/system/xmemory.h>
 
 #include "renut_engine/gpu/backend/backend.h"
@@ -85,6 +86,12 @@ REXCVAR_DEFINE_INT32(mgr_renut_diag_raster_override, 0, "MGR/Diagnostics",
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_STRING(banjo_renut_diag_blend_skip_exclude, "", "Banjo/Renut",
                       "Diagnostic: pixel shader hashes (hex, comma separated) banjo_gpu_blend_skip leaves alone");
+// ME2 (2026-11-12, backported from the Dunwall port / sa2-nx 2026-10-28 / naruto-nx 7509546): see ClearTargets.
+REXCVAR_DEFINE_BOOL(sa2_renut_clear_repeat, true, "SA2/Renderer",
+                    "Renut's renderer: a whole clear of a target that holds exactly that clear already (its last whole "
+                    "clear had the same values, and nothing has drawn into it, written its EDRAM through another view "
+                    "or replaced its image since) is not sent to the GPU. The same pixels. Off: every clear sent")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(me2_renut_msaa4x_downsample, true, "ME2/Renderer",
                     "Resolve a 4x view of EDRAM that nothing drew to from the single-sample view over the same memory, "
                     "2x2 averaged, as the Xbox 360 does (ME2's half-size scene for the depth of field)");
@@ -97,11 +104,29 @@ REXCVAR_DEFINE_BOOL(me2_renut_msaa_viewport_fix, true, "ME2/Renderer",
 REXCVAR_DEFINE_BOOL(me2_renut_depth_resolve_average, true, "ME2/Renderer",
                     "Resolve a multisampled depth target to the mean of its samples (the pixel centre's depth) "
                     "instead of sample 0: ME2 lights its 2x scene in 1x against that depth (half-black faces)");
+// ME2 (2026-11-12, backported from the Dunwall port, where the cvar was born with this name: the rats, 3-11 fps):
+// UE3's polygon offsets change with distance (shadow depths, decals: 6e-6, 1.6e-5, 1.9e-5, 2.1e-5, 3.1e-5 ...), and each
+// value in the pipeline key made a pipeline of its own: hundreds of new pipelines every 10 s for as long as the scene
+// lasted, each one built on the render thread and a pipeline list record written to the SD card. On deko3d the offset is
+// dynamic state instead (dkCmdBufSetDepthBias before the draw): one pipeline for every value (key.reserved bit 2,
+// kKeyDynamicBias).
+REXCVAR_DEFINE_BOOL(me2_renut_poly_offset_dynamic, true, "ME2/Renderer",
+                    "deko3d: the game's polygon offset is set per draw (dynamic depth bias), not part of the pipeline: "
+                    "no new pipeline for every offset value")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(me2_renut_poly_offset, true, "ME2/Renderer",
                     "Apply the game's polygon offset (depth bias, slope-scaled depth bias) to draws: UE3's shadow "
                     "depths need it");
 REXCVAR_DEFINE_BOOL(me2_renut_resolve_exp_bias, true, "ME2/Renderer",
                     "Resolves apply their exponent bias (D3DRESOLVE Flags bits 26-31; UE3's HDR scene resolves use -3)");
+// ME2 (2026-11-14, from the Dunwall port; Dunwall: the background black instead of blurred when a sword hits
+// the player): 16_16 / 16_16_16_16 (fixed point) targets hold -32...32 on the Xenos; Renut keeps them in SNORM images
+// (-1...1) and applied a resolve's exponent bias alone (Dunwall's -5 gave 1/32 a resolve). The resolve now takes the
+// target's -32...32 range first: 5 is added to the bias, as the SDK's emulated renderer does (sdk/src/graphics/util/
+// draw.cpp GetResolveInfo). "[resolve-range]" logs the first few such resolves.
+REXCVAR_DEFINE_BOOL(me2_renut_fixed16_resolve_range, true, "ME2/Renderer",
+                    "Resolves of 16_16 / 16_16_16_16 (fixed point) targets take the target's -32...32 range: 5 is "
+                    "added to the exponent bias. Off = the bias alone (as before 2026-11-14)");
 REXCVAR_DEFINE_BOOL(me2_renut_resolve_fuse_exp_bias, true, "ME2/Renderer",
                     "Apply exponent bias during compatible single-sample deko3d color resolves, avoiding the "
                     "scratch copy and second draw. Off restores separate passes")
@@ -146,6 +171,12 @@ REXCVAR_DEFINE_BOOL(sa2_renut_chain_reuse_verify, false, "SA2/Renderer",
 REXCVAR_DEFINE_BOOL(me2_renut_repeat_draws, false, "ME2/Renderer",
                     "Renut's renderer: a chain draw on the same device as the previous draw (Umbra's query boxes) "
                     "binds only its geometry and draws, keeping the rest of the previous draw's state")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// ME2 (2026-11-12, from the Dunwall port's dh_renut_draw_fastpath, after naruto-nx 7509546): see DrawFastPathState.
+REXCVAR_DEFINE_BOOL(me2_renut_draw_fastpath, true, "ME2/Renderer",
+                    "deko3d: a chain draw whose device changed only in its vertex streams, index buffer, vertex fetch "
+                    "constants and declaration chunks (their other bytes the same) binds only its geometry, pushes its "
+                    "float constants and draws on the previous draw's state. Off: the full path for every draw")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(sa2_renut_inline_line_compare, true, "SA2/Renderer",
                     "Renut's renderer on deko3d: the pushed shared constants' 64-byte lines are compared with what the "
@@ -203,6 +234,17 @@ ChainHint g_chain_hint;  // sa2-nx (2026-10-20): draw.h
 void ForgetRepeatLocked();  // ME2 (2026-10-28, me2_renut_repeat_draws): before DrawStateLocked
 
 namespace {
+
+// sa2_renut_clear_repeat: once, and the count of clears not sent (render thread), logged every 3,000.
+bool ClearRepeatOn() {
+  static const bool on = REXCVAR_GET(sa2_renut_clear_repeat);
+  return on;
+}
+void CountRepeatedClear() {
+  static uint64_t count = 0;
+  if (++count % 3000 == 1)
+    RGPU_INFO("[renut] clears of a target that held that clear already, not sent: {} (sa2_renut_clear_repeat)", count);
+}
 
 // sa2-nx (2026-10-20, sa2_renut_lean_diagnostics): whether the per-draw diagnostic counts are kept (their lines are
 // logged), once.
@@ -1389,6 +1431,50 @@ uint32_t DrawProfileLabel(const DrawCall &call, const Targets &t, const ShaderRe
   return TargetsProfileLabel(t);
 }
 
+// me2-nx-deko (2026-11-07, me2_deko3d_zcull_invalidate): a console-only halo around characters after a docked/handheld
+// switch (render scale 0.75x <-> 0.667x): gone with zcull off (banjo_deko3d_zcull = false) but the GPU time doubled
+// (46 ms vs ~20). deko3d drops its Zcull data only when a depth target of another GPU address is bound (MME
+// ConditionalZcullInvalidate on the IOVA): a depth image of another size can keep culling with stale data. Modes (after
+// a framebuffer bind with a depth target, deko3d only): 0 never, 1 once after each render-scale change, 2 at the first
+// depth bind of every frame, 3 at every depth bind.
+REXCVAR_DEFINE_INT32(me2_deko3d_zcull_invalidate, 0, "ME2/Renderer",
+                     "deko3d Zcull data dropped: 0 never, 1 once after a render-scale change (docked/handheld switch), "
+                     "2 at the first depth bind of each frame, 3 at every depth bind")
+    .range(0, 3)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+namespace {
+void ZcullAfterDepthBindLocked(plume::RenderCommandList *cmd) {
+#if defined(PLUME_DEKO3D)
+  static const int32_t mode = REXCVAR_GET(me2_deko3d_zcull_invalidate);
+  if (!mode || !IsDeko3D() || !cmd || !banjo::renut_gpu::Deko3DZcullOn())
+    return;
+  static uint64_t seen_changes = 0, last_frame = ~uint64_t(0), invalidations = 0;
+  bool now = mode == 3;
+  const uint64_t changes = ResolutionChangesLocked();
+  if (changes != seen_changes) {
+    seen_changes = changes;
+    now = true;
+    RGPU_WARN("[zcull] render scale changed: Zcull data dropped (me2_deko3d_zcull_invalidate {}, {} so far)", mode,
+              invalidations + 1);
+  }
+  if (mode == 2) {
+    const uint64_t frame = TextureFrameLocked();
+    if (frame != last_frame) {
+      last_frame = frame;
+      now = true;
+    }
+  }
+  if (now) {
+    ++invalidations;
+    banjo::renut_gpu::record::Deko3DInvalidateZcull(cmd);
+  }
+#else
+  (void)cmd;
+#endif
+}
+}  // namespace
+
 bool BindTargets(const Targets &t) {
   if (t.depth && t.depth->handed)
     DepthHandOverBeforeBindLocked(t.depth, nullptr, 0);  // banjo-nx (2026-10-19, banjo_deko3d_depth_handover)
@@ -1460,6 +1546,8 @@ bool BindTargets(const Targets &t) {
   if (g_bound.framebuffer != framebuffer) {
     State().command_list->setFramebuffer(framebuffer);
     g_bound.framebuffer = framebuffer;
+    if (t.depth)
+      ZcullAfterDepthBindLocked(State().command_list);
   }
   return true;
 }
@@ -2467,6 +2555,54 @@ struct TextureSlotMemo {
 constexpr uint32_t kTextureMemoEntries = 512;
 TextureSlotMemo g_texture_slot_memo[kTextureMemoEntries];
 
+// me2-nx-deko (2026-11-07, me2_renut_diag_stale_scale): the console-only halo after a docked/handheld switch (the
+// render scale 0.75x -> 0.667x; same scale in both modes = no halo; Ryujinx never shows it). Every texture bind whose
+// descriptor carries a scale (index bits 26-28, HostTexture::scale) that is neither the scene's nor the final pass's
+// now is logged once per texture and scale ('[stale-scale]'), with a count every 10 s. Code 0 (1x) cannot be told
+// from an ordinary texture's and is not checked.
+REXCVAR_DEFINE_BOOL(me2_renut_diag_stale_scale, false, "ME2/Diagnostics",
+                    "Log textures sampled at another render scale than the scene's and the final pass's "
+                    "('[stale-scale]' lines; the halo after a docked/handheld switch)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+namespace {
+struct StaleScaleDiag {
+  std::unordered_map<uint64_t, uint32_t> seen;  // (va << 3 | code) -> binds
+  uint64_t binds = 0, logged = 0;
+  std::chrono::steady_clock::time_point report_at{};
+};
+StaleScaleDiag g_stale_scale;
+
+inline void NoteTextureScaleLocked(u32 texture_va, u32 index, u32 slot, bool from_target) {
+  static const bool on = REXCVAR_GET(me2_renut_diag_stale_scale);
+  if (!on || (index & kStackedTextureBit))
+    return;
+  const u32 code = (index >> kResolutionScaleShift) & 7u;
+  if (!code && !from_target)  // 1x: only a GPU-drawn texture's is a render scale (an ordinary texture's is 1x too)
+    return;
+  const RenderScale scene = ResolutionScale(), ui = UiScaleLocked();
+  if (code == scene.code || code == ui.code)
+    return;
+  StaleScaleDiag &d = g_stale_scale;
+  ++d.binds;
+  uint32_t &n = d.seen[(uint64_t(texture_va) << 3) | code];
+  if (n++ == 0 && d.logged < 200) {
+    ++d.logged;
+    RenderScale old{code};
+    RGPU_WARN("[stale-scale] texture {:08X} sampled at {:.3g}x (fetch slot {}{}) while the scene is {:.3g}x and the "
+              "final pass {:.3g}x (final pass now: {}), frame {}",
+              texture_va, old.Factor(), slot, from_target ? ", GPU-drawn" : "", scene.Factor(), ui.Factor(),
+              UiPhaseLocked() ? "yes" : "no", TextureFrameLocked());
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (now >= d.report_at) {
+    d.report_at = now + std::chrono::seconds(10);
+    RGPU_WARN("[stale-scale] so far: {} binds of {} textures at another scale than the scene's", d.binds,
+              d.seen.size());
+  }
+}
+}  // namespace
+
 // sa2-nx (2026-10-20, sa2_renut_chain_reuse): 'slot_fx' (32 entries, or null) receives each bound slot's effects (its
 // memo entry's on a hit, the bind's otherwise) and 'all_memo' whether every bound slot went through the memo (a
 // texture header to key it), for the chain's reuse of the next draw.
@@ -2533,6 +2669,7 @@ void FillTextures(const GuestDevice &device, u32 fetch_mask, SharedConstants &sc
         banjo::renut_gpu::CountDepthWords(true);
       sc.texture_indices[m.dim][r] = m.index;
       sc.sampler_indices[r] = m.sampler;
+      NoteTextureScaleLocked(texture_va, m.index, r, false);
       if (slot_fx)
         slot_fx[r] = m.fx;
       continue;
@@ -2548,6 +2685,12 @@ void FillTextures(const GuestDevice &device, u32 fetch_mask, SharedConstants &sc
     // shader_common.h), with the fetch constant's filter between layers and
     // its Z address mode.
     u32 index = binding.slot | binding.scale.code << kResolutionScaleShift;
+    // ME2 (2026-11-12, backported from the Dunwall port): the fetch constant's exponent adjust, applied by the shader
+    // (renutExpScale in shader_common.h, bits 20-25). The Xbox's FXAA reads one image through fetch constants with
+    // adjusts 0, -1 and -2 (Dunwall: bright outlines on every edge without it); any texture read with an adjust was
+    // 2^n off before.
+    if (const i32 exp_adjust = fetch.ExpAdjust())
+      index |= (u32(exp_adjust) & 0x3Fu) << kExpAdjustShift;
     if (binding.stacked) {
       index |= kStackedTextureBit;
       if (fetch.VolumeMagFilter() != TextureFilter::Point ||
@@ -2558,6 +2701,7 @@ void FillTextures(const GuestDevice &device, u32 fetch_mask, SharedConstants &sc
         index |= kStackedLayerWrapBit;
     }
     sc.texture_indices[dim][r] = index;
+    NoteTextureScaleLocked(texture_va, index, r, binding.from_target);
     sc.sampler_indices[r] = SamplerWord(SamplerSlotLocked(fetch, binding.lod_scale, binding.min_level,
                                                           binding.smooth_minify));
     if (memo) {
@@ -3541,6 +3685,13 @@ const u32 *BoolSpecMask(const ShaderRecord *r) {
   return r->bool_spec_mask;
 }
 
+// me2_renut_poly_offset_dynamic: the polygon offset of the key MakeKey made last (render thread), set per draw.
+struct DynamicBias {
+  int32_t units = 0;
+  u32 clamp = 0, slope = 0;  // float bits
+};
+DynamicBias g_key_bias;
+
 PipelineKey MakeKey(const GuestDevice &device, const ShaderRecord *vs, const ShaderRecord *ps,
                     const VertexDeclarationRecord *declaration, const Targets &t, u32 primitive,
                     bool per_instance, const u32 *booleans, u32 alpha_test_func) {
@@ -3591,6 +3742,7 @@ PipelineKey MakeKey(const GuestDevice &device, const ShaderRecord *vs, const Sha
   // the decals before it. Neither the Xbox 360 nor Vulkan offsets a depth the shader writes, but deko3d did, Ryujinx
   // and the console alike: the scene's depth moved 2e-5 toward the camera, and on an animated face in a cutscene the
   // lighting passes failed it triangle by triangle (black patches jumping from frame to frame).
+  g_key_bias = {};
   if (t.depth && REXCVAR_GET(me2_renut_poly_offset) && ((u32(cp.DepthControl) >> 4) & 7) != 7) {
     const u32 mode = u32(cp.ModeControl);
     const auto *po = reinterpret_cast<const be_f32 *>(dev.m_PointPacket);
@@ -3609,6 +3761,14 @@ PipelineKey MakeKey(const GuestDevice &device, const ShaderRecord *vs, const Sha
       key.depth_bias = int32_t(std::clamp<double>(double(offset) * 1099511627776.0, -1073741824.0, 1073741824.0));
       key.depth_bias_clamp = std::bit_cast<u32>(offset);
       key.depth_bias_slope = std::bit_cast<u32>(slope);
+      static const bool dynamic = IsDeko3D() && REXCVAR_GET(me2_renut_poly_offset_dynamic);
+      if (dynamic && (key.depth_bias || key.depth_bias_slope)) {
+        g_key_bias = {key.depth_bias, key.depth_bias_clamp, key.depth_bias_slope};
+        key.depth_bias = 0;
+        key.depth_bias_clamp = 0;
+        key.depth_bias_slope = 0;
+        key.reserved |= kKeyDynamicBias;
+      }
       static unsigned logged = 0;
       if (logged < 8 && (offset != 0.0f || scale != 0.0f)) {
         ++logged;
@@ -4507,18 +4667,67 @@ void FinishRecordingLocked(VideoState &) {
 
 } // namespace detail
 
+namespace {
+// ME2 (2026-11-12, backported from the Dunwall port: a console crash at the main menu during a load): a queued fill
+// read guest memory that was no longer mapped (the start of a page: a vertex buffer freed, or a stream sized past its
+// allocation, between the draw and this flush, there a forced submit for a memexport draw). The render thread faulted.
+// Each fill's guest pages are checked first; one that cannot be read is converted from zeros and logged.
+bool GuestRangeReadable(const u8 *guest, size_t bytes) {
+  // The host mapping itself (the Switch's guest memory core tracks it; VirtualQuery / mincore elsewhere), not the
+  // guest heap's page table: Renut's own blocks (the Begin*Vertices scratch, records::AllocPhysicalBlock) are mapped
+  // without being in it.
+  if (!guest || !bytes)
+    return true;
+  static const size_t page = rex::memory::page_size();
+  size_t off = 0;
+  while (off < bytes) {
+    u8 *at = const_cast<u8 *>(guest + off);
+    size_t len = bytes - off + page;
+    rex::memory::PageAccess access = rex::memory::PageAccess::kNoAccess;
+    if (!rex::memory::QueryProtect(at, len, access) || access == rex::memory::PageAccess::kNoAccess)
+      return false;
+    const size_t in_page = reinterpret_cast<uintptr_t>(at) & (page - 1);  // len counts from the page's start
+    if (len <= in_page)
+      return false;
+    off += len - in_page;
+  }
+  return true;
+}
+
+std::atomic<u32> g_unreadable_fills{0};
+
+void LogUnreadableFill(const char *kind, const u8 *guest, size_t bytes, u32 stride, u32 count) {
+  const u32 n = g_unreadable_fills.fetch_add(1, std::memory_order_relaxed);
+  if (n < 16 || (n & (n - 1)) == 0)
+    RGPU_WARN("[vertex-fill] {} #{}: guest {:08X} + {} bytes (stride {}, {} vertices) is not mapped any more: zeros "
+              "instead", kind, n + 1, REX_KERNEL_MEMORY()->HostToGuestVirtual(guest), bytes, stride, count);
+}
+} // namespace
+
 void FlushVertexFillsLocked() {
   ++g_flush_serial;  // banjo-nx: banjo_renut_exact_streams' intervals
   banjo::renut_gpu::CountKick();
   for (const PendingStreamFill &f : g_stream_fills) {
+    const size_t span = f.count ? size_t(f.count - 1) * f.stride + std::max<u32>(f.stride, 4) : 0;
+    if (!GuestRangeReadable(f.guest, span)) {
+      LogUnreadableFill("stream", f.guest, span, f.stride, f.count);
+      std::memset(f.host, 0, size_t(std::max<u32>(f.count, 1)) * f.stream.host_stride);
+      continue;  // not cached either
+    }
     ConvertVertices(f.stream, f.guest, f.stride, f.count, f.endian, f.host);
     if (f.cacheable)
       TrackConvertedStream(f);
   }
   g_stream_fills.clear();
   ++g_queued_generation;  // banjo-nx (2026-10-19): the table emptied
-  for (const PendingCopy &c : g_copy_fills)
+  for (const PendingCopy &c : g_copy_fills) {
+    if (!GuestRangeReadable(c.src, c.size)) {
+      LogUnreadableFill("copy", c.src, c.size, 0, 0);
+      std::memset(c.dst, 0, c.size);
+      continue;
+    }
     std::memcpy(c.dst, c.src, c.size);
+  }
   g_copy_fills.clear();
   ++g_fetch_copy_generation;
 }
@@ -4613,6 +4822,123 @@ struct ViewportReuse {
 };
 ViewportReuse g_viewport_reuse;
 
+// sa2-nx (2026-10-20, sa2_renut_chain_reuse): the previous chain draw's texture words, key, pipeline and texture push
+// (DrawStateLocked). ME2 (2026-11-12, me2_renut_draw_fastpath, from the Dunwall port): at file scope, so that a draw
+// on the fast path (or a repeat, me2_renut_repeat_draws) can carry their seq on to the next draw (they were statics
+// inside DrawStateLocked).
+struct TexturesReuse {
+  uint64_t seq = 0, frame = 0, epoch = 0, depth_epoch = 0;
+  u32 mask = 0;
+  const HostSurface *depth = nullptr;
+  u32 header[32][6] = {};
+  BindEffects fx[32];
+  u32 indices[3][32] = {};
+  u32 samplers[32] = {};
+};
+TexturesReuse g_treuse;
+struct KeyReuse {
+  uint64_t seq = 0;
+  const ShaderCacheEntry *vs_entry = nullptr, *ps_entry = nullptr;
+  uint64_t layout_hash = 0, surface_epoch = 0;
+  u32 primitive = 0, alpha_test_func = 0, color_count = 0;
+  bool per_instance = false;
+  int ab_off = 0;
+  HostSurface *colors[d3d::kMaxRenderTargets] = {};
+  HostSurface *depth = nullptr;
+  PipelineKey key{};
+  DynamicBias bias;  // me2_renut_poly_offset_dynamic
+};
+KeyReuse g_key_reuse;
+struct PipelineReuse {
+  uint64_t seq = 0, lookups = 0, epoch = 0;
+  plume::RenderPipeline *pipeline = nullptr;
+};
+PipelineReuse g_pipe_reuse;
+uint64_t g_texture_push_seq = 0, g_texture_push_count = 0;
+
+#if defined(PLUME_DEKO3D)
+// ME2 (2026-11-12, me2_renut_draw_fastpath; from the Dunwall port, after naruto-nx 7509546's
+// naruto_renut_draw_fastpath): the state a chain draw keeps from the full draw before it when the device changed only in
+// the chunks of its vertex streams, index buffer, vertex fetch constants and vertex declaration word, and the bytes of
+// those chunks that are not stream, stride or index words read the same. Such a draw prepares and binds its geometry,
+// pushes the float constants and draws; the targets, textures, shared constants, viewport, key and pipeline stay bound
+// from the draw before. Every other byte of the allowed chunks is compared with a copy, the per-instance flag must
+// agree, and the shared constants' first vertex (the guest's vertex index) is pushed again when it differs.
+// ME2's device (XDK 8955; Dunwall's XDK 21076 numbers in brackets): chunk 27-29 the texture fetch slots 24-25 and the
+// vertex fetch constants (the same), chunk 56 the vertex declaration word at 11824 [chunk 63, 12224], chunks 66-69 the
+// index buffer, targets, streams, strides and textures, 12416-12671 [72-75, 12800-13055]. The shader pointers (12700,
+// 12704) are past them: a new shader is a changed chunk, the full path.
+constexpr u32 kFastHeadFirst = 1728, kFastHeadCount = 48;    // chunk 27's texture fetch slots 24-25, before the vertex fetches
+constexpr u32 kFastDeclFirst = 11776, kFastDeclCount = 64;   // chunk 56 whole (the vertex declaration word is in it)
+constexpr u32 kFastTailFirst = 12416, kFastTailCount = 256;  // chunks 66-69: index buffer, targets, streams, strides, textures
+constexpr u32 kFastStreamsGap = 12532;  // the 4 bytes between the stream sources and the strides
+static_assert(ChainChunkOf(1727) == 26 && ChainChunkOf(kFastHeadFirst) == 27 && ChainChunkOf(1919) == 29 &&
+              kChainHeadChunks == 30);
+static_assert(ChainChunkOf(kFastDeclFirst) == 56 && ChainChunkOf(kFastDeclFirst + kFastDeclCount - 1) == 56 &&
+              ChainChunkOf(kFastDeclFirst - 1) == 55 && ChainChunkOf(kFastDeclFirst + kFastDeclCount) == 57);
+static_assert(ChainChunkOf(kFastTailFirst) == 66 && ChainChunkOf(kFastTailFirst - 1) == 65 &&
+              ChainChunkOf(kFastTailFirst + kFastTailCount - 1) == 69 &&
+              ChainChunkOf(kFastTailFirst + kFastTailCount) == 70);
+static_assert(d3d::kDeviceOffsetVertexDeclaration >= kFastDeclFirst &&
+              d3d::kDeviceOffsetVertexDeclaration + 4 <= kFastDeclFirst + kFastDeclCount);
+static_assert(d3d::kDeviceOffsetIndexBuffer == 12444 && d3d::kDeviceOffsetRenderTargets == 12448 &&
+              d3d::kDeviceOffsetDepthStencil == 12464 && d3d::kDeviceOffsetStreamSources == 12468 &&
+              d3d::kDeviceOffsetStreamSources + 4 * 16 == kFastStreamsGap && d3d::kDeviceOffsetStreamStrides == 12536 &&
+              d3d::kDeviceOffsetTextures == 12552 &&
+              d3d::kDeviceOffsetIndexBuffer >= kFastTailFirst &&
+              d3d::kDeviceOffsetTextures + 4 * d3d::kTextureFetchSlots <= kFastTailFirst + kFastTailCount &&
+              d3d::kDeviceOffsetPixelShader >= kFastTailFirst + kFastTailCount &&
+              d3d::kDeviceOffsetVertexShader >= kFastTailFirst + kFastTailCount);
+constexpr uint64_t kFastAllowed0 = (1ull << 27) | (1ull << 28) | (1ull << 29) | (1ull << 56);
+constexpr uint64_t kFastAllowed1 = (1ull << (66 - 64)) | (1ull << (67 - 64)) | (1ull << (68 - 64)) | (1ull << (69 - 64));
+
+struct DrawFastPathState {
+  uint64_t seq = 0;
+  uint64_t surface_epoch = 0, framebuffer_epoch = 0, texture_epoch = 0, depth_epoch = 0, texture_frame = 0;
+  uint64_t shared_pushes = 0;  // g_shared_pushes after the last push of 'sc': the buffer's texture lines are its
+  u32 primitive = 0;
+  bool per_instance = false;
+  const ShaderRecord *vs = nullptr, *ps = nullptr;  // ps as drawn (none for a depth-only draw)
+  uint64_t ps_hash = 0;                             // the draw's pixel shader (the final-pass check reads it)
+  const u32 *vs_used = nullptr, *ps_used = nullptr;
+  const VertexDeclarationRecord *declaration = nullptr;
+  const u32 *shader_strides = nullptr;
+  Targets targets;
+  PipelineKey key{};
+  plume::RenderPipeline *pipeline = nullptr;
+  const plume::RenderFramebuffer *framebuffer = nullptr;
+  SharedConstants sc{};
+  u32 profile_label = 0, color_writes = 0;
+  bool depth_writes = false, stencil_used = false, depth_only = false;
+  u8 head_bytes[kFastHeadCount] = {};
+  u8 decl_bytes[kFastDeclCount] = {};
+  u8 tail_bytes[kFastTailCount] = {};
+};
+DrawFastPathState g_fastpath;
+std::atomic<uint64_t> g_fastpath_draws{0}, g_fastpath_refused{0};
+#endif  // PLUME_DEKO3D
+
+// The memos of the last full draw hold for the next draw too after a draw that kept its state (the fast path, a
+// repeat): their seq moves on from 'was' to 'now'.
+void CarryChainMemos(uint64_t was, uint64_t now) {
+  if (g_targets_reuse.seq == was)
+    g_targets_reuse.seq = now;
+  if (g_viewport_reuse.seq == was)
+    g_viewport_reuse.seq = now;
+  if (g_treuse.seq == was)
+    g_treuse.seq = now;
+  if (g_texture_push_seq == was)
+    g_texture_push_seq = now;
+  if (g_key_reuse.seq == was)
+    g_key_reuse.seq = now;
+  if (g_pipe_reuse.seq == was)
+    g_pipe_reuse.seq = now;
+#if defined(PLUME_DEKO3D)
+  if (g_fastpath.seq == was)
+    g_fastpath.seq = now;
+#endif
+}
+
 // The descriptor words GetHostSurfaceLocked reads for a surface word of the device (0 0 0 for none).
 void SurfaceDescWords(u32 va, u32 out[3]) {
   out[0] = out[1] = out[2] = 0;
@@ -4678,6 +5004,7 @@ bool RepeatDrawLocked(VideoState &s, const u8 *device_state, const DrawCall &cal
   if (!BindStreams(device, call, *r.vs, r.shader_strides, r.declaration->layout, r.declaration->layout_hash, geometry,
                    gpu_streams))
     return false;
+  CarryChainMemos(r.seq, chain.seq);  // ME2 (2026-11-12): the state stays the last draw's (me2_renut_draw_fastpath)
   r.seq = chain.seq;
   if (gpu_profile::Timed()) {
     gpu_profile::Mark(s, r.profile_label);  // me2-nx-deko (2026-11-06): no-op unless another kind came between
@@ -4711,6 +5038,127 @@ bool RepeatDrawLocked(VideoState &s, const u8 *device_state, const DrawCall &cal
   return true;
 }
 
+#if defined(PLUME_DEKO3D)
+namespace {
+// Whether no diagnostic that reads every draw in full is on (once).
+bool FastPathDiagnosticsOff() {
+  return REXCVAR_GET(me2_renut_diag_skip_ps).empty() && REXCVAR_GET(mgr_renut_diag_raster_override) == 0 &&
+         banjo::renut_gpu::FurShellEvery() <= 1 && banjo::renut_gpu::PortraitFurShellEvery() <= 1 &&
+         REXCVAR_GET(sa2_renut_lean_diagnostics) && REXCVAR_GET(banjo_renut_diag_draw_log_s) <= 0;
+}
+
+// The bytes of the allowed chunks that are not stream sources, strides or the index buffer: as the last full draw's.
+inline bool FastPathBytesSame(const u8 *d) {
+  const DrawFastPathState &f = g_fastpath;
+  constexpr u32 t = kFastTailFirst;
+  return std::memcmp(d + kFastHeadFirst, f.head_bytes, kFastHeadCount) == 0 &&
+         std::memcmp(d + kFastDeclFirst, f.decl_bytes, kFastDeclCount) == 0 &&
+         std::memcmp(d + t, f.tail_bytes, d3d::kDeviceOffsetIndexBuffer - t) == 0 &&
+         std::memcmp(d + d3d::kDeviceOffsetRenderTargets, f.tail_bytes + (d3d::kDeviceOffsetRenderTargets - t),
+                     d3d::kDeviceOffsetStreamSources - d3d::kDeviceOffsetRenderTargets) == 0 &&
+         std::memcmp(d + kFastStreamsGap, f.tail_bytes + (kFastStreamsGap - t),
+                     d3d::kDeviceOffsetStreamStrides - kFastStreamsGap) == 0 &&
+         std::memcmp(d + d3d::kDeviceOffsetTextures, f.tail_bytes + (d3d::kDeviceOffsetTextures - t),
+                     t + kFastTailCount - d3d::kDeviceOffsetTextures) == 0;
+}
+
+// The draw on the fast path; false when something else changed too (the full path follows, and prepares it again).
+bool FastPathDrawLocked(VideoState &s, const GuestDevice &device, const u8 *device_state, const DrawCall &call,
+                        const ReplayConstants *replay) {
+  DrawFastPathState &f = g_fastpath;
+  if (!Video::EnsureCommandListLocked() || g_bound.generation != s.list_generation || !g_bound.layout ||
+      g_bound.pipeline != f.pipeline || g_bound.framebuffer != f.framebuffer || !g_bound.viewport_set ||
+      !g_bound.shared_words_set || !g_bound.pushed_shared_valid || f.surface_epoch != SurfaceEpochLocked() ||
+      f.framebuffer_epoch != FramebufferEpochLocked() || f.texture_epoch != g_texture_epoch ||
+      f.depth_epoch != g_depth_epoch || f.texture_frame != TextureFrameLocked())
+    return false;
+  // The final pass may start at this draw (the surface and texture epochs move: the full path then, which asks again;
+  // the second ask finds the pass started and does nothing more).
+  UiPhaseBeforeDrawLocked(device.U32(d3d::kDeviceOffsetRenderTargets), f.ps_hash);
+  if (f.surface_epoch != SurfaceEpochLocked() || f.texture_epoch != g_texture_epoch)
+    return false;
+  const Targets &targets = f.targets;
+  for (uint32_t i = 0; i < targets.color_count; ++i)
+    SyncEdramAliasLocked(targets.colors[i]);
+  if (TakeUtilityPassDrawnLocked()) {
+    // As the full path: whatever drew binds its own targets, layout, pipeline and viewport again.
+    g_bound.framebuffer = nullptr;
+    g_bound.pipeline = nullptr;
+    g_bound.layout = false;
+    g_bound.viewport_set = false;
+    return false;
+  }
+  if (g_bound.framebuffer != f.framebuffer || g_bound.pipeline != f.pipeline || !g_bound.layout)
+    return false;  // the alias sync drew
+  Geometry geometry;
+  if (!PrepareGeometry(device, call, geometry) || geometry.per_instance != f.per_instance)
+    return false;
+  plume::RenderCommandList *cmd = s.command_list;
+  const FloatConstants vs_constants = DrawFloatConstants(device_state, replay, false);
+  const FloatConstants ps_constants = DrawFloatConstants(device_state, replay, true);
+  const bool vs_dirty = !replay || !replay->vs_dirty || *replay->vs_dirty != 0;
+  const bool ps_dirty = !replay || !replay->ps_dirty || *replay->ps_dirty != 0;
+  if (vs_dirty)
+    PushFloatConstants(cmd, vs_constants, f.vs_used, g_bound.pushed_vs, f.vs->entry, g_pushed_buffers.address);
+  if (ps_dirty)
+    PushFloatConstants(cmd, ps_constants, f.ps_used, g_bound.pushed_ps, f.ps ? f.ps->entry : nullptr,
+                       g_pushed_buffers.address + kPushedFloatStride);
+  g_bound.vs_constants.replay = 0;
+  g_bound.ps_constants.replay = 0;
+  banjo::renut_gpu::CountPushedConstants(1, (vs_dirty ? 1 : 0) + (ps_dirty ? 1 : 0));
+  // The shared constants carry the draw's first vertex (the guest's vertex index): pushed again when it differs (the
+  // buffer holds 'sc' from the last push: only that line goes).
+  if (f.sc.tessellation[3] != geometry.first_vertex) {
+    f.sc.tessellation[3] = geometry.first_vertex;
+    const bool lines_held = f.shared_pushes == g_shared_pushes;
+    PushSharedConstants(cmd, f.sc,
+                        lines_held ? kTextureLines | (g_held_fetch_slots_zero ? kFetchSlotLines : 0u) : 0u);
+    f.shared_pushes = g_shared_pushes;
+    if (lines_held && g_texture_push_seq == f.seq)
+      g_texture_push_count = g_shared_pushes;  // the texture lines are still the last full draw's
+  }
+  banjo::renut_gpu::CountSharedConstants(true);
+  GpuStreams gpu_streams;  // none: no exports pending
+  if (!BindStreams(device, call, *f.vs, f.shader_strides, f.declaration->layout, f.declaration->layout_hash, geometry,
+                   gpu_streams))
+    return false;
+  if (gpu_profile::Timed()) {
+    gpu_profile::Mark(s, f.profile_label);
+    gpu_profile::CountDraw(s, f.profile_label);
+  }
+  for (u32 i = 0; i < targets.color_count; ++i)
+    if (f.color_writes & (1u << i))
+      ++targets.colors[i]->writes, targets.colors[i]->write_seq = ++g_edram_write_seq, NoteWriteSeq(targets.colors[i]);
+  if (targets.depth) {
+    if (f.depth_writes)
+      ++targets.depth->writes;
+    if (f.stencil_used)
+      targets.depth->stencil_used = true;
+  }
+  if (f.depth_only)
+    banjo::renut_gpu::CountDepthOnly();
+  UiNoteDrawLocked(targets.color_count ? targets.colors[0] : nullptr, f.ps_hash);
+  Video::NoteDrawLocked();
+  if (geometry.indexed)
+    SetIndexBuffer(cmd, geometry.index_view);
+  const uint32_t occlusion = g_occlusion_before_draw ? g_occlusion_before_draw(cmd) : UINT32_MAX;
+  if (geometry.indexed)
+    cmd->drawIndexedInstanced(geometry.index_count, geometry.instance_count, 0, 0, 0);
+  else
+    cmd->drawInstanced(geometry.vertex_count, geometry.instance_count, 0, 0);
+  if (occlusion != UINT32_MAX)
+    g_occlusion_after_draw(cmd, occlusion);
+  // The full path's memos of the last full draw hold for the next draw too: their seq moves on with this one.
+  CarryChainMemos(f.seq, g_chain_hint.seq);
+  const uint64_t n = g_fastpath_draws.fetch_add(1, std::memory_order_relaxed) + 1;
+  if ((n & 0x3FFFF) == 0)  // every 262,144 fast draws
+    RGPU_INFO("[fastpath] {} draws on the fast path so far, {} chain draws it refused (me2_renut_draw_fastpath)", n,
+              g_fastpath_refused.load(std::memory_order_relaxed));
+  return true;
+}
+}  // namespace
+#endif  // PLUME_DEKO3D
+
 bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayConstants *replay) {
   ++g_trace_draws;
   auto &s = State();
@@ -4724,10 +5172,37 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
   if (!device.valid())
     return false;
 
+  // ME2 (2026-11-12, me2_renut_draw_fastpath): a chain draw with only new geometry, on the previous draw's state.
+#if defined(PLUME_DEKO3D)
+  static const bool fastpath_on = REXCVAR_GET(me2_renut_draw_fastpath) && IsDeko3D() && FastPathDiagnosticsOff();
+  {
+    const ChainHint &fp_chain = g_chain_hint;
+    if (fastpath_on && fp_chain.seq && fp_chain.seq == g_fastpath.seq + 1 && !call.tessellation &&
+        call.primitive == g_fastpath.primitive && call.primitive != kPointList &&
+        (fp_chain.changed[0] & ~kFastAllowed0) == 0 && (fp_chain.changed[1] & ~kFastAllowed1) == 0 &&
+        !AnyPendingExports() && !UiPendingLocked() && FastPathBytesSame(device_state)) {
+      if (FastPathDrawLocked(s, device, device_state, call, replay))
+        return true;
+      g_fastpath_refused.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  // Whatever leaves this draw early leaves nothing for the next one to take.
+  struct FastPathInvalidator {
+    bool armed = true;
+    ~FastPathInvalidator() {
+      if (armed)
+        g_fastpath.seq = 0;
+    }
+  } fp_guard;
+#else
+  constexpr bool fastpath_on = false;
+#endif
+
   const u32 vs_va = device.U32(d3d::kDeviceOffsetVertexShader);
   auto *vs = FindShaderLocked(vs_va, RecordKind::VertexShader);
   const u32 declaration_va = device.U32(d3d::kDeviceOffsetVertexDeclaration);
   auto *ps = FindShaderLocked(device.U32(d3d::kDeviceOffsetPixelShader), RecordKind::PixelShader);
+  const uint64_t draw_ps_hash = ps ? ps->hash : 0;  // me2_renut_draw_fastpath: before a depth-only draw drops it
   // Without a declaration set, the shader fetches as D3DVertexShader_Bind
   // bound it, or else as its own vfetches describe (bundle meshes).
   const VertexDeclarationRecord *declaration = nullptr;
@@ -4819,6 +5294,9 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
     }
     WaitForExportsLocked(slots);
   }
+#if defined(PLUME_DEKO3D)
+  plume::Deko3DBreadcrumbTag(vs->hash, ps ? ps->hash : 0);  // ME2 (2026-11-14, from the Dunwall port): me2_gpu_breadcrumbs
+#endif
   if (!Video::EnsureCommandListLocked())
     return false;
   SyncBound(s);
@@ -4962,16 +5440,7 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
   // memo would answer every bound slot as it did then: the device's fetch constants and texture words unchanged
   // (bytes 1152-1775, 12920-13023), the same slots, frame, texture and depth epochs and depth target, and each bound
   // texture's header words the same. The memo hit's work is done again for each slot (its transitions and counters).
-  struct TexturesReuse {
-    uint64_t seq = 0, frame = 0, epoch = 0, depth_epoch = 0;
-    u32 mask = 0;
-    const HostSurface *depth = nullptr;
-    u32 header[32][6] = {};
-    BindEffects fx[32];
-    u32 indices[3][32] = {};
-    u32 samplers[32] = {};
-  };
-  static TexturesReuse treuse;
+  TexturesReuse &treuse = g_treuse;  // ME2 (me2_renut_draw_fastpath): at file scope, the fast path moves its seq
   bool textures_reused = targets_reuse_on && chain.seq && chain.seq == treuse.seq + 1 && treuse.mask == texture_mask &&
                          !ChainChanged(chain, 1152, 1775) && !ChainChanged(chain, 12552, 12655) /*me2: Textures[26]*/ &&
                          treuse.frame == TextureFrameLocked() && treuse.epoch == g_texture_epoch &&
@@ -5246,7 +5715,8 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
 #if defined(PLUME_DEKO3D)
     // sa2-nx (2026-10-20, sa2_renut_chain_reuse): a chain draw whose texture words are the previous draw's, when that
     // draw pushed last (no push since, the same command list's buffer): its first 512 bytes are held already.
-    static uint64_t texture_push_seq = 0, texture_push_count = 0;
+    uint64_t &texture_push_seq = g_texture_push_seq;  // ME2 (me2_renut_draw_fastpath): at file scope
+    uint64_t &texture_push_count = g_texture_push_count;
     const bool texture_lines_held = textures_reused && !targets_verify && chain.seq &&
                                     texture_push_seq + 1 == chain.seq && texture_push_count == g_shared_pushes &&
                                     g_bound.pushed_shared_valid;
@@ -5286,18 +5756,7 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
   // the shaders' cache entries, the
   // declaration's layout, the primitive, the instancing, the alpha test, the targets (their surfaces and the surface
   // epoch, which every target built, retired or rebound bumps) and the in-run A/B half.
-  struct KeyReuse {
-    uint64_t seq = 0;
-    const ShaderCacheEntry *vs_entry = nullptr, *ps_entry = nullptr;
-    uint64_t layout_hash = 0, surface_epoch = 0;
-    u32 primitive = 0, alpha_test_func = 0, color_count = 0;
-    bool per_instance = false;
-    int ab_off = 0;
-    HostSurface *colors[d3d::kMaxRenderTargets] = {};
-    HostSurface *depth = nullptr;
-    PipelineKey key{};
-  };
-  static KeyReuse reuse;
+  KeyReuse &reuse = g_key_reuse;  // ME2 (me2_renut_draw_fastpath): at file scope, the fast path moves its seq
   static const bool reuse_on = REXCVAR_GET(sa2_renut_chain_reuse);
   static const bool reuse_verify = reuse_on && REXCVAR_GET(sa2_renut_chain_reuse_verify);
   const ChainHint &hint = chain;
@@ -5313,8 +5772,10 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
   for (u32 i = 0; reused && i < targets.color_count; ++i)
     reused = reuse.colors[i] == targets.colors[i];
   PipelineKey key;
+  DynamicBias bias;
   if (reused) {
     key = reuse.key;
+    bias = reuse.bias;
     if (reuse_verify) {
       const PipelineKey made = MakeKey(device, vs, ps, declaration, targets, call.primitive, geometry.per_instance,
                                        sc.booleans, sc.alpha_test_func);
@@ -5325,12 +5786,15 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
                     vs->hash);
         key = made;
       }
+      bias = g_key_bias;
     }
   } else {
     key = MakeKey(device, vs, ps, declaration, targets, call.primitive, geometry.per_instance, sc.booleans,
                   sc.alpha_test_func);
+    bias = g_key_bias;
   }
   if (reuse_on) {
+    reuse.bias = bias;
     reuse.seq = hint.seq;
     reuse.vs_entry = vs->entry;
     reuse.ps_entry = ps_entry;
@@ -5369,11 +5833,7 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
   }
   // sa2-nx (2026-10-20, sa2_renut_chain_reuse): the previous draw's pipeline for its key again when no lookup was made
   // since and no prebuilt pipeline came in (PipelineLookupsLocked): GetPipelineLocked would answer the same.
-  struct PipelineReuse {
-    uint64_t seq = 0, lookups = 0, epoch = 0;
-    plume::RenderPipeline *pipeline = nullptr;
-  };
-  static PipelineReuse preuse;
+  PipelineReuse &preuse = g_pipe_reuse;  // ME2 (me2_renut_draw_fastpath): at file scope
   plume::RenderPipeline *pipeline = nullptr;
   // The prebuild epoch read once, before the test and the lookup (found by banjo-nx's verify run): a prebuild worker
   // finishing a specialised pipeline between this draw's lookup (which returned the generic one) and a later read
@@ -5464,6 +5924,9 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
     if (IsVulkan())
       g_bound.blend_constant_set = false;
   }
+  // me2_renut_poly_offset_dynamic: the draw's own polygon offset (the pipeline leaves the bias to the draw).
+  if (key.reserved & kKeyDynamicBias)
+    cmd->setDepthBias(float(bias.units), std::bit_cast<float>(bias.clamp), std::bit_cast<float>(bias.slope));
   float blend_constant[4];
   if (DrawBlendConstant(dev, key, blend_constant) &&
       !(g_bound.blend_constant_set &&
@@ -5651,6 +6114,49 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
     FinishMemExportLocked(s, exports, export_count, export_offsets);
     g_bound.framebuffer = nullptr;  // the copies end any render pass
   }
+#if defined(PLUME_DEKO3D)
+  // ME2 (me2_renut_draw_fastpath): what a chain draw with only new geometry keeps from this one.
+  if (fastpath_on && chain.seq && !call.tessellation && call.primitive != kPointList && !export_count &&
+      fetch_mask == 0 && pushed && g_bound.generation == s.list_generation && g_bound.pipeline == pipeline &&
+      g_bound.framebuffer && g_bound.layout && g_bound.viewport_set && g_bound.shared_words_set &&
+      g_bound.pushed_shared_valid && !(targets.depth && targets.depth->handed)) {
+    DrawFastPathState &f = g_fastpath;
+    f.seq = chain.seq;
+    f.surface_epoch = SurfaceEpochLocked();
+    f.framebuffer_epoch = FramebufferEpochLocked();
+    f.texture_epoch = g_texture_epoch;
+    f.depth_epoch = g_depth_epoch;
+    f.texture_frame = TextureFrameLocked();
+    f.shared_pushes = g_shared_pushes;
+    f.primitive = call.primitive;
+    f.per_instance = geometry.per_instance;
+    f.vs = vs;
+    f.ps = ps;
+    f.ps_hash = draw_ps_hash;
+    f.vs_used = vs_used;
+    f.ps_used = ps_used;
+    f.declaration = declaration;
+    f.shader_strides = shader_strides;
+    f.targets = targets;
+    f.key = key;
+    f.pipeline = pipeline;
+    f.framebuffer = g_bound.framebuffer;
+    f.sc = sc;
+    f.profile_label = gpu_profile::Timed() ? DrawProfileLabel(call, targets, ps, key) : 0;
+    f.color_writes = 0;
+    for (u32 i = 0; i < targets.color_count && i < key.color_count; ++i)
+      if ((key.color_mask >> (4 * i)) & 0xF)
+        f.color_writes |= 1u << i;
+    const u32 dc = key.depth_control;
+    f.depth_writes = ((dc & 2) && (dc & 4)) || ((dc & 1) && ((key.stencil_ref_mask >> 16) & 0xFF) != 0);
+    f.stencil_used = (dc & 1) != 0;
+    f.depth_only = depth_only_draw;
+    std::memcpy(f.head_bytes, device_state + kFastHeadFirst, kFastHeadCount);
+    std::memcpy(f.decl_bytes, device_state + kFastDeclFirst, kFastDeclCount);
+    std::memcpy(f.tail_bytes, device_state + kFastTailFirst, kFastTailCount);
+    fp_guard.armed = false;
+  }
+#endif
   return true;
 }
 
@@ -5860,14 +6366,39 @@ void ClearTargets(const Targets &t, u32 flags, const plume::RenderRect &rect, co
   static std::vector<HostSurface *> found;
   aliases.clear();
   const uint64_t clear_seq = ++g_edram_write_seq;
+  // ME2 (2026-11-12, sa2_renut_clear_repeat, backported from the Dunwall port / sa2-nx / naruto-nx 7509546): a whole
+  // clear of a target that holds exactly that clear already (its last whole clear had the same values, and neither a
+  // write nor a new image since: writes and generation as that clear left them) is not sent; everything else about it is
+  // as before. Draws and clears are what count a target's writes; a hand-over or a rebuild changes its generation. Also
+  // no later write of its EDRAM through another view (an alias's write order newer than the target's, which
+  // SyncEdramAliasLocked copies in at a draw), and not while its image is handed over.
+  const bool repeat_on = ClearRepeatOn();
+  const auto whole = [&](const HostSurface *s) {
+    return rect.left <= 0 && rect.top <= 0 && rect.right >= int32_t(s->width) && rect.bottom >= int32_t(s->height);
+  };
   for (uint32_t i = 0; i < t.color_count; ++i) {
     if (!(flags & (1u << i)))
       continue;
-    ++t.colors[i]->writes;  // banjo-nx (banjo_renut_resolve_skip)
-    t.colors[i]->write_seq = clear_seq;  // me2-nx-deko: the clear writes the memory of every view over it
-    NoteWriteSeq(t.colors[i]);
-    cmd->clearColor(i, clear_color, &host_rect, 1);
-    ColorAliasesLocked(t.colors[i], found);
+    HostSurface *c = t.colors[i];
+    ColorAliasesLocked(c, found);
+    bool repeat = repeat_on && !c->handed && whole(c) && c->clear_known && c->clear_generation == c->generation &&
+                  c->clear_writes == c->writes && c->clear_write_seq == c->write_seq &&
+                  std::memcmp(c->clear_color, color, sizeof(c->clear_color)) == 0;
+    for (HostSurface *alias : found)
+      if (alias->write_seq > c->write_seq)
+        repeat = false;
+    ++c->writes;  // banjo-nx (banjo_renut_resolve_skip)
+    c->write_seq = clear_seq;  // me2-nx-deko: the clear writes the memory of every view over it
+    NoteWriteSeq(c);
+    if (repeat)
+      CountRepeatedClear();
+    else
+      cmd->clearColor(i, clear_color, &host_rect, 1);
+    c->clear_known = whole(c);
+    c->clear_generation = c->generation;
+    c->clear_writes = c->writes;
+    c->clear_write_seq = c->write_seq;
+    std::memcpy(c->clear_color, color, sizeof(c->clear_color));
     for (HostSurface *alias : found) {
       if (std::find(aliases.begin(), aliases.end(), alias) == aliases.end() &&
           std::find(t.colors, t.colors + t.color_count, alias) == t.colors + t.color_count)
@@ -5875,9 +6406,35 @@ void ClearTargets(const Targets &t, u32 flags, const plume::RenderRect &rect, co
     }
   }
   if (t.depth && (flags & 0x30)) {
-    ++t.depth->writes;  // banjo-nx (banjo_renut_resolve_skip)
-    cmd->clearDepthStencil((flags & 0x10) != 0, (flags & 0x20) != 0, depth, stencil & 0xFF,
-                           &host_rect, 1);
+    HostSurface *d = t.depth;
+    const bool zc = (flags & 0x10) != 0, sc = (flags & 0x20) != 0;
+    const bool same = whole(d) && d->clear_generation == d->generation && d->clear_writes == d->writes;
+    const bool repeat = repeat_on && !d->handed && same &&
+                        (!zc || (d->clear_depth_known && std::memcmp(&d->clear_depth, &depth, sizeof(depth)) == 0)) &&
+                        (!sc || (d->clear_stencil_known && d->clear_stencil == (stencil & 0xFF)));
+    ++d->writes;  // banjo-nx (banjo_renut_resolve_skip)
+    if (repeat)
+      CountRepeatedClear();
+    else
+      cmd->clearDepthStencil(zc, sc, depth, stencil & 0xFF, &host_rect, 1);
+    // sa2_renut_clear_repeat: what the target holds now; a part it did not clear keeps what was known of it only while
+    // the image and its writes are the ones that knowledge was of.
+    if (!whole(d)) {
+      d->clear_depth_known = d->clear_stencil_known = false;
+    } else {
+      if (!same)
+        d->clear_depth_known = d->clear_stencil_known = false;
+      if (zc) {
+        d->clear_depth_known = true;
+        d->clear_depth = depth;
+      }
+      if (sc) {
+        d->clear_stencil_known = true;
+        d->clear_stencil = stencil & 0xFF;
+      }
+    }
+    d->clear_generation = d->generation;
+    d->clear_writes = d->writes;
   }
   static const uint32_t kAliasLabel = gpu_profile::Label("clears: other-format views of the EDRAM");
   const ProfileHold alias_hold(kAliasLabel);
@@ -5896,6 +6453,7 @@ void ClearTargets(const Targets &t, u32 flags, const plume::RenderRect &rect, co
     ++alias->writes;  // banjo-nx (banjo_renut_resolve_skip)
     alias->write_seq = clear_seq;
     NoteWriteSeq(alias);
+    alias->clear_known = false;  // sa2_renut_clear_repeat: not followed through aliases
     cmd->clearColor(0, clear_color, &alias_host, 1);
   }
 }
@@ -6305,8 +6863,45 @@ void ClearStateLocked(const u8 *device_state, u32 flags, const ClearRect *rect,
 
   // D3D clamps clears to the viewport (CDevice viewport floats at 0x3168).
   ClearRect r = rect ? *rect : ClearRect{0, 0, int32_t(targets.width), int32_t(targets.height)};
-  const float vx = device.F32(0x3168), vy = device.F32(0x316C);
-  const float vw = device.F32(0x3170), vh = device.F32(0x3174);
+  float vx = device.F32(0x3168), vy = device.F32(0x316C);
+  float vw = device.F32(0x3170), vh = device.F32(0x3174);
+  // ME2 (2026-11-12, backported from the Dunwall port, RenderDoc 2513 / 2622 there: characters' shadows came and went
+  // with the camera): UE3 draws up to three characters' shadows into regions of one depth target, clearing each region
+  // (Clear without rects: the viewport) before drawing it. The CDevice floats read above are N&B's offset (0x3168), which
+  // ME2's layout does not promise (0x2E30..0x3387 are 8 bytes later there) and XDK 21076 does not hold either. The
+  // viewport registers (PA_CL_VPORT_*, as ComputeViewport reads them) are the viewport whatever the XDK; the window
+  // scissor bounds the GPU's clear as well. The device floats stay the fallback when the registers hold no viewport.
+  // "[clear] viewport from the registers" logs where the two differ.
+  {
+    const d3d::Device &dev = device.dev();
+    const u32 vte = dev.m_ControlPacket.VteControl;
+    const d3d::ValuesPacket &vp = dev.m_ValuesPacket;
+    const float xs = std::fabs(float(vp.VportXScale)), ys = std::fabs(float(vp.VportYScale));
+    if ((vte & 0x0F) == 0x0F && xs >= 0.5f && ys >= 0.5f) {
+      const float rx = float(vp.VportXOffset) - xs, ry = float(vp.VportYOffset) - ys;
+      static uint32_t logged = 0;
+      if (logged < 8 && (std::fabs(rx - vx) > 0.5f || std::fabs(2.0f * xs - vw) > 0.5f)) {
+        ++logged;
+        RGPU_INFO("[clear] viewport from the registers {},{} {}x{} (device floats {},{} {}x{}), target {}x{}", rx, ry,
+                  2.0f * xs, 2.0f * ys, vx, vy, vw, vh, targets.guest_width, targets.guest_height);
+      }
+      vx = rx;
+      vy = ry;
+      vw = 2.0f * xs;
+      vh = 2.0f * ys;
+    }
+    const u32 tl = dev.m_WindowPacket.WindowScissorTL, br = dev.m_WindowPacket.WindowScissorBR;
+    const int32_t sx1 = int32_t(tl & 0x7FFF), sy1 = int32_t((tl >> 16) & 0x7FFF);
+    const int32_t sx2 = int32_t(br & 0x7FFF), sy2 = int32_t((br >> 16) & 0x7FFF);
+    // Not for a target grown for tiling (the scissor is then the tile-sized surface's, see ComputeViewport).
+    if (targets.width <= targets.guest_width && targets.height <= targets.guest_height && sx2 > sx1 && sy2 > sy1 &&
+        (sx1 || sy1 || sx2 < int32_t(targets.guest_width) || sy2 < int32_t(targets.guest_height))) {
+      r.x1 = std::max(r.x1, sx1);
+      r.y1 = std::max(r.y1, sy1);
+      r.x2 = std::min(r.x2, sx2);
+      r.y2 = std::min(r.y2, sy2);
+    }
+  }
   if (vw > 0.0f && vh > 0.0f) {
     int32_t vx2 = int32_t(vx + vw), vy2 = int32_t(vy + vh);
     // A target grown for tiling: D3D bounds the viewport by the tile-sized
@@ -6948,7 +7543,18 @@ void ResolveStateLocked(const u8 *device_state, u32 flags, const ClearRect *sour
       const uint32_t slice = volume ? 0 : dest_slice;
       const uint32_t z = volume ? dest_slice : 0;
       const bool fits = fit(dest, src);
-      const int32_t bias = REXCVAR_GET(me2_renut_resolve_exp_bias) ? ResolveExponentBias(flags) : 0;
+      int32_t bias = REXCVAR_GET(me2_renut_resolve_exp_bias) ? ResolveExponentBias(flags) : 0;
+      // ME2 (2026-11-14, me2_renut_fixed16_resolve_range): a 16_16 / 16_16_16_16 target (the only SNORM host targets)
+      // resolves from its -32...32 range: 2^5 over the bias.
+      if (REXCVAR_GET(me2_renut_fixed16_resolve_range) &&
+          (surface->format == plume::RenderFormat::R16G16B16A16_SNORM ||
+           surface->format == plume::RenderFormat::R16G16_SNORM)) {
+        static uint32_t logged = 0;
+        if (LogLimited(logged, 4))
+          RGPU_INFO("[resolve-range] 16-bit fixed target resolved into {:08X}: exponent bias {} -> {}",
+                    dest_texture_va, bias, bias + 5);
+        bias += 5;
+      }
       uint64_t sig = fits ? ResolveSignature(surface, src, dest_x, dest_y, dest_level, dest_slice, bias) : 0;
       // me2-nx-deko: a 4x view resolved from its single-sample backing changes with the backing's writes.
       if (const HostSurface *backing = Msaa4xBackingLocked(surface); fits && backing && REXCVAR_GET(me2_renut_msaa4x_downsample))

@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/input/read_hook.h>
 #include <rex/cvar.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
@@ -108,6 +109,8 @@ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_
   }
 
   REXKRNL_DEBUG("XamContentCreateEnumerator: added {} items to enumerator", e->item_count());
+  // Dunwall (2026-11-09, input_hold_until_dlc_ready): the game's scan of its downloadable content (type 2).
+  if (content_type == 2) rex::input::NoteGameDlcEnumerated(uint32_t(e->item_count()));
 
   *handle_out = e->handle();
   return X_ERROR_SUCCESS;
@@ -240,6 +243,10 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
                  : disposition == kDispositionState::Open  ? "open"
                                                            : "none",
                  uint32_t(result));
+
+    if (XSUCCEEDED(result) && disposition == kDispositionState::Open &&
+        static_cast<uint32_t>(content_data.content_type.get()) == 2)
+      rex::input::NoteGameDlcOpened();  // Dunwall (2026-11-09, input_hold_until_dlc_ready)
 
     extended_error = X_HRESULT_FROM_WIN32(result);
     length = static_cast<uint32_t>(disposition);

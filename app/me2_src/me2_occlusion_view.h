@@ -28,7 +28,7 @@ struct Me2OcclusionView {
 };
 
 struct Me2OcclusionViewHistory {
-  enum Reason : unsigned { kRotation = 1, kPosition = 2, kProjection = 4, kInvalid = 8, kGap = 16 };
+  enum Reason : unsigned { kRotation = 1, kPosition = 2, kProjection = 4, kInvalid = 8, kGap = 16, kSpike = 32 };
   Me2OcclusionView previous;
   uint64_t epoch = 1, frame = 0;
   bool seen = false;
@@ -37,6 +37,17 @@ struct Me2OcclusionViewHistory {
   // every frame, each "cut" threw every occlusion answer away, frame rate fell further (console, Kasumi's party: 23 fps
   // looking, 5 fps turning, draws 1,300 -> 4,500 a frame).
   float rot_cut = 0.2f;
+  // ME2 (2026-11-12, user: in cutscenes and dialogues models do not appear at once after the camera changes position,
+  // and on the Normandy the stars showed through for an instant): a dialogue's reverse shot or a new angle from nearby
+  // stays under the absolute limits (60 degrees, 128 units), so the old camera's "occluded" answers lived on. A camera
+  // change that is a spike against the last kSpikeHistory frames' motion (more than spike_factor times their largest
+  // change, and above spike_min_rot / spike_min_move) is a cut too. A steady turn or walk changes by about the same each
+  // frame, so it never is; a turn or a run starting from rest can count once (a few frames of culling lost).
+  // spike_factor 0 = off (me2_occlusion_cut_spike_factor).
+  static constexpr unsigned kSpikeHistory = 8;
+  float spike_factor = 0.0f, spike_min_rot = 0.15f, spike_min_move = 24.0f;
+  float recent_rot[kSpikeHistory] = {}, recent_move[kSpikeHistory] = {};
+  unsigned recent_count = 0;
 
   // Conservative discontinuity detection, not an inferred guest bCameraCut bit.
   // Normal walking/turning and small temporal projection jitter keep their cache.
@@ -59,6 +70,26 @@ struct Me2OcclusionViewHistory {
         float distance2 = 0;
         for (unsigned c = 0; c < 3; ++c) distance2 += (a[c] - b[c]) * (a[c] - b[c]);
         if (distance2 > 128.0f * 128.0f) reason |= kPosition;
+        const float distance = std::sqrt(distance2);
+        if (spike_factor > 0.0f && recent_count >= kSpikeHistory) {
+          float max_rot = 0, max_move = 0;
+          for (unsigned i = 0; i < kSpikeHistory; ++i) {
+            max_rot = std::max(max_rot, recent_rot[i]);
+            max_move = std::max(max_move, recent_move[i]);
+          }
+          if ((rotation > spike_min_rot && rotation > spike_factor * max_rot) ||
+              (distance > spike_min_move && distance > spike_factor * max_move))
+            reason |= kSpike;
+        }
+        // The motion history: this frame's change, unless it was a cut (the next frames compare with the shot's own
+        // motion, not with the jump).
+        if (!(reason & (kRotation | kPosition | kSpike))) {
+          recent_rot[recent_count % kSpikeHistory] = rotation;
+          recent_move[recent_count % kSpikeHistory] = distance;
+          ++recent_count;
+        } else {
+          recent_count = 0;
+        }
         for (unsigned i = 0; i < 16; ++i) {
           const float scale = std::max(1.0f, std::max(std::fabs(previous.projection[i]), std::fabs(current.projection[i])));
           if (std::fabs(current.projection[i] - previous.projection[i]) > 0.05f * scale)

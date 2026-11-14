@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
+
 #include <rex/kernel/xam/apps/xgi_app.h>
 #include <rex/logging.h>
 #include <rex/thread.h>
@@ -330,6 +332,44 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       REXKRNL_DEBUG("XUserReadStats({}, {}, {:08X}, {}, {:08X}, {}, {:08X})", title_id, xuids_count,
                     xuids_ptr, specs_count, specs_ptr, results_size, results_ptr);
 
+      // Dunwall (2026-11-13, PC crash opening the Dunwall City Trials leaderboards): success was returned with
+      // nothing written, so the game read its own uninitialized buffer as XUSER_STATS_READ_RESULTS (a view count and
+      // pointers to rows) and sorted garbage pointers (sub_8278CF90, read of unmapped 0x486C0008). Without Xbox Live
+      // the answer is an empty leaderboard: one XUSER_STATS_VIEW per spec (dwViewId from the spec, 0 rows).
+      // XUSER_STATS_READ_RESULTS { DWORD dwNumViews; XUSER_STATS_VIEW *pViews; } (8 bytes)
+      // XUSER_STATS_VIEW { DWORD dwViewId, dwTotalViewRows, dwNumRows; XUSER_STATS_ROW *pRows; } (16 bytes)
+      // XUSER_STATS_SPEC { DWORD dwViewId, dwNumColumnIds; WORD rgwColumnIds[64]; } (136 bytes)
+      constexpr uint32_t kSpecBytes = 136, kViewBytes = 16, kHeaderBytes = 8;
+      const uint32_t views = std::min<uint32_t>(specs_count, 64);
+      const uint32_t needed = kHeaderBytes + views * kViewBytes;
+      // The size as the message carries it; a guest address there is read as the pointer to it (pcbResults).
+      uint32_t capacity = results_size;
+      if (results_size >= 0x40000000u) {
+        auto* size_word = memory_->TranslateVirtual(results_size);
+        capacity = size_word ? memory::load_and_swap<uint32_t>(size_word) : 0;
+      }
+      auto* results = results_ptr ? memory_->TranslateVirtual(results_ptr) : nullptr;
+      if (!results || capacity < needed) {
+        if (results_size >= 0x40000000u)
+          memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(results_size), needed);
+        REXKRNL_WARN("XUserReadStats: {} views need {} bytes, buffer {:08X} of {}: insufficient buffer", views,
+                     needed, results_ptr, capacity);
+        return X_HRESULT_FROM_WIN32(X_ERROR_INSUFFICIENT_BUFFER);
+      }
+      auto* specs = specs_ptr ? memory_->TranslateVirtual(specs_ptr) : nullptr;
+      memory::store_and_swap<uint32_t>(results + 0, views);
+      memory::store_and_swap<uint32_t>(results + 4, views ? results_ptr + kHeaderBytes : 0);
+      for (uint32_t i = 0; i < views; ++i) {
+        uint8_t* view = results + kHeaderBytes + i * kViewBytes;
+        const uint32_t view_id = specs ? memory::load_and_swap<uint32_t>(specs + i * kSpecBytes) : 0;
+        memory::store_and_swap<uint32_t>(view + 0, view_id);
+        memory::store_and_swap<uint32_t>(view + 4, 0);   // dwTotalViewRows
+        memory::store_and_swap<uint32_t>(view + 8, 0);   // dwNumRows
+        memory::store_and_swap<uint32_t>(view + 12, 0);  // pRows
+      }
+      static uint32_t logged = 0;
+      if (logged++ < 16)
+        REXKRNL_INFO("[stats] XUserReadStats: {} users, {} views: empty results (no Xbox Live)", xuids_count, views);
       return X_E_SUCCESS;
     }
     case 0x000B0025: {

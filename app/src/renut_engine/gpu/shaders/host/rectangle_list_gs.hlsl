@@ -10,7 +10,7 @@
 // across the diagonal from it.
 //
 // The vertex layout is what XenosRecomp (RENUT_RECOMP) writes for every vertex
-// shader and pixel shader: the position, then the 23 interpolators in this
+// shader and pixel shader: the position, then the 27 interpolators in this
 // order, then the point sprite coordinate and size (see point_sprite_gs.hlsl).
 // SPIR-V matches stages by location, which follows the order.
 
@@ -18,7 +18,7 @@ struct Vertex
 {
     float4 position : SV_Position;
     float4 texcoord[16] : TEXCOORD0;
-    float4 color[2] : COLOR0;
+    float4 color[6] : COLOR0;  // COLOR0-5 (XenosRecomp INTERPOLATORS); with 2, POINTCOORD sat 4 locations early
     float4 normal[3] : NORMAL0;
     float4 tangent : TANGENT0;
     float4 binormal : BINORMAL0;
@@ -33,7 +33,7 @@ Vertex Opposite(Vertex a, Vertex b, Vertex c)
     d.position = a.position + b.position - c.position;
     [unroll] for (uint i = 0; i < 16; ++i)
         d.texcoord[i] = a.texcoord[i] + b.texcoord[i] - c.texcoord[i];
-    [unroll] for (uint j = 0; j < 2; ++j)
+    [unroll] for (uint j = 0; j < 6; ++j)
         d.color[j] = a.color[j] + b.color[j] - c.color[j];
     [unroll] for (uint k = 0; k < 3; ++k)
         d.normal[k] = a.normal[k] + b.normal[k] - c.normal[k];

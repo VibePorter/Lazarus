@@ -39,6 +39,13 @@ REXCVAR_DEFINE_INT32(switch_profile_stacks_top, 0, "SA2 enhancements",
                      "0 = every thread in turn, one a millisecond")
     .range(0, 16)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// me2-nx-deko (2026-11-07): threads sampled at every tick whatever their CPU, by name substring (comma separated), on
+// top of the switch_profile_stacks_top busiest: a thread that stalls by WAITING (the game's audio mixer after a death)
+// uses little CPU and was never sampled. E.g. "X82FE7F48,Audio Worker,X82E22A90".
+REXCVAR_DEFINE_STRING(switch_profile_stacks_always, "", "SA2 enhancements",
+                      "Switch: with switch_profile_stacks_top, also sample these threads at every tick (name substrings, "
+                      "comma separated, e.g. \"X82FE7F48,Audio Worker\")")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(switch_profile_report, true, "SA2 enhancements",
                     "Switch: the profiler writes its 10-second report to logs/rex/rex_profile.log (false = no file)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);

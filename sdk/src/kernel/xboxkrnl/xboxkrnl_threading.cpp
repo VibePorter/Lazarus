@@ -899,17 +899,22 @@ uint32_t xeNtWaitForMultipleObjectsEx(uint32_t count, rex::be<uint32_t>* handles
                                       uint64_t* timeout_ptr) {
   assert_true(wait_type <= 1);
 
-  std::vector<object_ref<XObject>> objects;
+  // Dunwall (2026-11-12): the references on the stack up to 64 objects (the Xbox 360's limit): one heap vector less
+  // per wait (newlib has one malloc lock, see threading_posix.cpp). Released when this returns, as the vector's were.
+  object_ref<XObject> inline_objects[64];
+  std::vector<object_ref<XObject>> heap_objects;
+  if (count > std::size(inline_objects)) heap_objects.resize(count);
+  object_ref<XObject>* const objects = count > std::size(inline_objects) ? heap_objects.data() : inline_objects;
   for (uint32_t n = 0; n < count; n++) {
     uint32_t object_handle = handles[n];
     auto object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(object_handle);
     if (!object) {
       return X_STATUS_INVALID_PARAMETER;
     }
-    objects.push_back(std::move(object));
+    objects[n] = std::move(object);
   }
 
-  auto result = XObject::WaitMultiple(count, reinterpret_cast<XObject**>(objects.data()), wait_type,
+  auto result = XObject::WaitMultiple(count, reinterpret_cast<XObject**>(objects), wait_type,
                                       6, wait_mode, alertable, timeout_ptr);
   if (alertable && result == X_STATUS_USER_APC) {
     XThread::GetCurrentThread()->DeliverAPCs();

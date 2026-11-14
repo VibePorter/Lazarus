@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <vector>
 
 namespace rex::ui {
 
@@ -22,6 +23,12 @@ struct FrameStats {
   double frame_time_ms = 0;
   double fps = 0;
   uint64_t frame_count = 0;
+  // Dunwall (2026-11-14): optional detail, shown when the provider fills it (averages over the same second as fps).
+  double worst_ms = 0;            // the longest frame of that second
+  double cpu_ms = -1;             // the game thread's work a frame (< 0: unknown)
+  double gpu_ms = -1;             // the GPU's work a frame (< 0: unknown)
+  double render_thread_ms = -1;   // the host render thread's work a frame (< 0: unknown)
+  std::vector<float> frame_history_ms;  // the last frames' lengths, oldest first (empty: no graph)
 };
 
 // true while the debug overlay exists. On Switch, with it open, L+R and the right stick move it, and

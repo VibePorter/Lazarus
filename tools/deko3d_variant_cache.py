@@ -110,7 +110,9 @@ def read_cache(path):
 # samples, 4 blend controls, 9 more u32 fields (offset 108 on), bool_mask[8], bool_values[8], blend_skip, output_trim;
 # version 4 (2026-10-18) adds alpha_func at 180 (constant 903 + 1, banjo_deko3d_alpha_spec; version 3 had padding there)
 # and a reserved word.
-LIST_KEY_SIZES = {3: 184, 4: 192}
+# Dunwall (2026-11-10): version 4 keys grew to 200 bytes (depth_bias_slope / depth_bias_clamp after alpha_func,
+# pipeline state only; the offsets read below are unchanged).
+LIST_KEY_SIZES = {3: (184,), 4: (192, 200)}
 LIST_KEY_SIZE = 184
 OFF_BOOL_MASK, OFF_BOOL_VALUES, OFF_BLEND_SKIP, OFF_OUTPUT_TRIM, OFF_ALPHA_FUNC = 108, 140, 172, 176, 180
 OFF_PER_INSTANCE, OFF_RECT_LIST, OFF_POINT_SPRITE = 96, 100, 104
@@ -210,15 +212,38 @@ def read_list(path, blend_skip_on, alpha_guess=ALPHA_GUESS):
     alpha functions (903 values) also made for a pipeline with a pixel shader whose record has none."""
     data = open(path, 'rb').read()
     magic, version, key_size, streams = struct.unpack_from('<4sIII', data, 0)
-    if magic != b'RNPL' or LIST_KEY_SIZES.get(version) != key_size:
+    if magic != b'RNPL' or key_size not in LIST_KEY_SIZES.get(version, ()):
         sys.exit(f'deko3d_variant_cache: {path}: not a version 3 or 4 pipeline list ({magic}, {version}, {key_size})')
     at = 16
     out = []
+
+    # Dunwall (2026-11-10): the game appends to the list every session, so a session killed mid-write leaves a part
+    # record and everything after it was misread (a 30 MB list gave 22 pipelines). A record whose size is implausible,
+    # or whose next record's is, is skipped by scanning on to the next spot where two plausible records follow.
+    def plausible(p):
+        if p + 4 > len(data):
+            return False
+        (s,) = struct.unpack_from('<I', data, p)
+        return key_size <= s <= 65536 and p + 4 + s <= len(data)
+
+    def chained(p):
+        if not plausible(p):
+            return False
+        nxt = p + 4 + struct.unpack_from('<I', data, p)[0]
+        return nxt + 4 > len(data) or plausible(nxt)
+
+    resyncs = 0
     while at + 4 <= len(data):
+        if not chained(at):
+            p = at + 1
+            while p + 4 <= len(data) and not chained(p):
+                p += 1
+            if p + 4 > len(data):
+                break
+            resyncs += 1
+            at = p
         (size,) = struct.unpack_from('<I', data, at)
         at += 4
-        if at + size > len(data) or size < key_size:
-            break
         vs, ps = struct.unpack_from('<QQ', data, at)
         mask = struct.unpack_from('<8I', data, at + OFF_BOOL_MASK)
         values = struct.unpack_from('<8I', data, at + OFF_BOOL_VALUES)
@@ -249,6 +274,8 @@ def read_list(path, blend_skip_on, alpha_guess=ALPHA_GUESS):
                 guessed = dict(spec)
                 guessed[903] = guess
                 out.append((hashes, guessed))
+    if resyncs:
+        print(f'deko3d_variant_cache: {path}: {resyncs} damaged spots skipped (records cut by a session that ended mid-write)')
     return out
 
 

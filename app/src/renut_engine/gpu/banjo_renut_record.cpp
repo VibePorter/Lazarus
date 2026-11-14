@@ -74,6 +74,7 @@ enum Op : uint16_t {
   // ME2 (2026-10-26): plume's deko3d extensions (banjo_deko3d_record_worker).
   kDkMemExport, kDkFetchData, kDkBindUniform, kDkPushUniform, kDkSharedWords,
   kBeginOcclusion, kEndOcclusion,  // ME2 (2026-10-27, me2_occlusion_queries)
+  kDkInvalidateZcull,  // ME2 (2026-11-07, me2_deko3d_zcull_invalidate)
   kOpCount
 };
 
@@ -365,6 +366,9 @@ void Play(plume::RenderCommandList *cmd, const uint8_t *p, const uint8_t *end) {
 #if defined(PLUME_DEKO3D)
     case kDkMemExport:
       plume::Deko3DBindMemExport(cmd, static_cast<const plume::RenderBuffer *>(At<DkPtr>(p).p));
+      break;
+    case kDkInvalidateZcull:
+      plume::Deko3DInvalidateZcull(cmd);
       break;
     case kDkFetchData: {
       const DkAddr &a = At<DkAddr>(p);
@@ -666,6 +670,10 @@ public:
     Done();
   }
 #if defined(PLUME_DEKO3D)
+  void DkInvalidateZcull() {
+    Emit(kDkInvalidateZcull, 0);
+    Done();
+  }
   void DkMemExport(const plume::RenderBuffer *buffer) {
     Put(Emit(kDkMemExport, Size<DkPtr>()), DkPtr{buffer});
     Done();
@@ -762,6 +770,12 @@ bool IsProxy(const plume::RenderCommandList *cmd) {
 }
 
 #if defined(PLUME_DEKO3D)
+bool Deko3DInvalidateZcull(plume::RenderCommandList *cmd) {
+  if (cmd != &g_recorder)
+    return plume::Deko3DInvalidateZcull(cmd);
+  g_recorder.DkInvalidateZcull();
+  return true;
+}
 bool Deko3DBindMemExport(plume::RenderCommandList *cmd, const plume::RenderBuffer *buffer) {
   if (cmd != &g_recorder)
     return plume::Deko3DBindMemExport(cmd, buffer);

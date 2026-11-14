@@ -45,6 +45,11 @@
 
 using namespace renut::gpu;
 
+// ME2 (2026-11-12, from the Dunwall port): the game port's work before a draw (app/me2_src/me2_constant_blocks.cpp
+// sets it: the shaders' constant blocks), for the Begin*Vertices draws, which do not pass through its Draw*Vertices
+// hooks. Null in a build without it.
+void (*g_me2_draw_prepare)(uint8_t *base, uint32_t device) = nullptr;
+
 // me2-nx-deko (2026-11-01, run 13: UE3's render thread costs ~20 us a draw and heavy scenes have 1,100-1,300 draws a
 // frame; per-light additive passes looked like the largest group): each draw counted by its UE3 caller (host return
 // addresses as image offsets: the generated functions are sub_XXXXXXXX in the ELF) and by what it does: depth only
@@ -348,6 +353,8 @@ void D3DDevice_DrawIndexedVerticesUP_hook(u32 device, u32 primitive, u32 min_ver
 // device, so the draw's state is captured now and its vertices copied at the
 // device's next hook (FlushDeferredVertices).
 u32 D3DDevice_BeginVertices_hook(u32 device, u32 primitive, u32 vertex_count, u32 stride) {
+  if (g_me2_draw_prepare)
+    g_me2_draw_prepare(detail::GuestVirtualBase(), device);
   g_me2_begin_draws_total.fetch_add(1, std::memory_order_relaxed);
   const u64 bytes = u64(vertex_count) * stride;
   if (!bytes || bytes > kVerticesScratchSize)
@@ -826,6 +833,8 @@ BANJO_RENUT_HOOK(sub_82A9E5D8, D3DDevice_BeginVertices_hook);  // D3DDevice_Begi
 
 // BeginIndexedVertices: nine arguments, the ninth (ppVertexData) in the caller's argument words at +84.
 BANJO_RENUT_HOOK_RAW(sub_82A9EAB8) {
+  if (g_me2_draw_prepare)
+    g_me2_draw_prepare(base, ctx.r3.u32);
   ctx.r3.u64 = Me2BeginIndexedVertices(ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32,
                                        ctx.r9.u32, ctx.r10.u32, LoadU32(ctx.r1.u32 + 84));
 }
@@ -866,7 +875,12 @@ BANJO_RENUT_HOOK_RAW(sub_82AA2B30) {
 // unset), ClearStencil in the caller's argument word at +84 (the ninth slot; the depth clear sub_82AA2CF8 takes it).
 BANJO_RENUT_HOOK_RAW(sub_82AA31F8) {
   const u32 device = ctx.r3.u32, flags = ctx.r4.u32, rect_va = ctx.r5.u32, dest_texture = ctx.r6.u32;
-  const u32 point_va = ctx.r7.u32, dest_level = ctx.r8.u32, dest_slice = 0, color_va = ctx.r9.u32;
+  // ME2 (2026-11-12, backported from the Dunwall port): r8 is the destination slice / face, not the mip level.
+  // Resolve (sub_82AA31F8, Dunwall's sub_82B0A120 alike) rounds it down to the GPU's slice group (andc), passes that
+  // to the subresource address helper with level 0, and puts the remainder into the copy destination's slice field.
+  // Read as the level, every resolve into a slice or cube face went to slice 0 (Dunwall: the colour-grading volume's
+  // 16 slices). Level is always 0 here.
+  const u32 point_va = ctx.r7.u32, dest_level = 0, dest_slice = ctx.r8.u32, color_va = ctx.r9.u32;
   const u32 clear_stencil = LoadU32(ctx.r1.u32 + 84);
   ClearRect rect;
   const bool has_rect = rect_va && ReadRect(rect_va, rect);

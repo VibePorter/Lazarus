@@ -1156,7 +1156,18 @@ void FlushDeferredVertices(u32 device_va) {
     g_deferred.erase(it);
     g_deferred_count.store(g_deferred.size(), std::memory_order_release);
   }
+  // Dunwall (2026-11-12, perf item 2): pooled captures keep their vectors' storage, but assign() sizes it exactly, so
+  // a capture reallocated whenever its next Begin*Vertices draw was a little bigger (malloc + free under newlib's one
+  // lock on UE3's render thread: ~0.8 % of it in slow frames of NRO b4563e94). Grown in powers of two (at least 1 KB),
+  // a capture reallocates a few times in its life.
+  const auto grow = [](std::vector<u8> &v, size_t n) {
+    if (v.capacity() < n)
+      v.reserve(std::bit_ceil(std::max<size_t>(n, 1024)));
+  };
+  grow(deferred.capture->vertices, deferred.bytes);
   deferred.capture->vertices.assign(deferred.scratch, deferred.scratch + deferred.bytes);
+  if (deferred.index_scratch)
+    grow(deferred.capture->indices, deferred.index_bytes);
   if (deferred.index_scratch)
     deferred.capture->indices.assign(deferred.index_scratch, deferred.index_scratch + deferred.index_bytes);
   else

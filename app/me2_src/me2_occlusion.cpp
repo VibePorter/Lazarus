@@ -230,6 +230,13 @@ REXCVAR_DEFINE_DOUBLE(me2_occlusion_cut_rot, 1.0, "ME2",
                       "Camera cut detection: a view rotation element changing by more than this in ONE frame is a cut "
                       "(every occlusion answer thrown away); 1.0 ~ 60 degrees a frame (was a fixed 0.2 ~ 12 degrees)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// ME2 (2026-11-12, user: cutscene / dialogue cuts left models hidden for a moment, the Normandy's stars showed
+// through): see Me2OcclusionViewHistory::spike_factor.
+REXCVAR_DEFINE_DOUBLE(me2_occlusion_cut_spike_factor, 4.0, "ME2",
+                      "Camera cut detection: a camera change more than this many times the largest of the last 8 frames "
+                      "(and over 0.15 rotation / 24 units) is a cut too (dialogue reverse shots, new angles nearby); "
+                      "0 = off (only the absolute limits)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(me2_occlusion_umbra_latent_turn, true, "ME2",
                     "me2_occlusion_umbra_latent: an 'occluded' count stays valid while the camera only turned (moved "
                     "at most me2_occlusion_umbra_latent_move) if the node's box was wholly on screen at the count: "
@@ -3714,6 +3721,8 @@ REX_HOOK_RAW(sub_8274AA38) {
     }
     static const float cut_rot = float(REXCVAR_GET(me2_occlusion_cut_rot));
     g_latent_view.rot_cut = cut_rot;  // me2-nx-deko (2026-11-04)
+    static const float spike = float(REXCVAR_GET(me2_occlusion_cut_spike_factor));
+    g_latent_view.spike_factor = spike;  // ME2 (2026-11-12)
     const unsigned reason = g_latent_view.Observe(current, frame);
     ViewAt& v = g_view_hist[frame & (kViewHist - 1)];
     v.frame = frame;
@@ -3725,7 +3734,7 @@ REX_HOOK_RAW(sub_8274AA38) {
       // me2_occlusion_cut_visible_frames: a cut is the camera turning or moving at once (or a frame gap), not a
       // projection change alone (run 6: 1,424 of 1,714 detections, zooms / FOV moves with the camera in place).
       if (reason & (Me2OcclusionViewHistory::kRotation | Me2OcclusionViewHistory::kPosition |
-                    Me2OcclusionViewHistory::kGap))
+                    Me2OcclusionViewHistory::kGap | Me2OcclusionViewHistory::kSpike))
         g_cut_frame.store(frame, std::memory_order_relaxed);
       static uint64_t window = 0;
       static unsigned lines = 0;

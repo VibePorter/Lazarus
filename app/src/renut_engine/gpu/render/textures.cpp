@@ -56,6 +56,13 @@ REXCVAR_DEFINE_INT32(me2_renut_resolve_pool_mb, 32, "ME2/Renderer",
                      "up to 8 spare targets, idle for at most 120 frames. Zero disables reuse. Read at start")
     .range(0, 64)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// ME2 (2026-11-14, from the Dunwall port 2026-11-13): the GPU memory left (MB) under which the resolve pool stops. It
+// used the texture reserve (banjo_renut_memory_policy, 192 MB): under it a UI resolve destination flipping 0.5x <-> 1x
+// (me2_renut_ui_* scales) was freed and made again twice a frame for the rest of the session (Dunwall: rainbow DXT
+// textures until a level reload). 192 = the old behaviour, for an A/B.
+REXCVAR_DEFINE_INT32(me2_renut_resolve_pool_floor_mb, 32, "ME2/Renderer",
+                     "GPU memory left (MB) under which the colour resolve pool stops reusing allocations")
+    .range(0, 1024);
 
 // me2-nx-deko (2026-10-31): the console logs of 10-31 (run 3) had 33 of the 290 frames over 70 ms in bursts of new
 // textures (median 145 ms, up to 1.2 s): every texture a draw binds for the first time is created, hashed, untiled,
@@ -150,6 +157,8 @@ constexpr uint64_t kEvictCheckFrames = 120;
 constexpr uint64_t kEvictIdleFrames = 600;
 constexpr uint64_t kEvictIdleGpuFrames = 3600;
 constexpr uint32_t kEvictPressureSlots = kTextureDescriptorCount * 3 / 4;
+// ME2 (2026-11-12): descriptor slots stay below the exponent adjust bits of a slot word (textures.h).
+static_assert(kTextureDescriptorCount <= (1u << kExpAdjustShift));
 constexpr double kEvictMemoryShare = 0.85;
 
 // Linear textures (see BindTextureLocked): how often a lock-driven texture
@@ -567,6 +576,7 @@ struct PendingFill {
   uint32_t blocks_w, blocks_h, depth;
   uint8_t *dst;
   uint32_t row_pitch, slice_pitch;
+  UploadAllocation staging;  // Dunwall (2026-11-13): cleaned once filled (UploadRing::CleanNow)
 };
 std::vector<PendingFill> g_pending_fills;
 
@@ -631,10 +641,17 @@ bool Upload(HostTexture &t, const TextureFetch &fetch, bool defer_read, uint32_t
         return false;
       auto *dst = static_cast<uint8_t *>(staging.cpu);
       if (defer_read) {
-        g_pending_fills.push_back({t.guest_va, t.info, fetch, src, blocks_w, blocks_h, d, dst, row_pitch, slice_pitch});
+        g_pending_fills.push_back(
+            {t.guest_va, t.info, fetch, src, blocks_w, blocks_h, d, dst, row_pitch, slice_pitch, staging});
       } else {
         g_level_replaced = false;
         ReadLevel(t.info, fetch, src, blocks_w, blocks_h, d, dst, row_pitch, slice_pitch);
+        // Dunwall (2026-11-13, the rainbow textures seen from a distance): the level's staging bytes out of the
+        // CPU's cache now, by the thread that wrote them. Until now only the ring cleaner (another core) did it, and
+        // a list could reach the GPU without waiting for it (video.cpp RingCleaner::Enqueue): the copy then read what
+        // the ring held frames ago (other textures' blocks) and the image kept it until it was made again. The small
+        // levels are written last, so they were the ones still in the cache.
+        s.uploads[s.frame].CleanNow(staging);
         if (g_level_replaced) {
           t.replaced_icon = true;
           // me2-nx-deko (2026-11-06): its HD levels, for UpgradeToHdIcon after the upload.
@@ -717,6 +734,25 @@ bool Create(HostTexture &t, const TextureFetch &fetch, bool render_target,
   const u32 largest = std::max({width, height, fetch.Dimension() == TextureDimension::Tex3D ? depth : 1u});
   const u32 size_levels = 32 - u32(std::countl_zero(largest));
   t.mip_levels = render_target ? 1 : std::min(fetch.MaxMipLevel() + 1, size_levels);
+  // ME2 (2026-11-12, backported from the Dunwall port: rainbow / black textures at a distance): a level without guest
+  // data (its page 0: a fetch constant with mip levels but no mip address) was left out by Upload (and by the content
+  // hashes), so the host level kept what its image memory held before: deko3d does not clear it, and with cold
+  // textures released all the time that is another texture's bytes (random DXT blocks) or zeros (black). Only a far
+  // object samples those levels. The host texture gets the levels that have data, so the sampler clamps to the last.
+  if (!render_target && t.mip_levels > 1) {
+    u32 filled = 1;
+    while (filled < t.mip_levels && GetTextureLevelLayout(fetch, filled).page)
+      ++filled;
+    if (filled < t.mip_levels) {
+      static uint32_t logged = 0;
+      if (logged++ < 32)
+        RGPU_WARN("[mips] texture {:08X} ({}x{} format {}): {} levels in its fetch constant, data for {} (base {:08X}, "
+                  "mip address {:08X}); the host texture has {}",
+                  t.guest_va, width, height, u32(fetch.Format()), t.mip_levels, filled, fetch.BasePage() << 12,
+                  fetch.MipPage() << 12, filled);
+      t.mip_levels = filled;
+    }
+  }
   t.render_target = render_target;
   plume::RenderFormat format = render_target ? rt_format : t.info.host;
   if (format == plume::RenderFormat::UNKNOWN)
@@ -853,6 +889,7 @@ bool UpgradeToHdIcon(HostTexture &t, const TextureFetch &fetch) {
       else
         ConvertTexels(t.info.conversion, row.data(), out, w);
     }
+    s.uploads[s.frame].CleanNow(staging[level]);  // Dunwall (2026-11-13): see UploadRing::CleanNow
     cmd->copyTextureRegion(plume::RenderTextureCopyLocation::Subresource(texture.get(), level, 0),
                            plume::RenderTextureCopyLocation::PlacedFootprint(
                                staging[level].ref.ref, t.info.host, w, w, 1, pitch[level] / t.info.host_block_bytes,
@@ -959,9 +996,15 @@ bool ResolvePoolAllowed() {
   if (checked_frame != g_frame) {
     checked_frame = g_frame;
     const GpuMemoryUsage memory = QueryGpuMemory(State().device.get());
-    const uint64_t reserve = std::max<uint64_t>(64ull << 20, banjo::renut_gpu::TextureReserveBytes());
+    // Dunwall (2026-11-13, the rainbow textures that stay until a level reload): this used the texture reserve
+    // (banjo_renut_memory_policy, 192 MB). In all four rainbow sessions the GPU went under it a few minutes in, the
+    // pool stopped, and the UI's resolve destination (41D0DA00, flipping 0.5x <-> 1x twice a frame) was freed and made
+    // again ~50 times a second for the rest of the session: compressed colour targets churned through the image heap
+    // the sampled textures share. The pool holds one or two spares (~4.5 MB, capped by me2_renut_resolve_pool_mb),
+    // less than the churn keeps in flight; it stops only when the GPU is really out of room. me2_renut_resolve_pool_floor_mb.
+    const uint64_t floor = uint64_t(std::max(0, REXCVAR_GET(me2_renut_resolve_pool_floor_mb))) << 20;
     allowed = memory.valid && memory.local_budget > memory.local_used &&
-              memory.local_budget - memory.local_used >= reserve;
+              memory.local_budget - memory.local_used >= floor;
   }
   return allowed;
 }
@@ -1430,6 +1473,31 @@ void ReleaseResolvePoolLocked() {
     DropResolveSpare(spare);
 }
 
+// me2-nx-deko (2026-11-07, me2_renut_scale_switch_reset): at a render-scale change (docked/handheld switch), every
+// GPU-drawn texture (resolve destinations, made at the old scale) and every parked resolve spare goes; the next resolve
+// makes them again at the new scale. Returns how many of each.
+void DropGpuDrawnTexturesLocked(size_t *textures, size_t *spares) {
+  size_t s = 0;
+  for (auto &spare : g_resolve_spares) {
+    if (spare.target) {
+      DropResolveSpare(spare);
+      ++s;
+    }
+  }
+  std::vector<u32> gone;
+  for (const auto &[va, t] : g_textures) {
+    if (t && t->render_target)
+      gone.push_back(va);
+  }
+  for (u32 va : gone)
+    ReleaseHostTextureLocked(va);
+  ++g_texture_epoch;  // no slot memo (draw.cpp FillTextures) keeps a dropped texture's descriptor
+  if (textures)
+    *textures = gone.size();
+  if (spares)
+    *spares = s;
+}
+
 void ReleaseHostTexturesInMemoryLocked(u32 physical, u32 size) {
   if (!size)
     return;
@@ -1464,6 +1532,7 @@ void FlushTextureFillsLocked() {
     g_level_replaced = false;
     ReadLevel(f.info, f.fetch, f.src, f.blocks_w, f.blocks_h, f.depth, f.dst, f.row_pitch,
               f.slice_pitch);
+    Video::UploadsLocked().CleanNow(f.staging);  // Dunwall (2026-11-13): see UploadRing::CleanNow
     if (g_level_replaced)
       if (HostTexture *t = FindHostTextureLocked(f.texture_va))
         t->replaced_icon = true;
@@ -1765,6 +1834,7 @@ TextureBinding BindTextureLocked(u32 texture_va, const TextureFetch &device_fetc
     }
     binding.stacked = resolved->stacked;
     binding.scale = resolved->scale;
+    binding.from_target = resolved->render_target;
     binding.lod_scale = resolved->extra_levels ? resolved->scale : RenderScale{};
     return binding;
   }
@@ -1862,6 +1932,7 @@ TextureBinding BindTextureLocked(u32 texture_va, const TextureFetch &device_fetc
       binding.slot = words_slot;
       binding.stacked = false;
       binding.scale = t.scale;
+      binding.from_target = true;
       binding.lod_scale = RenderScale{};
       return binding;
     }
@@ -1934,6 +2005,7 @@ TextureBinding BindTextureLocked(u32 texture_va, const TextureFetch &device_fetc
       binding.slot = fsr->slot;
       binding.stacked = false;
       binding.scale = fsr->scale;
+      binding.from_target = true;
       binding.lod_scale = RenderScale{};
       return binding;
     }
@@ -1956,6 +2028,7 @@ TextureBinding BindTextureLocked(u32 texture_va, const TextureFetch &device_fetc
   }
   binding.stacked = t.stacked;
   binding.scale = t.scale;
+  binding.from_target = t.render_target;
   binding.lod_scale = t.hd_icon ? t.hd_scale : t.extra_levels ? t.scale : RenderScale{};  // me2-nx-deko: HD icons
   binding.min_level = t.resident_from;  // me2-nx-deko (2026-10-31): the levels it has yet
   binding.smooth_minify = t.replaced_icon;  // me2-nx-deko (2026-11-06)

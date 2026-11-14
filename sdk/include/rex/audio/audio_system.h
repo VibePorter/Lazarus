@@ -40,6 +40,14 @@ class XmaDecoder;
 using HookBeforeFrame = void (*)(size_t client_index);
 void SetHookBeforeFrame(HookBeforeFrame hook);
 
+// ME2 (2026-11-07): how many buffers the game's own output voice has queued in its mixer (ME2: Wwise's XAudio2
+// source voice), or -1 = unknown. The Switch audio pump (switch_audio_system.cpp) holds new frame requests while
+// it is 0 and the host queue still has frames, and refills its queue only while it is 2 or more. nullptr = none
+// (the pump then behaves as before).
+using GuestVoiceProbe = int (*)();
+void SetGuestVoiceProbe(GuestVoiceProbe probe);
+GuestVoiceProbe GetGuestVoiceProbe();
+
 class AudioSystem : public system::IAudioSystem {
  public:
   virtual ~AudioSystem();

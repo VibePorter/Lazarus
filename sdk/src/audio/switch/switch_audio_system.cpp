@@ -44,7 +44,24 @@ REXCVAR_DEFINE_BOOL(audio_switch_pump_inflight, true, "Audio",
                     "audio_switch_frames_in_queue, so a late game is not sent a burst of requests (ME2 cut-outs). "
                     "false = only the delivered frames count, as before")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
-REXCVAR_DEFINE_INT32(audio_switch_frames_in_queue, 16, "Audio",
+// ME2 (2026-11-07): with a guest voice probe (rex::audio::SetGuestVoiceProbe, ME2: me2_audio_gate.cpp = buffers
+// queued in Wwise's XAudio2 voice) the pump keeps a real cushion and spends it when the game's mixer would play
+// an empty voice. Without a probe nothing changes.
+REXCVAR_DEFINE_INT32(audio_switch_refill_frames, 24, "Audio",
+                     "With a guest voice probe: frames the pump keeps queued (24 = 128 ms; console-tested 2026-11-07: 0 dropouts). While below "
+                     "it and the game's voice has 2+ buffers queued, 2 frames are requested a tick; 0 = never refill "
+                     "(the queue then stays at ~2-5 frames as before). Capped by audio_switch_frames_in_queue")
+    .range(0, 32);
+REXCVAR_DEFINE_BOOL(audio_switch_voice_hold, true, "Audio",
+                    "With a guest voice probe: no new frame request while the game's voice has nothing queued (the "
+                    "game's mixer would mix silence), as long as more than audio_switch_hold_floor frames are queued");
+REXCVAR_DEFINE_INT32(audio_switch_hold_floor, 2, "Audio",
+                     "audio_switch_voice_hold stops holding when the queue is down to this many frames")
+    .range(1, 16);
+REXCVAR_DEFINE_INT32(audio_switch_report_s, 10, "Audio",
+                     "With a guest voice probe: seconds between '[audio-pump]' lines (0 = none)")
+    .range(0, 3600);
+REXCVAR_DEFINE_INT32(audio_switch_frames_in_queue, 32, "Audio",
                      "With audio_switch_pump: game frames kept queued before audout "
                      "(cushion; 10 = 53 ms, 6 up to build 105). A longer queue lets the game wait without cutting the "
                      "output, at the cost of latency: sa2_audio_wait_server_ms waits up to 30 ms; read "
@@ -406,6 +423,43 @@ void SwitchAudioSystem::FillAndAppend(size_t buffer_index) {
 
 void SwitchAudioSystem::PumpTick() {
   static const bool inflight = REXCVAR_GET(audio_switch_pump_inflight);
+  // ME2 (2026-11-07): the game's voice state (see audio_switch_refill_frames). Read once a tick for all clients.
+  const GuestVoiceProbe probe = GetGuestVoiceProbe();
+  const int raw_voice = probe ? probe() : -1;
+  // Safety net: a game voice that reads empty on more than a quarter of the ticks of a 10 s window cannot be true
+  // (the mix would be in pieces anyway): the count is wrong, so the pump stops using it until a 2 s window under 5 %.
+  // (v2 of 2026-11-07 counted the wrong callback, read 0 almost always and held every other tick: tearing.) v4 reads
+  // XAudio2's own BuffersQueued, so it starts trusted: the start-up logos play in the first seconds.
+  static uint64_t window_ticks = 0, window_empty = 0, voice_sum = 0, voice_ticks = 0;
+  static bool distrust = false;
+  if (raw_voice >= 0) {
+    ++window_ticks;
+    window_empty += raw_voice == 0;
+    voice_sum += uint64_t(raw_voice);
+    ++voice_ticks;
+    if (window_ticks >= (distrust ? 375u : 1875u)) {
+      const bool was = distrust;
+      if (window_empty * 4 > window_ticks) distrust = true;
+      else if (window_empty * 20 < window_ticks) distrust = false;
+      if (distrust != was) {
+        REXLOG_WARN("[audio-pump] the game's voice read empty on {} of {} ticks: {}", window_empty, window_ticks,
+                    distrust ? "count ignored (pump as before)" : "count used again");
+      }
+      window_ticks = window_empty = 0;
+    }
+  }
+  const int voice = distrust ? -1 : raw_voice;
+  const size_t refill = std::min<size_t>(size_t(std::max(REXCVAR_GET(audio_switch_refill_frames), 0)),
+                                         output_->frames_in_queue);
+  const size_t hold_floor = size_t(REXCVAR_GET(audio_switch_hold_floor));
+  const bool hold_on = REXCVAR_GET(audio_switch_voice_hold);
+  // Report state (this thread only).
+  static uint64_t ticks = 0, held = 0, hold_episodes = 0, hold_spent = 0, refills = 0, queued_sum = 0;
+  static size_t queued_min = ~size_t(0), queued_max = 0;
+  static bool holding = false;
+  static u64 report_at = 0;
+  bool held_now = false;
+  size_t tick_queued = 0;
   std::lock_guard<std::mutex> guard(drivers_mutex_);
   for (SwitchAudioDriver* driver : drivers_) {
     const size_t queued = driver->QueuedFrames();
@@ -415,8 +469,22 @@ void SwitchAudioSystem::PumpTick() {
     // while every output buffer was full - the cut-outs, worst during loads and fights.
     const int32_t outstanding = inflight ? std::max(driver->Outstanding(), 0) : 0;
     const size_t on_the_way = queued + size_t(outstanding);
+    tick_queued = std::max(tick_queued, queued);  // the busiest client (an idle one keeps ~0)
+    // ME2 (2026-11-07): the game's voice is empty (Wwise late): another mixer pass now would mix silence. While the
+    // queue still has frames, ask for none and let the output play what it has; Wwise's next buffer ends the hold.
+    if (hold_on && voice == 0 && queued > hold_floor) {
+      held_now = true;
+      continue;
+    }
+    if (voice == 0 && hold_on && queued <= hold_floor && holding) ++hold_spent;  // the cushion ran out while waiting
     if (on_the_way <= output_->frames_in_queue) {
       driver->RequestFrame();
+      // Refill toward audio_switch_refill_frames at twice the real-time rate, only while the game's voice is two
+      // buffers ahead (Wwise keeps up), so the extra passes cannot run it dry.
+      if (voice >= 2 && outstanding <= 1 && on_the_way + 1 < refill) {
+        driver->RequestFrame();
+        ++refills;
+      }
     }
     if (queued < kMinQueuedFrames) {
       // The queue has (almost) emptied: one more to catch up, whatever is on its way, so a request the game never
@@ -434,6 +502,36 @@ void SwitchAudioSystem::PumpTick() {
       }
     }
   }
+  if (!probe) return;
+  ++ticks;
+  queued_sum += tick_queued;
+  queued_min = std::min(queued_min, tick_queued);
+  queued_max = std::max(queued_max, tick_queued);
+  if (held_now) {
+    ++held;
+    if (!holding) ++hold_episodes;
+  }
+  holding = held_now;
+  const int32_t report_s = REXCVAR_GET(audio_switch_report_s);
+  const u64 now = armGetSystemTick();
+  if (report_s <= 0) return;
+  if (report_at == 0) {
+    report_at = now + armNsToTicks(u64(report_s) * 1'000'000'000ull);
+    return;
+  }
+  if (now < report_at) return;
+  report_at = now + armNsToTicks(u64(report_s) * 1'000'000'000ull);
+  REXLOG_INFO(
+      "[audio-pump] {} s: queue {}..{} frames (mean {:.1f}, refill target {}), {} requests to refill; game's voice "
+      "{:.2f} buffers on average (now {}{}); empty -> {} ticks held in {} holds ({:.1f} ms), {} ticks with the queue "
+      "down to the floor",
+      report_s, queued_min == ~size_t(0) ? 0 : queued_min, queued_max,
+      ticks ? double(queued_sum) / double(ticks) : 0.0, refill, refills,
+      voice_ticks ? double(voice_sum) / double(voice_ticks) : -1.0, raw_voice, distrust ? ", IGNORED" : "", held,
+      hold_episodes, held * 5.333, hold_spent);
+  ticks = held = hold_episodes = hold_spent = refills = queued_sum = voice_sum = voice_ticks = 0;
+  queued_min = ~size_t(0);
+  queued_max = 0;
 }
 
 void SwitchAudioSystem::OutputThreadMain() {

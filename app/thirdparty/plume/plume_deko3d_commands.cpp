@@ -13,6 +13,8 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <atomic>
+#include <mutex>
 
 namespace plume {
     DkImageFormat toDkFormat(RenderFormat format);
@@ -57,6 +59,305 @@ namespace plume {
             device->destroyBlock(t.first);
     }
 
+    // ---- Dunwall (2026-11-12): GPU breadcrumbs (Deko3DSetBreadcrumbs in plume_deko3d.h)
+    namespace {
+        struct Crumb {
+            uint32_t kind = 0;     // CrumbKind
+            uint32_t a = 0, b = 0, c = 0;
+            uint64_t vs = 0, ps = 0;
+            uint64_t addr = 0;     // indexed draws: the index buffer's GPU address; copies from a buffer: the source
+            uint64_t addr2 = 0;    // Dunwall (2026-11-13): copies into a texture: the destination image's GPU address
+            // Dunwall (2026-11-13): every GPU address the work reads or writes, as recorded (tag: I index, V vertex,
+            // U uniform, S storage, T texture image from its descriptor, t texture descriptor table, C colour target,
+            // D depth target, B copy source, X copy destination).
+            struct Ref {
+                uint64_t addr;
+                uint32_t size;
+                uint16_t slot;
+                char tag;
+            };
+            static constexpr uint32_t kRefs = 24;
+            uint32_t refCount = 0;
+            Ref refs[kRefs];
+            const uint8_t *descriptorCpu = nullptr;  // the image descriptor table's CPU address (T refs re-read at the dump)
+            void add(char tag, uint32_t slot, uint64_t a, uint32_t size) {
+                if (refCount < kRefs && a)
+                    refs[refCount++] = {a, size, uint16_t(slot), tag};
+            }
+        };
+        enum CrumbKind : uint32_t {
+            kCrumbDraw = 1, kCrumbDrawIndexed, kCrumbDispatch, kCrumbClearColor, kCrumbClearDepth, kCrumbCopyBuffer,
+            kCrumbBufferToImage, kCrumbImageToBuffer, kCrumbCopyImage, kCrumbResolve, kCrumbBlit
+        };
+        const char *const kCrumbNames[] = {"?", "draw", "indexed draw", "dispatch", "colour clear", "depth clear",
+                                           "buffer copy", "buffer to image", "image to buffer", "image copy",
+                                           "resolve", "blit"};
+        constexpr uint32_t kCrumbRing = 1u << 15;  // more than the work recorded ahead of the GPU (8,300 at the dumps)
+        bool g_crumbsOn = false;
+        bool g_crumbsExact = false;  // Dunwall (2026-11-13): Deko3DSetBreadcrumbsExact
+        Crumb *g_crumbs = nullptr;
+        std::atomic<uint32_t> g_crumbSeq{0};
+        DkMemBlock g_crumbBlock = nullptr;
+        Deko3DDevice *g_crumbDevice = nullptr;
+        volatile uint32_t *g_crumbCpu = nullptr;
+        DkGpuAddr g_crumbGpu = 0;
+        std::mutex g_crumbMutex;
+        thread_local uint64_t t_crumbVs = 0, t_crumbPs = 0;
+    }
+
+    void Deko3DSetBreadcrumbs(bool on) { g_crumbsOn = on; }
+    void Deko3DSetBreadcrumbsExact(bool on) { g_crumbsExact = on; }
+
+    // ---- Dunwall (2026-11-13): queue operations between the breadcrumbs (submissions, swapchain acquires and
+    // presents, fence signals), so the dump can tell "waiting at a queue wait after #n" from "hung in #n+1".
+    namespace {
+        enum QueueOpKind : uint32_t { kOpSubmit = 1, kOpAcquire, kOpPresent, kOpSignal, kOpAcquireFailed };
+        const char *const kQueueOpNames[] = {"?", "submit list", "ACQUIRE swapchain image (GPU waits for it)",
+                                             "present swapchain image", "signal fence", "acquire FAILED"};
+        struct QueueOp {
+            uint64_t tick;
+            uint32_t kind;
+            uint32_t first, last;  // submit: the list's breadcrumbs; others: last = the last breadcrumb submitted before
+            int32_t slot;          // acquire / present: the image; submit: the list's breadcrumb count
+            uint32_t cpuWaitUs;    // acquire: how long the CPU blocked in it
+        };
+        constexpr uint32_t kQueueOps = 1024;
+        QueueOp g_queueOps[kQueueOps];
+        std::atomic<uint32_t> g_queueOpCount{0};
+        uint32_t g_lastSubmittedCrumb = 0;
+        void queueOp(uint32_t kind, uint32_t first, uint32_t last, int32_t slot, uint32_t cpuWaitUs = 0) {
+            if (!g_crumbsOn)
+                return;
+            const uint32_t n = g_queueOpCount.fetch_add(1, std::memory_order_relaxed);
+            g_queueOps[n % kQueueOps] = {armGetSystemTick(), kind, first, last, slot, cpuWaitUs};
+        }
+    }
+
+    void Deko3DDumpQueueOps(uint32_t done) {
+        const uint32_t count = g_queueOpCount.load();
+        const uint32_t n = std::min<uint32_t>(count, 40);
+        const uint64_t now = armGetSystemTick();
+        deko3dLog("queue: the last %u of %u queue operations (newest last; GPU finished breadcrumb #%u)", n, count, done);
+        int32_t acquired[8] = {0};
+        for (uint32_t k = n; k > 0; k--) {
+            const QueueOp &o = g_queueOps[(count - k) % kQueueOps];
+            const double ago = double(armTicksToNs(now - o.tick)) / 1e9;
+            const char *mark = "";
+            if (o.kind == kOpSubmit && done + 1 >= o.first && done + 1 <= o.last && done >= o.first)
+                mark = "   <== THE GPU IS INSIDE THIS LIST";
+            else if (o.kind == kOpSubmit && done + 1 == o.first)
+                mark = "   <== THE GPU HAS NOT STARTED THIS LIST (stuck before it)";
+            else if (o.kind != kOpSubmit && o.last == done)
+                mark = "   <== RIGHT AFTER THE LAST FINISHED BREADCRUMB";
+            if (o.kind == kOpSubmit)
+                deko3dLog("queue: %8.3f s ago submit list #%u..#%u (%d pieces)%s", ago, o.first, o.last, o.slot, mark);
+            else if (o.kind == kOpAcquire)
+                deko3dLog("queue: %8.3f s ago %s %d after #%u (CPU blocked %u us)%s", ago, kQueueOpNames[o.kind], o.slot,
+                          o.last, o.cpuWaitUs, mark);
+            else
+                deko3dLog("queue: %8.3f s ago %s %d after #%u%s", ago, kQueueOpNames[o.kind < 6 ? o.kind : 0], o.slot,
+                          o.last, mark);
+        }
+        // Images acquired but never presented (a leak starves the swapchain: the GPU then waits forever at an acquire).
+        const uint32_t m = std::min<uint32_t>(count, kQueueOps);
+        for (uint32_t k = m; k > 0; k--) {
+            const QueueOp &o = g_queueOps[(count - k) % kQueueOps];
+            if (o.slot >= 0 && o.slot < 8) {
+                if (o.kind == kOpAcquire)
+                    acquired[o.slot]++;
+                else if (o.kind == kOpPresent)
+                    acquired[o.slot]--;
+            }
+        }
+        deko3dLog("queue: acquires minus presents per image over the last %u operations: %d %d %d %d", m, acquired[0],
+                  acquired[1], acquired[2], acquired[3]);
+    }
+    uint32_t Deko3DCrumbRecorded() { return g_crumbsOn ? g_crumbSeq.load(std::memory_order_relaxed) : 0; }
+    uint32_t Deko3DCrumbDone() { return g_crumbCpu ? g_crumbCpu[0] : 0; }
+    void Deko3DBreadcrumbTag(uint64_t vs, uint64_t ps) {
+        t_crumbVs = vs;
+        t_crumbPs = ps;
+    }
+
+    // After a piece of work: its number, written by the GPU once it (and everything before it) has finished.
+    static uint32_t crumb(Deko3DCommandList *list, Deko3DDevice *device, DkCmdBuf cmd, uint32_t kind, uint32_t a,
+                          uint32_t b, uint32_t c) {
+        if (!g_crumbsOn || !device || !cmd)
+            return 0;
+        if (!g_crumbBlock) {
+            std::lock_guard<std::mutex> lock(g_crumbMutex);
+            if (!g_crumbBlock) {
+                g_crumbs = new Crumb[kCrumbRing];
+                // Uncached on both sides: the value reaches memory even when the GPU hangs right after it.
+                DkMemBlock block = device->makeBlock(DK_MEMBLOCK_ALIGNMENT, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuUncached,
+                                                     "breadcrumbs");
+                if (!block)
+                    return 0;
+                g_crumbDevice = device;
+                g_crumbCpu = static_cast<volatile uint32_t *>(dkMemBlockGetCpuAddr(block));
+                g_crumbCpu[0] = 0;
+                g_crumbGpu = dkMemBlockGetGpuAddr(block);
+                g_crumbBlock = block;
+                deko3dLog("breadcrumbs: on, %s", g_crumbsExact ? "EXACT (a full GPU barrier after each piece of work)"
+                                                               : "pipelined");
+            }
+        }
+        const uint32_t seq = g_crumbSeq.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (list) {
+            if (!list->crumbFirst)
+                list->crumbFirst = seq;
+            list->crumbLast = seq;
+        }
+        Crumb &e = g_crumbs[seq & (kCrumbRing - 1)];
+        e.kind = kind;
+        e.a = a;
+        e.b = b;
+        e.c = c;
+        e.addr = 0;
+        e.addr2 = 0;
+        e.refCount = 0;
+        e.descriptorCpu = nullptr;
+        e.vs = (kind == kCrumbDraw || kind == kCrumbDrawIndexed) ? t_crumbVs : 0;
+        e.ps = (kind == kCrumbDraw || kind == kCrumbDrawIndexed) ? t_crumbPs : 0;
+        if (kind == kCrumbDraw || kind == kCrumbDrawIndexed)
+            t_crumbVs = t_crumbPs = 0;
+        // Exact: the work above finishes before the number is written and before anything after it starts.
+        if (g_crumbsExact)
+            dkCmdBufBarrier(cmd, DkBarrier_Full, 0);
+        dkCmdBufReportValue(cmd, seq, g_crumbGpu);
+        return seq;
+    }
+
+    // Dunwall (2026-11-13): a texture descriptor's image address (Maxwell TIC: word 1 = address bits 0-31, word 2
+    // bits 0-15 = bits 32-47).
+    static uint64_t ticAddress(const uint8_t *descriptor) {
+        uint32_t w[3];
+        memcpy(w, descriptor, sizeof(w));
+        return uint64_t(w[1]) | (uint64_t(w[2] & 0xFFFFu) << 32);
+    }
+
+    // Dunwall (2026-11-13): a draw's or dispatch's addresses into its breadcrumb.
+    static void crumbRefs(const Deko3DCommandList &cl, uint32_t seq, bool compute) {
+        if (!seq)
+            return;
+        Crumb &e = g_crumbs[seq & (kCrumbRing - 1)];
+        if (compute) {
+            const Deko3DComputePipeline *p = cl.computePipeline;
+            for (uint32_t s = 0; p && s < 16; s++) {
+                if (((p->uboMask & cl.computeUboValid) >> s) & 1u)
+                    e.add('U', s, cl.computeUbo[s].addr, cl.computeUbo[s].size);
+                if (((p->ssboMask & cl.computeSsboValid) >> s) & 1u)
+                    e.add('S', s, cl.computeSsbo[s].addr, cl.computeSsbo[s].size);
+            }
+            return;
+        }
+        const Deko3DGraphicsPipeline *p = cl.graphicsPipeline;
+        if (!p)
+            return;
+        if (cl.framebuffer) {
+            for (uint32_t i = 0; i < cl.framebuffer->colorCount; i++)
+                if (cl.framebuffer->colors[i].pImage)
+                    e.add('C', i, dkImageGetGpuAddr(cl.framebuffer->colors[i].pImage), 0);
+            if (cl.framebuffer->hasDepth && cl.framebuffer->depth.pImage)
+                e.add('D', 0, dkImageGetGpuAddr(cl.framebuffer->depth.pImage), 0);
+        }
+        for (uint32_t i = 0; i < p->vtxBufferCount && i < 16; i++)
+            e.add('V', i, cl.crumbVtx[i].addr, cl.crumbVtx[i].size);
+        uint32_t ubo = (p->uboMask[0] | p->uboMask[1] | p->uboMask[2]) & cl.graphicsUboValid;
+        while (ubo) {
+            const uint32_t s = uint32_t(__builtin_ctz(ubo));
+            ubo &= ubo - 1;
+            e.add('U', s, cl.graphicsUbo[s].addr, cl.graphicsUbo[s].size);
+        }
+        uint32_t ssbo = (p->ssboMask[0] | p->ssboMask[1] | p->ssboMask[2]) & cl.graphicsSsboValid;
+        while (ssbo) {
+            const uint32_t s = uint32_t(__builtin_ctz(ssbo));
+            ssbo &= ssbo - 1;
+            e.add('S', s, cl.graphicsSsbo[s].addr, cl.graphicsSsbo[s].size);
+        }
+        const Deko3DDescriptorSet *set = cl.boundImageSetObj;
+        if (set && set->imageBlock) {
+            e.add('t', 0, dkMemBlockGetGpuAddr(set->imageBlock), set->imageCount * 32);
+            const uint8_t *table = static_cast<const uint8_t *>(dkMemBlockGetCpuAddr(set->imageBlock));
+            e.descriptorCpu = table;
+            for (int st = 0; st < 3; st++) {
+                for (uint32_t k = 0; k < cl.boundTexCount[st] && k < 32; k++) {
+                    const uint32_t id = cl.boundTex[st][k] & 0xFFFFFu;
+                    if (id >= set->imageCount)
+                        e.add('T', id, 0xDEAD00000000ull | id, 0);  // an id past the table
+                    else
+                        e.add('T', id, ticAddress(table + size_t(id) * 32), 0);
+                }
+            }
+        }
+    }
+
+    // The failed kickoff's log (rex_switch_kickoff_failed in plume_deko3d.cpp): where the GPU stopped.
+    void Deko3DDumpBreadcrumbs() {
+        if (!g_crumbsOn || !g_crumbCpu) {
+            deko3dLog("breadcrumbs: off (dh_gpu_breadcrumbs = true in the toml names the work the GPU stopped in)");
+            return;
+        }
+        const uint32_t done = g_crumbCpu[0];
+        const uint32_t recorded = g_crumbSeq.load();
+        deko3dLog("breadcrumbs: the GPU finished work #%u of #%u recorded (%u not finished)", done, recorded,
+                  recorded - done);
+        const auto line = [](const char *what, uint32_t seq) {
+            const Crumb &e = g_crumbs[seq & (kCrumbRing - 1)];
+            deko3dLog("breadcrumbs: %s #%u %s (%u, %u, %u) VS %016llX PS %016llX", what, seq,
+                      kCrumbNames[e.kind < 12 ? e.kind : 0], e.a, e.b, e.c, (unsigned long long)e.vs,
+                      (unsigned long long)e.ps);
+        };
+        for (uint32_t s = done > 3 ? done - 3 : 1; s <= done; ++s)
+            line("finished", s);
+        for (uint32_t s = done + 1; s <= recorded && s <= done + 12; ++s)
+            line(s == done + 1 ? "STOPPED IN" : "after it", s);
+        deko3dLog("breadcrumbs: %s mode (%s)", g_crumbsExact ? "EXACT" : "pipelined",
+                  g_crumbsExact ? "one piece of work in flight: the stopped one is the one that hung"
+                                : "the GPU may have hung in any of the pieces after the stopped one");
+        // Dunwall (2026-11-13): every address the stopped work (and the next one) uses: live block, destroyed one,
+        // or none; textures also with their descriptor read again now (rewritten while the work waited?).
+        for (uint32_t s = done + 1; s <= recorded && s <= done + 2; ++s) {
+            const Crumb &e = g_crumbs[s & (kCrumbRing - 1)];
+            deko3dLog("breadcrumbs: #%u %s uses %u addresses:", s, kCrumbNames[e.kind < 12 ? e.kind : 0], e.refCount);
+            for (uint32_t r = 0; r < e.refCount; r++) {
+                const Crumb::Ref &ref = e.refs[r];
+                char label[96];
+                if (ref.tag == 'T' && e.descriptorCpu && (ref.addr >> 32) != 0xDEADull) {
+                    const uint64_t now = ticAddress(e.descriptorCpu + size_t(ref.slot) * 32);
+                    snprintf(label, sizeof(label), "#%u T%u (texture id %u; descriptor now 0x%llX%s)", s, r, ref.slot,
+                             (unsigned long long)now, now == ref.addr ? "" : " REWRITTEN");
+                }
+                else
+                    snprintf(label, sizeof(label), "#%u %c%u (slot %u, %u bytes)", s, ref.tag, r, ref.slot, ref.size);
+                Deko3DDescribeGpuAddress(label, ref.addr);
+                if (g_crumbDevice && (ref.tag == 'T' || ref.tag == 'X' || ref.tag == 'C' || ref.tag == 'D'))
+                    g_crumbDevice->describeImageHeapAddress(label, ref.addr);
+            }
+        }
+        for (uint32_t s = done + 1; s <= recorded && s <= done + 3; ++s) {
+            const Crumb &e = g_crumbs[s & (kCrumbRing - 1)];
+            char label[64];
+            snprintf(label, sizeof(label), "#%u %s %s", s, kCrumbNames[e.kind < 12 ? e.kind : 0],
+                     e.kind == kCrumbDrawIndexed ? "index buffer" : "source");
+            Deko3DDescribeGpuAddress(label, e.addr);
+            snprintf(label, sizeof(label), "#%u %s destination image", s, kCrumbNames[e.kind < 12 ? e.kind : 0]);
+            Deko3DDescribeGpuAddress(label, e.addr2);
+        }
+        // The stopped draw's index buffer: still inside a live buffer of the device?
+        const Crumb &stopped = g_crumbs[(done + 1) & (kCrumbRing - 1)];
+        if (stopped.addr && g_crumbDevice) {
+            DkGpuAddr base = 0;
+            uint32_t size = 0;
+            const uint8_t *cpu = nullptr;
+            const bool live = g_crumbDevice->findBuffer(stopped.addr, base, size, cpu);
+            deko3dLog("breadcrumbs: the stopped draw's index buffer at GPU 0x%llX: %s (buffer 0x%llX, %u bytes)",
+                      (unsigned long long)stopped.addr, live ? "inside a live buffer" : "NOT INSIDE ANY LIVE BUFFER",
+                      (unsigned long long)base, size);
+        }
+    }
+
+
     void Deko3DCommandList::addMemory(size_t minimum) {
         const uint32_t want = alignUp(uint32_t(std::max<size_t>(minimum, CommandBlockSize)), DK_MEMBLOCK_ALIGNMENT);
         while (memoryUsed < memory.size() && memory[memoryUsed].second < want)
@@ -96,6 +397,7 @@ namespace plume {
         // transient memory is free again. dkCmdBufClear rewinds into the memory fed last, so the first block is fed
         // explicitly (SwitchWakerHD: deko3d 0.5.0's clear keeps the old position).
         dkCmdBufClear(cmd);
+        crumbFirst = crumbLast = 0;  // Dunwall (2026-11-13)
         pendingBarrier = false;  // banjo-nx (2026-10-19): nothing held over from the list before
         pendingBarrierMode = DkBarrier_None;
         pendingBarrierInvalidate = 0;
@@ -294,6 +596,7 @@ namespace plume {
         }
         flushBarriers();
         dkCmdBufDispatchCompute(cmd, x, y, z);
+        crumbRefs(*this, crumb(this, device, cmd, kCrumbDispatch, x, y, z), true);
     }
 
     void Deko3DCommandList::traceRays(uint32_t, uint32_t, uint32_t, RenderBufferReference, const RenderShaderBindingGroupsInfo &) {}
@@ -414,6 +717,7 @@ namespace plume {
         texReadEnd = readEnd;
     }
 
+
     void Deko3DCommandList::drawInstanced(uint32_t vertexCount, uint32_t instanceCount, uint32_t startVertex, uint32_t startInstance) {
         if (!graphicsPipeline || !graphicsPipeline->valid)
             return;
@@ -423,6 +727,7 @@ namespace plume {
             bindTextures();
         flushBarriers();
         dkCmdBufDraw(cmd, graphicsPipeline->primitive, vertexCount, instanceCount, startVertex, startInstance);
+        crumbRefs(*this, crumb(this, device, cmd, kCrumbDraw, vertexCount, instanceCount, startVertex), false);
         ++statDraws;
     }
 
@@ -435,6 +740,11 @@ namespace plume {
             bindTextures();
         flushBarriers();
         dkCmdBufDrawIndexed(cmd, graphicsPipeline->primitive, indexCount, instanceCount, startIndex, baseVertex, startInstance);
+        if (const uint32_t seq = crumb(this, device, cmd, kCrumbDrawIndexed, indexCount, instanceCount, startIndex)) {
+            g_crumbs[seq & (kCrumbRing - 1)].addr = indexAddress;
+            g_crumbs[seq & (kCrumbRing - 1)].add('I', 0, indexAddress, 0);
+            crumbRefs(*this, seq, false);
+        }
         ++statDraws;
     }
 
@@ -695,6 +1005,7 @@ namespace plume {
             const Deko3DBuffer *b = static_cast<const Deko3DBuffer *>(views[i].buffer.ref);
             extents[i] = (b && b->block) ? DkBufExtents{b->gpu + views[i].buffer.offset, std::max<uint32_t>(views[i].size, 4)}
                                          : DkBufExtents{device->zeroAddr, Deko3DDevice::ZeroSize};
+            crumbVtx[startSlot + i] = extents[i];  // Dunwall (2026-11-13): breadcrumbs
         }
         if (count)
             dkCmdBufBindVtxBuffers(cmd, startSlot, extents, count);
@@ -814,6 +1125,7 @@ namespace plume {
             dkCmdBufSetScissors(cmd, 0, &all, 1);
             flushBarriers();
             dkCmdBufClearColorFloat(cmd, attachmentIndex, DkColorMask_RGBA, color.r, color.g, color.b, color.a);
+            crumb(this, device, cmd, kCrumbClearColor, attachmentIndex, 0, 0);
         }
         else {
             for (uint32_t i = 0; i < rectsCount; i++) {
@@ -823,6 +1135,7 @@ namespace plume {
                 dkCmdBufSetScissors(cmd, 0, &s, 1);
                 flushBarriers();
                 dkCmdBufClearColorFloat(cmd, attachmentIndex, DkColorMask_RGBA, color.r, color.g, color.b, color.a);
+                crumb(this, device, cmd, kCrumbClearColor, attachmentIndex, 0, 0);
             }
         }
         restoreScissors();
@@ -834,6 +1147,7 @@ namespace plume {
             dkCmdBufSetScissors(cmd, 0, &all, 1);
             flushBarriers();
             dkCmdBufClearDepthStencil(cmd, clearDepth, depthValue, clearStencil ? 0xFF : 0, uint8_t(stencilValue));
+            crumb(this, device, cmd, kCrumbClearDepth, 0, 0, 0);
         }
         else {
             for (uint32_t i = 0; i < rectsCount; i++) {
@@ -843,6 +1157,7 @@ namespace plume {
                 dkCmdBufSetScissors(cmd, 0, &s, 1);
                 flushBarriers();
                 dkCmdBufClearDepthStencil(cmd, clearDepth, depthValue, clearStencil ? 0xFF : 0, uint8_t(stencilValue));
+                crumb(this, device, cmd, kCrumbClearDepth, 0, 0, 0);
             }
         }
         restoreScissors();
@@ -856,6 +1171,7 @@ namespace plume {
         flushBarriers();
         GetDeko3DStats().copyBuffer.store(GetDeko3DStats().copyBuffer.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);  // banjo-nx (2026-10-19)
         dkCmdBufCopyBuffer(cmd, s->gpu + src.offset, d->gpu + dst.offset, uint32_t(size));
+        crumb(this, device, cmd, kCrumbCopyBuffer, uint32_t(size), 0, 0);
     }
 
     static DkImageView subresourceView(const Deko3DTexture *t, uint32_t mip, uint32_t layer) {
@@ -924,6 +1240,13 @@ namespace plume {
             flushBarriers();
             GetDeko3DStats().copyUpload.store(GetDeko3DStats().copyUpload.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);  // banjo-nx (2026-10-19)
             dkCmdBufCopyBufferToImage(cmd, &src, &v, &rect, 0);
+            if (const uint32_t seq = crumb(this, device, cmd, kCrumbBufferToImage, rect.width, rect.height, uint32_t(t->desc.format))) {
+                Crumb &e = g_crumbs[seq & (kCrumbRing - 1)];
+                e.addr = src.addr;
+                e.addr2 = t->alloc.block ? dkMemBlockGetGpuAddr(t->alloc.block) + t->alloc.offset : 0;
+                e.add('B', 0, e.addr, src.imageHeight);
+                e.add('X', dstLoc.subresource.mipLevel, e.addr2, t->alloc.size);
+            }
             invalidateZcullAfterCopy(t);  // banjo-nx (2026-10-18): an upload into a depth target, the same as a copy
         }
         else if (dstLoc.type == RenderTextureCopyType::PLACED_FOOTPRINT && srcLoc.type == RenderTextureCopyType::SUBRESOURCE) {
@@ -949,6 +1272,7 @@ namespace plume {
             flushBarriers();
             GetDeko3DStats().copyReadback.store(GetDeko3DStats().copyReadback.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);  // banjo-nx (2026-10-19)
             dkCmdBufCopyImageToBuffer(cmd, &v, &rect, &dst, 0);
+            crumb(this, device, cmd, kCrumbImageToBuffer, rect.width, rect.height, 0);
             flushBarriers();
             dkCmdBufBarrier(cmd, DkBarrier_Full, DkInvalidateFlags_L2Cache);
         }
@@ -970,6 +1294,7 @@ namespace plume {
             flushBarriers();
             GetDeko3DStats().copyImage.store(GetDeko3DStats().copyImage.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);  // banjo-nx (2026-10-19)
             dkCmdBufCopyImage(cmd, &sv, &srect, &dv, &drect, 0);
+            crumb(this, device, cmd, kCrumbCopyImage, drect.width, drect.height, 0);
             invalidateZcullAfterCopy(dt);
         }
     }
@@ -978,9 +1303,16 @@ namespace plume {
         // banjo-nx (2026-10-18): deko3d drops the Zcull data only when another depth target is bound; a copy into the
         // bound one (the copy engine does not update Zcull) leaves it describing the old depth, which would cull draws
         // the new depth passes.
-        if (Deko3DGetOptions().zcull && (dst->desc.flags & RenderTextureFlag::DEPTH_TARGET))
+        // Dunwall (2026-11-13): the braces were missing, so every texture upload dropped the Zcull data.
+        if (Deko3DGetOptions().zcull && (dst->desc.flags & RenderTextureFlag::DEPTH_TARGET)) {
             flushBarriers();
             dkCmdBufBarrier(cmd, DkBarrier_None, DkInvalidateFlags_Zcull);
+        }
+    }
+
+    void Deko3DCommandList::invalidateZcull() {
+        flushBarriers();
+        dkCmdBufBarrier(cmd, DkBarrier_None, DkInvalidateFlags_Zcull);
     }
 
     void Deko3DCommandList::copyBuffer(const RenderBuffer *dst, const RenderBuffer *src) {
@@ -991,6 +1323,7 @@ namespace plume {
         flushBarriers();
         GetDeko3DStats().copyBuffer.store(GetDeko3DStats().copyBuffer.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);  // banjo-nx (2026-10-19)
         dkCmdBufCopyBuffer(cmd, s->gpu, d->gpu, uint32_t(std::min(d->desc.size, s->desc.size)));
+        crumb(this, device, cmd, kCrumbCopyBuffer, uint32_t(std::min(d->desc.size, s->desc.size)), 1, 0);
     }
 
     void Deko3DCommandList::copyTexture(const RenderTexture *dst, const RenderTexture *src) {
@@ -1009,6 +1342,7 @@ namespace plume {
                 flushBarriers();
                 GetDeko3DStats().copyImage.store(GetDeko3DStats().copyImage.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);  // banjo-nx (2026-10-19)
                 dkCmdBufCopyImage(cmd, &sv, &r, &dv, &r, 0);
+                crumb(this, device, cmd, kCrumbCopyImage, r.width, r.height, 1);
             }
         }
         invalidateZcullAfterCopy(dt);
@@ -1024,6 +1358,7 @@ namespace plume {
         flushBarriers();
         GetDeko3DStats().copyResolve.store(GetDeko3DStats().copyResolve.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);  // banjo-nx (2026-10-19)
         dkCmdBufResolveImage(cmd, &sv, &dv);
+        crumb(this, device, cmd, kCrumbResolve, 0, 0, 0);
         invalidateZcullAfterCopy(dt);
     }
 
@@ -1048,6 +1383,7 @@ namespace plume {
         flushBarriers();
         GetDeko3DStats().copyBlit.store(GetDeko3DStats().copyBlit.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);  // banjo-nx (2026-10-19)
         dkCmdBufBlitImage(cmd, &sv, &srect, &dv, &drect, DkBlitFlag_FilterLinear, 0);
+        crumb(this, device, cmd, kCrumbBlit, drect.width, drect.height, 0);
         invalidateZcullAfterCopy(dt);
     }
 
@@ -1149,11 +1485,15 @@ namespace plume {
         if (offset < cl->texReadEnd && (cl->graphicsUboValid & (1u << SharedUboSlot)) &&
             cl->graphicsUbo[SharedUboSlot].addr == address)
             cl->texturesDirty = true;
+        // ME2 backport from the Dunwall port (2026-11-09): the UBO size rounded up to DK_UNIFORM_BUF_ALIGNMENT. The
+        // release deko3d rounds it the same way (the same command words); the debug library stops at the first
+        // unaligned size ("misaligned size: uboSize").
+        const uint32_t selectSize = alignUp(uboSize, DK_UNIFORM_BUF_ALIGNMENT);
         constexpr uint32_t kPiece = 1024;
         const uint8_t *bytes = static_cast<const uint8_t *>(data);
         for (uint32_t done = 0; done < size;) {
             const uint32_t n = std::min(kPiece, size - done);
-            dkCmdBufPushConstants(cl->cmd, address, uboSize, offset + done, alignUp(n, 4), bytes + done);
+            dkCmdBufPushConstants(cl->cmd, address, selectSize, offset + done, alignUp(n, 4), bytes + done);
             done += n;
         }
         return true;
@@ -1169,6 +1509,13 @@ namespace plume {
         cl->sharedWordsSize = size;
         if (!cpu)
             cl->sharedCpu = nullptr;  // looked up again where the bound buffer is
+        return true;
+    }
+
+    bool Deko3DInvalidateZcull(RenderCommandList *commandList) {
+        if (!commandList)
+            return false;
+        static_cast<Deko3DCommandList *>(commandList)->invalidateZcull();
         return true;
     }
 
@@ -1253,14 +1600,20 @@ namespace plume {
         // operations in deko3d).
         for (uint32_t i = 0; i < count; i++) {
             const Deko3DCommandList *cl = static_cast<const Deko3DCommandList *>(commandLists[i]);
-            if (cl && cl->list)
+            if (cl && cl->list) {
                 dkQueueSubmitCommands(device->queue, cl->list);
+                if (cl->crumbLast) {
+                    queueOp(kOpSubmit, cl->crumbFirst, cl->crumbLast, int32_t(cl->crumbLast - cl->crumbFirst + 1));
+                    g_lastSubmittedCrumb = cl->crumbLast;
+                }
+            }
         }
         if (signalFence) {
             Deko3DCommandFence *f = static_cast<Deko3DCommandFence *>(signalFence);
             // flush: the GPU's caches are written out before the fence signals, so the CPU reads what the GPU wrote
             // (readbacks, timestamps) once it has waited for it.
             dkQueueSignalFence(device->queue, &f->fence, true);
+            queueOp(kOpSignal, 0, g_lastSubmittedCrumb, -1);
             f->pending = true;
         }
         device->noteSubmission();
@@ -1406,7 +1759,10 @@ namespace plume {
         if (!swapchain)
             return false;
         // A queue operation: the queue waits for the image before the commands submitted after this.
+        const uint64_t t0 = armGetSystemTick();
         const int slot = dkQueueAcquireImage(device->queue, swapchain);
+        queueOp(slot < 0 ? kOpAcquireFailed : kOpAcquire, 0, g_lastSubmittedCrumb, slot,
+                uint32_t(armTicksToNs(armGetSystemTick() - t0) / 1000));
         if (slot < 0)
             return false;
         *textureIndex = uint32_t(slot);
@@ -1417,6 +1773,7 @@ namespace plume {
         if (!swapchain)
             return false;
         dkQueuePresentImage(device->queue, swapchain, int(textureIndex));
+        queueOp(kOpPresent, 0, g_lastSubmittedCrumb, int32_t(textureIndex));
         return true;
     }
 

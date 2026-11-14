@@ -6,9 +6,17 @@
  */
 #pragma once
 
+#include <cstdint>
+
 namespace rex::input {
 
 using ReadHook = void (*)();
 void SetReadHook(ReadHook hook);
+
+// Dunwall (2026-11-09, input_hold_until_dlc_ready): the content code reports the game's DLC scan (the items of a
+// XamContentCreateEnumerator of downloadable content) and each DLC package it opens (XamContentCreate); the input
+// system holds the buttons back until the game has opened everything its scan found.
+void NoteGameDlcEnumerated(uint32_t count);
+void NoteGameDlcOpened();
 
 }  // namespace rex::input

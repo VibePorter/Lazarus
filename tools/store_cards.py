@@ -43,6 +43,15 @@ DCBZ = re.compile(r'(?<![\w,] )\bmemset\(\(void\*\)REX_RAW_ADDR\(ea\), 0, (?:32|
 CAS = 'REX_GUEST_CAS(reinterpret_cast<'
 # mk9-nx (2026-10-25): MK9's codegen writes stwcx. / stdcx. as a plain compare-and-swap on the raw address.
 SYNC_CAS = 'cr0.eq = __sync_bool_compare_and_swap(reinterpret_cast<'
+# Dunwall (2026-11-08): the classic codegen keeps cr0 in ctx (`ctx.cr0.eq = ...`); the card goes before the whole
+# assignment. Inserting it before `cr0.eq` alone split `ctx.cr0.eq` into `ctx.REX_CARD(ea), cr0.eq` (a compile error).
+SYNC_CAS_RE = re.compile(r'(?<!REX_CARD\(ea\), )((?:ctx\.)?cr0\.eq = __sync_bool_compare_and_swap\(reinterpret_cast<)')
+# Dunwall (2026-11-12): a store already carded, also when tools/watch_marks.py put its mark between the card and the
+# store ("REX_CARD(ea), RexWatchN((u32)(ea), 16), simde_mm_store_si128(..."). The checks wanted the card right before
+# the store, so every re-run of the post-codegen passes added one more card to those lines (47 seen on one line).
+_WATCH = r'(?:RexWatch\w*\([^;]*?\), )*'
+CARDED_VEC = re.compile(r'REX_CARD\(ea\), ' + _WATCH + re.escape(VEC))
+CARDED_DCBZ = re.compile(r'REX_CARD\(ea\), ' + _WATCH + r'memset\(')
 EA_SET = re.compile(r'^\s*ea = (.*);\s*$')
 INSN = re.compile(r'^\s*// ')
 
@@ -153,14 +162,14 @@ def apply_line(lines, k, counts):
         counts[key] += 1
     out.append(line[pos:])
     line = ''.join(out)
-    if VEC in line and 'REX_CARD(ea), ' + VEC not in line:
+    if VEC in line and not CARDED_VEC.search(line):
         if stack_ea(lines, k):
             counts['stack'] += 1
         else:
             line = line.replace(VEC, 'REX_CARD(ea), ' + VEC)
             counts['vector'] += 1
     m = DCBZ.search(line)
-    if m and 'REX_CARD(ea), memset' not in line:
+    if m and not CARDED_DCBZ.search(line):
         if stack_ea(lines, k):
             counts['stack'] += 1
         else:
@@ -172,11 +181,11 @@ def apply_line(lines, k, counts):
         else:
             line = line.replace(CAS, 'REX_GUEST_CAS_C(ea, reinterpret_cast<')
             counts['cas'] += 1
-    if SYNC_CAS in line and 'REX_RAW_ADDR(ea)' in line and 'REX_CARD(ea), ' + SYNC_CAS not in line:
+    if SYNC_CAS in line and 'REX_RAW_ADDR(ea)' in line and 'REX_CARD(ea), ' not in line:
         if stack_ea(lines, k):
             counts['stack'] += 1
         else:
-            line = line.replace(SYNC_CAS, 'REX_CARD(ea), ' + SYNC_CAS)
+            line = SYNC_CAS_RE.sub(r'REX_CARD(ea), \1', line, count=1)
             counts['cas'] += 1
     return line
 
@@ -184,7 +193,9 @@ def apply_line(lines, k, counts):
 UNDO = [
     (re.compile(r'\b(REX_STORE_D_U(?:8|16|32|64)|REX_STORE_U(?:8|16|32|64)|REX_STVLX|REX_STVRX|'
                 r'REX_MM_STORE_U(?:8|16|32|64)|BANJO_HOT_STORE_(?:D_)?U(?:8|16|32|64))_C\('), r'\1('),
-    (re.compile(r'REX_CARD\(ea\), (?=simde_mm_store_si128|memset\(|cr0\.eq = __sync_bool_compare_and_swap)'), ''),
+    (re.compile(r'REX_CARD\(ea\), (?=simde_mm_store_si128|memset\(|(?:ctx\.)?cr0\.eq = __sync_bool_compare_and_swap)'), ''),
+    # Dunwall (2026-11-08): the split form an earlier version wrote into classic code.
+    (re.compile(r'ctx\.REX_CARD\(ea\), (?=cr0\.eq = __sync_bool_compare_and_swap)'), 'ctx.'),
     (re.compile(r'REX_GUEST_CAS_C\(ea, '), 'REX_GUEST_CAS('),
 ]
 

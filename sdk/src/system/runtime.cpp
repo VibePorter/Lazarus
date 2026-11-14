@@ -11,6 +11,7 @@
 
 #include <algorithm>
 
+#include <rex/sys_counters.h>
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/platform.h>
@@ -51,6 +52,20 @@ REXCVAR_DEFINE_STRING(update_game_dir, "", "Runtime",
                       "Folder of the game data mounted as update: when update_data_root is empty (e.g. \"update\"); "
                       "empty = none");
 REXCVAR_DEFINE_STRING(cache_root, "", "Runtime", "Override shader cache path");
+#if !defined(__SWITCH__)
+REXCVAR_DEFINE_BOOL(trace_xam_calls, false, "Runtime",
+                    "PC: log the game's XAM / online calls (Xam*, XNet*, XMsg*, XContent*, XUser*) with time and "
+                    "thread, the first 40 of each, then every 1000th (rex/sys_counters.h TraceExport)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+#endif
+REXCVAR_DEFINE_STRING(vfs_file_aliases, "", "Runtime",
+                      "Files opened under another name, \"from=to,...\" (names alone, from the same folder, for "
+                      "reading; e.g. a notice movie as a short black one); empty = none")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(vfs_cache_drive, false, "Runtime",
+                    "cache: (the 360's utility drive) as a writable folder <user_data_root>/utility_drive, emptied at "
+                    "start; off = no cache: device (games see no hard drive)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_STRING(metadata_root, "", "Runtime", "Override metadata path");
 // The asset cache (filesystem/devices/pack_device.h, ported from Fruit Ninja NX): the game data folder as one pack
 // file, <game_data_root>.nxpack + .nxidx next to it. On the Switch every file open on the SD card is costly and the
@@ -442,9 +457,47 @@ bool Runtime::SetupVfs() {
     REXSYS_DEBUG("  Registered NullDevice for \\Device\\Harddisk0\\{{Partition0,Cache0,Cache1}}");
   }
 
+#if !defined(__SWITCH__)
+  rex::syscount::g_trace_exports.store(REXCVAR_GET(trace_xam_calls), std::memory_order_relaxed);
+#endif
+  // vfs_file_aliases: "from=to,..." (VirtualFileSystem::AddFileAlias).
+  {
+    const std::string list = REXCVAR_GET(vfs_file_aliases);
+    size_t at = 0;
+    while (at < list.size()) {
+      size_t end = list.find(',', at);
+      if (end == std::string::npos) end = list.size();
+      const std::string item = list.substr(at, end - at);
+      const size_t eq = item.find('=');
+      if (eq != std::string::npos && eq > 0 && eq + 1 < item.size())
+        file_system_->AddFileAlias(item.substr(0, eq), item.substr(eq + 1));
+      at = end + 1;
+    }
+  }
+
   // NOTE: Do NOT register a device for cache: paths
   // Games handle "device not found" gracefully but don't handle actual device
   // errors (like NAME_COLLISION) well. Let cache: fail cleanly.
+  // Dunwall (2026-11-09, vfs_cache_drive): a game that tests the utility drive (cache:\$cache$\dummy.txt) takes
+  // "not found" as "no hard drive": Dunwall then plays its NOHD notices and refreshes its content (DLC, saves) only
+  // seconds after the main menu is up, so a Continue before that says "Required content unavailable". With the option
+  // on, cache: is a writable host folder (as Xenia's), emptied at every start like a utility drive formatted at boot
+  // (no stale files, no name collisions with the last run's).
+  if (REXCVAR_GET(vfs_cache_drive) && !user_data_root_.empty()) {
+    const auto cache_dir = std::filesystem::absolute(user_data_root_) / "utility_drive";
+    std::error_code ec;
+    std::filesystem::remove_all(cache_dir, ec);
+    // $cache$: the folder a formatted utility drive has, where XMountUtilityDrive's check writes dummy.txt (without
+    // it: 0xC000000F, the same "no hard drive").
+    std::filesystem::create_directories(cache_dir / "$cache$", ec);
+    auto cache_device = std::make_unique<rex::filesystem::HostPathDevice>("\\CACHE", cache_dir, false);
+    if (!ec && cache_device->Initialize() && file_system_->RegisterDevice(std::move(cache_device))) {
+      file_system_->RegisterSymbolicLink("cache:", "\\CACHE");
+      REXSYS_INFO("[vfs] cache: (the utility drive) = {} (emptied at start, vfs_cache_drive)", cache_dir.string());
+    } else {
+      REXSYS_ERROR("Runtime::SetupVfs: the utility drive {} could not be made: no cache:", cache_dir.string());
+    }
+  }
 
   return true;
 }

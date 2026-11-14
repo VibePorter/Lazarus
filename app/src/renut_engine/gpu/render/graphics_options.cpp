@@ -13,6 +13,17 @@
 #include "renut_engine/gpu/guest/widescreen.h"
 #include "renut_engine/gpu/render/format.h"
 
+REXCVAR_DEFINE_INT32(renut_unscaled_max_size, 0, "Nuts&Bolts/Graphics",
+                     "Render targets at most this many pixels wide and high stay at 1x when the scene renders below "
+                     "720p (lookup tables such as a colour-grading LUT); 0 = every target follows the resolution")
+    .range(0, 256)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// Dunwall (2026-11-09, console: a walking guard's shadow disappears and comes back, with occlusion culling off too):
+// UE3's character shadows render into an 800x800 depth target, which followed the 360p scene to 400x400. On: square
+// depth targets of 256 px or more (the shadow maps; the scene's depth is 1280x720 / 640x360) stay at 1x.
+REXCVAR_DEFINE_BOOL(renut_shadow_unscaled, false, "Nuts&Bolts/Graphics",
+                    "Square depth targets of 256 px or more (shadow maps) stay at 1x when the scene renders lower")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_STRING(renut_shadow_resolution, "Resolution", "Nuts&Bolts/Graphics",
                       "Shadow map resolution, as a multiple of the console's: Resolution follows "
                       "renut_resolution; 1x is the console's; 2x, 3x and 4x are sharper.")
@@ -121,7 +132,18 @@ RenderScale SurfaceRenderScale(const d3d::SurfaceDesc &desc, RenderScale resolut
   // MGR: no evidence identifies N&B's SSAO EDRAM base 1864, its shadow-map
   // dimensions or its post-process targets in this game. Preserve the guest
   // targets' relative sizes instead of applying another game's heuristics.
-  (void)desc;
+  // ME2 (2026-11-14, from the Dunwall port, 2026-11-09, renut_unscaled_max_size): a target this small in both directions stays at 1x. UE3 renders
+  // its colour-grading LUT into a 32x16 target and resolves it into the volume texture the final pass looks colours up
+  // in; at 360p (0.5x) it came out 16x8 and the lookups read the wrong cells: the 3D picture tinted yellow / green on
+  // the Switch (the PC renders at 1x). Scaling such targets saves nothing.
+  static const bool shadow_unscaled = REXCVAR_GET(renut_shadow_unscaled);
+  if (shadow_unscaled && d3d::IsDepthFormat(desc.Format) && d3d::SurfaceWidth(u32(desc.Size)) >= 256 &&
+      d3d::SurfaceWidth(u32(desc.Size)) == d3d::SurfaceHeight(u32(desc.Size)))
+    return RenderScale{};
+  static const int32_t unscaled = REXCVAR_GET(renut_unscaled_max_size);
+  if (unscaled > 0 && d3d::SurfaceWidth(u32(desc.Size)) <= u32(unscaled) &&
+      d3d::SurfaceHeight(u32(desc.Size)) <= u32(unscaled))
+    return RenderScale{};
   return resolution;
 }
 

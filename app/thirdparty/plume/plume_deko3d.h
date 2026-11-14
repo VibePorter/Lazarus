@@ -24,6 +24,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -70,6 +71,12 @@ namespace plume {
     extern std::atomic<uint64_t> g_deko3dBudgetArenaFloor;
     // ME2 (2026-11-06, me2_deko3d_arena_max_mb): the block arena's largest size (set before the device is created).
     extern std::atomic<uint64_t> g_deko3dArenaMax;
+    extern std::atomic<bool> g_deko3dFlushStorage;  // Dunwall (2026-11-12): makeBlock cleans given storage
+    // Dunwall (2026-11-13, dh_deko3d_arena_quarantine_ms): a destroyed block's arena range goes back into the free
+    // list only this long after the destroy (0 = at once, as before). The GPU timeout at the DLC save's level load
+    // happened with the arena (whose best fit hands a just-freed range straight to the next block of the same size)
+    // and not without it.
+    extern std::atomic<uint32_t> g_deko3dArenaQuarantineMs;
 
     // Where the back end's messages go (stderr until set: the application's log, so they reach it on the console and in
     // an emulator alike).
@@ -334,6 +341,7 @@ namespace plume {
     struct Deko3DSwapChain;
 
     struct Deko3DCommandList : RenderCommandList {
+        uint32_t crumbFirst = 0, crumbLast = 0;  // Dunwall (2026-11-13): the breadcrumbs this list recorded
         Deko3DCommandQueue *queue = nullptr;
         Deko3DDevice *device = nullptr;
         DkCmdBuf cmd = nullptr;
@@ -376,6 +384,7 @@ namespace plume {
         int restartIndexFormat = -1;  // mgr-nx-deko: the index format primitive restart was last set for
         uint32_t indexSize = 2;
         DkGpuAddr indexAddress = 0;
+        DkBufExtents crumbVtx[16]{};  // Dunwall (2026-11-13): the vertex buffers bound, for the breadcrumbs
         bool descriptorsInvalidated = false;
         uint64_t descriptorEpoch = 0;
         // ME2 (2026-11-02, from naruto-nx's plume patch): the per-draw binding scans skipped while nothing they read
@@ -475,6 +484,10 @@ namespace plume {
                 emitBarrier(pendingBarrierMode, pendingBarrierInvalidate);
         }
         void invalidateZcullAfterCopy(const Deko3DTexture *dst);
+        // me2-nx-deko (2026-11-07): the Zcull data dropped (dkCmdBufBarrier DkInvalidateFlags_Zcull, no wait for idle).
+        // deko3d itself drops it only when a depth target of another GPU address is bound (MME ConditionalZcullInvalidate):
+        // a depth image of another size at a reused address keeps culling with the old data.
+        void invalidateZcull();
         uint64_t currentEpoch() const;
         void bindGraphicsBuffers();
         void bindGraphicsBuffersSlow();
@@ -534,6 +547,9 @@ namespace plume {
             DkMemBlock block = nullptr;
             uint32_t size = 0;
             std::vector<std::pair<uint32_t, uint32_t>> freeList; // offset, size, sorted by offset
+            // Dunwall (2026-11-13, the rainbow textures): render targets (hardware-compressed images) and sampled
+            // textures never share a chunk, so memory a compressed target used is never handed to a texture.
+            bool render = false;
         };
         std::mutex heapMutex;
         std::vector<Chunk> chunks;
@@ -665,6 +681,10 @@ namespace plume {
             std::map<uint64_t, uint64_t> free;                       // offset -> size
             std::unordered_map<DkMemBlock, std::pair<uint64_t, uint64_t>> blocks;  // block -> offset, size
             std::unordered_map<DkMemBlock, void *> heapBlocks;  // caller-owned storage outside the arena
+            // Dunwall (2026-11-13, g_deko3dArenaQuarantineMs): destroyed blocks' ranges (offset, size, tick of the
+            // destroy), still counted as used until they go back into `free` (arenaTake).
+            std::vector<std::tuple<uint64_t, uint64_t, uint64_t>> quarantine;
+            uint64_t quarantineBytes = 0, quarantined = 0;
         } arena;
         void *arenaTake(uint32_t size);
         void arenaGive(DkMemBlock block, void *storage, uint32_t size);
@@ -673,8 +693,12 @@ namespace plume {
         // `free` after it (the storage is unmapped by then).
         bool arenaDetach(DkMemBlock block, uint64_t &start, uint64_t &length);
         void arenaFreeRange(uint64_t start, uint64_t length);
+        void arenaReleaseQuarantineLocked(bool all);
         void arenaFreeRangeLocked(uint64_t start, uint64_t length);
-        bool imageAlloc(uint32_t size, uint32_t alignment, Deko3DImageAlloc &out);
+        bool imageAlloc(uint32_t size, uint32_t alignment, Deko3DImageAlloc &out, bool render = false);
+        // Dunwall (2026-11-13, breadcrumbs): an image address inside the image heap: allocated, FREE, or retired
+        // (free once the GPU passes its submission). Logged with the label.
+        void describeImageHeapAddress(const char *label, uint64_t address);
         void retire(const Deko3DImageAlloc &image, DkMemBlock block);
         void collectRetired();
         void noteSubmission(); // after a submission: a fence for its serial
@@ -713,6 +737,8 @@ namespace plume {
     bool Deko3DPushUniform(RenderCommandList *commandList, uint64_t address, uint32_t uboSize, uint32_t offset,
                            const void *data, uint32_t size);
     bool Deko3DSetSharedWords(RenderCommandList *commandList, const void *cpu, uint32_t size);
+    // me2-nx-deko (2026-11-07): drops the queue's Zcull data at this point of the list (Deko3DCommandList::invalidateZcull).
+    bool Deko3DInvalidateZcull(RenderCommandList *commandList);
     // banjo-nx: the queue lost (dkQueueIsInErrorState).
     bool Deko3DDeviceLost(RenderDevice *device);
     // sa2-nx (2026-10-20, 1.0.3.1): the size the swapchain should have, the console display's (1920x1080 docked,
@@ -761,6 +787,24 @@ namespace plume {
         bool leanBarriers = false;
     };
     void Deko3DSetOptions(const Deko3DOptions &options);
+    // Dunwall (2026-11-12, the GPU timeout 0xD5C at a level load): GPU breadcrumbs. With them on, every piece of GPU
+    // work a command list records (draws, dispatches, clears, copies, resolves, blits) gets a sequence number and a
+    // description in a ring, and the GPU writes the number into uncached memory once the work before it has finished.
+    // A failed channel kickoff then logs the last finished piece and the ones after it (the one the GPU stopped in).
+    void Deko3DSetBreadcrumbs(bool on);
+    // Dunwall (2026-11-13): exact breadcrumbs: a full GPU barrier before each number, so only one piece of work is
+    // ever in flight and "STOPPED IN" is the piece that hung (not just the oldest of several running at once). Slow.
+    void Deko3DSetBreadcrumbsExact(bool on);
+    // The next draw's description (the renderer's shader hashes); cleared by the draw that takes it.
+    void Deko3DBreadcrumbTag(uint64_t vs, uint64_t ps);
+    // Dunwall (2026-11-13): the breadcrumb numbers (recorded so far / last one the GPU finished; 0 without them),
+    // stamped on the block events below.
+    uint32_t Deko3DCrumbRecorded();
+    uint32_t Deko3DCrumbDone();
+    // Dunwall (2026-11-13): the last memory block creations and destructions (GPU range, what, serials, breadcrumb
+    // numbers), logged at a failed kickoff; and what a GPU address belongs to (a live block or a destroyed one).
+    void Deko3DDumpBlockEvents();
+    void Deko3DDescribeGpuAddress(const char *label, uint64_t address);
     // banjo-nx (2026-10-19, render-thread proposal 13): read inline (barriers() reads it per call).
     extern Deko3DOptions g_deko3dOptions;
     inline const Deko3DOptions &Deko3DGetOptions() { return g_deko3dOptions; }

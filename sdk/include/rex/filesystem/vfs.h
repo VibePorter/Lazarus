@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -25,6 +26,11 @@
 REXCVAR_DECLARE(bool, allow_game_relative_writes);
 
 namespace rex::filesystem {
+
+// Dunwall (2026-11-09): when set, called with the name (no folder) of every file the guest opens that exists
+// (input_hold_trigger_file, rex/input/read_hook.h). None by default.
+using OpenObserver = void (*)(std::string_view file_name);
+void SetOpenObserver(OpenObserver observer);
 
 class VirtualFileSystem {
  public:
@@ -48,9 +54,25 @@ class VirtualFileSystem {
                     bool is_directory, bool is_non_directory, File** out_file,
                     FileAction* out_action);
 
+  // Dunwall (2026-11-09): opening "<name>.<from>" for reading when it does not exist opens "<name>.<to>" from
+  // the same folder instead (extensions without the dot, compared without case). Set once, before the game opens
+  // such files (the game's localized voice banks exist as .RUS only, see app/dunwall_src/dh_language.cpp).
+  void SetExtensionFallback(const std::string& from, const std::string& to);
+
+  // Dunwall (2026-11-09): opening a file named 'from' (the name alone, any folder, compared without case) for
+  // reading opens 'to' from the same folder instead, when that exists. Set before the game opens such files.
+  void AddFileAlias(const std::string& from, const std::string& to);
+
  private:
+  std::string FallbackName(const std::string_view file_name) const;
+  std::string AliasName(const std::string_view file_name) const;
+  std::vector<std::pair<std::string, std::string>> aliases_;  // lower-case 'from', 'to'
+  std::atomic<bool> aliases_set_{false};
+
   rex::thread::global_critical_region global_critical_region_;
   std::vector<std::unique_ptr<Device>> devices_;
+  std::string fallback_from_, fallback_to_;
+  std::atomic<bool> fallback_set_{false};
   std::unordered_map<std::string, std::string> symlinks_;
 
   bool ResolveSymbolicLink(const std::string_view path, std::string& result);

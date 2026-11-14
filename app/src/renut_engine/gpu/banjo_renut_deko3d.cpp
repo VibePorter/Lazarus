@@ -3,10 +3,13 @@
 
 #include <atomic>
 #include <algorithm>
+#include <cerrno>
 #include <cinttypes>
+#include <climits>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <chrono>
 #include <unordered_map>
 #include <vector>
 
@@ -28,6 +31,26 @@
 // one, hence weak.
 extern const uint8_t g_deko3dGlslPackage[] __attribute__((weak));
 extern const size_t g_deko3dGlslPackageSize __attribute__((weak));
+
+// ME2 (2026-11-14, from the Dunwall port 2026-11-12, the GPU timeout 0xD5C at a level load): every piece of GPU work numbered, the GPU writing the
+// number when done; a failed channel kickoff logs the work the GPU stopped in ("breadcrumbs:" in deko3d.log). Costs a
+// GPU report per piece of work: diagnostic runs only.
+REXCVAR_DEFINE_BOOL(me2_gpu_breadcrumbs, false, "ME2",
+                    "Diagnostic: GPU breadcrumbs (deko3d), dumped to deko3d.log when the GPU channel dies")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// Dunwall (2026-11-13): exact breadcrumbs (plume_deko3d.h Deko3DSetBreadcrumbsExact): a full GPU barrier before each
+// number, so the dump names the work that hung, not just the oldest unfinished one. Slow: diagnostic runs only.
+REXCVAR_DEFINE_BOOL(me2_gpu_breadcrumbs_exact, false, "ME2",
+                    "Diagnostic: with me2_gpu_breadcrumbs, the GPU finishes each piece of work before the next starts "
+                    "(the dump then names the piece that hung). Slow")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// Dunwall (2026-11-13): the level-load GPU timeout happened with the block arena and not without it; the arena's best
+// fit gives a just-destroyed block's range straight to the next block of the same size (the upload ring's 32 MB chunks).
+REXCVAR_DEFINE_INT32(me2_deko3d_arena_quarantine_ms, 0, "ME2",
+                     "deko3d: a destroyed memory block's arena range is given to a new block only this many ms after "
+                     "the destroy (0 = at once, as before)")
+    .range(0, 60000)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace banjo::renut_gpu::deko3d {
 
@@ -163,6 +186,34 @@ struct DkshCache {
   std::string path;
 };
 DkshCache g_cache;
+// Dunwall (2026-11-12, the stalls after Press Start): what the cache's reads cost (DkshReadReport).
+std::atomic<uint64_t> g_dksh_reads{0}, g_dksh_read_ns{0}, g_dksh_lock_ns{0}, g_dksh_max_ns{0}, g_dksh_block_hits{0};
+// me2-nx-deko (2026-11-12): a second handle of the cache file could not be opened (the console's file system, the file
+// open for writing): reads go through DkshCache::file under its mutex.
+std::atomic<bool> g_dksh_shared_handle{false};
+
+// Dunwall (2026-11-12): the startup preparation (PrewarmGameShaders) loaded the default variant of all ~45,000 game
+// shaders in hash order, each with its own fseek + fread of the cache under the cache's lock: 234 s of random SD reads
+// (2-8 ms each, beside the game's streaming) from the start through Press Start and the first level, and the render
+// thread and the pipeline workers waited for the lock (5 s in the 10 s after Press Start). It now goes through the
+// shaders in the order of their records in the file and reads the file ahead in blocks of kPrefetchBytes on a handle of
+// its own; the lookup answers from that thread's block when it holds the record.
+constexpr size_t kPrefetchBytes = 4u << 20;
+struct PrefetchBlock {
+  long begin = 0;
+  std::vector<uint8_t> data;
+};
+thread_local PrefetchBlock t_prefetch;
+
+uint64_t Fnv1a64(const void *data, size_t size) {  // plume_deko3d.cpp's fnv1a64: a variant's key
+  const uint8_t *p = static_cast<const uint8_t *>(data);
+  uint64_t h = 0xcbf29ce484222325ull;
+  for (size_t i = 0; i < size; i++) {
+    h ^= p[i];
+    h *= 0x100000001b3ull;
+  }
+  return h;
+}
 
 // me2-nx-deko (2026-10-28): the DKSH cache's record index beside it (<cache>.idx): "BDKI", version 1, the cache's
 // length it describes, the record count, then per record (u64 key, u32 offset of the DKSH, u32 size). Used only when
@@ -427,23 +478,89 @@ void InstallShaderCache() {
   options.compileCore = Deko3DCompileCore();
   options.compilePriority = Deko3DCompilePriority();
   plume::Deko3DSetOptions(options);
+  // ME2 (2026-11-14, from the Dunwall port): GPU breadcrumbs (plume_deko3d.h Deko3DSetBreadcrumbs), dumped at a
+  // failed kickoff, and the block arena's quarantine of destroyed ranges.
+  plume::Deko3DSetBreadcrumbs(REXCVAR_GET(me2_gpu_breadcrumbs));
+  plume::Deko3DSetBreadcrumbsExact(REXCVAR_GET(me2_gpu_breadcrumbs_exact));
+  plume::g_deko3dArenaQuarantineMs.store(uint32_t(REXCVAR_GET(me2_deko3d_arena_quarantine_ms)), std::memory_order_relaxed);
   LoadCache();
   plume::SetDeko3DShaderCache(
       [](uint64_t key, std::vector<uint8_t> &dksh) {
         DkshCache &c = g_cache;
-        std::lock_guard<std::mutex> lock(c.mutex);
+        const auto t_lock = std::chrono::steady_clock::now();
+        std::unique_lock<std::mutex> lock(c.mutex);
+        const auto t_read = std::chrono::steady_clock::now();
         auto it = c.index.find(key);
         if (it == c.index.end() || !c.file) {
           c.misses++;
           return false;
         }
-        dksh.resize(it->second.second);
+        // Dunwall (2026-11-12): from this thread's read-ahead block (the startup preparation's), when it has it.
+        {
+          const PrefetchBlock &b = t_prefetch;
+          const long at = it->second.first;
+          const uint32_t size = it->second.second;
+          if (!b.data.empty() && at >= b.begin && at + long(size) <= b.begin + long(b.data.size())) {
+            const uint8_t *src = b.data.data() + (at - b.begin);
+            uint32_t magic = 0;
+            std::memcpy(&magic, src, sizeof(magic));
+            if (magic == kDkshMagic) {
+              c.hits++;
+              lock.unlock();
+              g_dksh_block_hits.fetch_add(1, std::memory_order_relaxed);
+              dksh.assign(src, src + size);
+              return true;
+            }
+          }
+        }
+        // Dunwall (2026-11-12): read through this thread's own handle of the file, without the lock (held for the
+        // whole SD read before, so the startup preparation, the pipeline workers and the render thread queued behind
+        // each other's reads: seconds of waiting in the 10 s after Press Start). A record is in the index only once
+        // it is whole in the file (the store writes, flushes and syncs before it adds it).
+        const long record_at = it->second.first;
+        const uint32_t record_size = it->second.second;
+        // me2-nx-deko (2026-11-12, black screen after a save load): on the console the file cannot be opened a second
+        // time while c.file has it open for writing ("r+b"), so every thread's fopen failed, every lookup was a miss
+        // and every cached shader was compiled again by uam (~0.5 s a pipeline on the render thread, the startup
+        // preparation never finished). Without an own handle the read goes through c.file under the lock (as before).
+        thread_local FILE *t_file = nullptr;
+        if (!t_file && !g_dksh_shared_handle.load(std::memory_order_relaxed)) {
+          t_file = std::fopen(c.path.c_str(), "rb");
+          if (!t_file && !g_dksh_shared_handle.exchange(true))
+            REXLOG_WARN("[deko3d] DKSH cache {}: a second handle could not be opened (errno {}); reads go through the "
+                        "cache's own handle under its lock",
+                        c.path, errno);
+        }
+        if (t_file)
+          lock.unlock();
+        dksh.resize(record_size);
         uint32_t magic = 0;
-        if (std::fseek(c.file, it->second.first, SEEK_SET) != 0 ||
-            std::fread(dksh.data(), 1, dksh.size(), c.file) != dksh.size() ||
-            (std::memcpy(&magic, dksh.data(), sizeof(magic)), magic != kDkshMagic)) {
+        FILE *const from = t_file ? t_file : c.file;
+        const bool ok = from && std::fseek(from, record_at, SEEK_SET) == 0 &&
+                        std::fread(dksh.data(), 1, dksh.size(), from) == dksh.size() &&
+                        (std::memcpy(&magic, dksh.data(), sizeof(magic)), magic == kDkshMagic);
+        // Dunwall (2026-11-12): counted (DkshReadReport).
+        const auto t_end = std::chrono::steady_clock::now();
+        const uint64_t read_ns =
+            uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t_end - t_read).count());
+        g_dksh_reads.fetch_add(1, std::memory_order_relaxed);
+        g_dksh_read_ns.fetch_add(read_ns, std::memory_order_relaxed);
+        g_dksh_lock_ns.fetch_add(
+            uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t_read - t_lock).count()),
+            std::memory_order_relaxed);
+        if (read_ns > g_dksh_max_ns.load(std::memory_order_relaxed))
+          g_dksh_max_ns.store(read_ns, std::memory_order_relaxed);
+        if (!lock.owns_lock())
+          lock.lock();
+        if (!ok) {
+          static std::atomic<uint32_t> failed_logged{0};
+          if (failed_logged.fetch_add(1, std::memory_order_relaxed) < 8)
+            REXLOG_WARN("[deko3d] DKSH cache {}: the record of {:016X} ({} bytes at {}) could not be read; compiled "
+                        "again",
+                        c.path, key, record_size, record_at);
           c.misses++;
-          c.index.erase(it);
+          if (auto again = c.index.find(key); again != c.index.end() && again->second.first == record_at)
+            c.index.erase(again);
           return false;
         }
         c.hits++;
@@ -486,6 +603,16 @@ std::atomic<bool> g_prewarm_cancel{false};
 
 void CancelPrewarm() { g_prewarm_cancel.store(true, std::memory_order_release); }
 
+std::string DkshReadReport() {
+  const auto take = [](std::atomic<uint64_t> &a) { return a.exchange(0, std::memory_order_relaxed); };
+  const uint64_t reads = take(g_dksh_reads), read_ns = take(g_dksh_read_ns), lock_ns = take(g_dksh_lock_ns),
+                 max_ns = take(g_dksh_max_ns);
+  const uint64_t block_hits = take(g_dksh_block_hits);
+  return fmt::format("DKSH cache: {} reads from the card ({:.1f} ms, slowest {:.1f} ms), {:.1f} ms waiting for its "
+                     "lock, {} from the startup preparation's read-ahead",
+                     reads, double(read_ns) / 1e6, double(max_ns) / 1e6, double(lock_ns) / 1e6, block_hits);
+}
+
 bool PrewarmGameShaders(plume::RenderDevice *device, const std::function<void(const PrewarmProgress &)> &progress) {
   if (!device || !renut::gpu::IsDeko3D())
     return false;
@@ -503,10 +630,103 @@ bool PrewarmGameShaders(plume::RenderDevice *device, const std::function<void(co
   PrewarmProgress state;
   state.total = uint32_t(hashes.size());
   progress(state);
+  // Dunwall (2026-11-12): the shaders in the order of their default variant's record in the cache (see
+  // kPrefetchBytes); those without one last.
+  const auto t_order = std::chrono::steady_clock::now();
+  // The keys first, without the cache's lock (a reader holds it for a whole SD read, and the pipeline workers read
+  // a lot at the start: one lookup under the lock per shader made this pass take minutes on the console), then every
+  // key's record under the lock at once.
+  std::vector<std::pair<uint64_t, uint64_t>> keys;  // (variant key or 0, shader hash)
+  keys.reserve(hashes.size());
+  {
+    std::vector<uint8_t> glsl;
+    for (const uint64_t hash : hashes) {
+      uint64_t key = 0;
+      const Found found = Find(all, hash);
+      if (found.entry) {
+        Package &p = *found.package;
+        const PackageEntry *e = found.entry;
+        glsl.resize(e->size);
+        size_t n;
+        {
+          std::lock_guard<std::mutex> lock(p.mutex);
+          n = p.dict ? ZSTD_decompress_usingDDict(p.dctx, glsl.data(), e->size, p.data + e->offset, e->compressedSize,
+                                                  p.dict)
+                     : ZSTD_decompressDCtx(p.dctx, glsl.data(), e->size, p.data + e->offset, e->compressedSize);
+        }
+        if (!ZSTD_isError(n) && n == e->size)
+          key = Fnv1a64(glsl.data(), glsl.size());
+      }
+      keys.emplace_back(key, hash);
+    }
+  }
+  std::vector<std::pair<long, uint64_t>> order;
+  order.reserve(keys.size());
+  size_t with_record = 0;
+  {
+    std::lock_guard<std::mutex> lock(g_cache.mutex);
+    for (const auto &[key, hash] : keys) {
+      long at = LONG_MAX;
+      if (key)
+        if (auto it = g_cache.index.find(key); it != g_cache.index.end())
+          at = it->second.first;
+      with_record += at != LONG_MAX;
+      order.emplace_back(at, hash);
+    }
+  }
+  std::sort(order.begin(), order.end());
+  const double order_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_order).count();
+  REXLOG_INFO("[deko3d] startup preparation: {} shaders ordered by their record in the cache in {:.0f} ms ({} have one)",
+              order.size(), order_ms, with_record);
+  FILE *ahead = g_dksh_shared_handle.load(std::memory_order_relaxed) ? nullptr : std::fopen(g_cache.path.c_str(), "rb");
+  // me2-nx-deko (2026-11-12): no second handle on the console (the file is open for writing): the blocks are read
+  // through the cache's own handle, under its lock in 512 KB pieces (a lookup waits for one piece at most).
+  if (!ahead && !g_dksh_shared_handle.exchange(true))
+    REXLOG_WARN("[deko3d] DKSH cache {}: a second handle could not be opened (errno {}); the read-ahead goes through "
+                "the cache's own handle",
+                g_cache.path, errno);
+  const auto read_block = [&](long at, uint8_t *dst, size_t len) -> bool {
+    if (ahead)
+      return std::fseek(ahead, at, SEEK_SET) == 0 && std::fread(dst, 1, len, ahead) == len;
+    for (size_t done = 0; done < len;) {
+      const size_t piece = std::min<size_t>(len - done, 512u << 10);
+      std::lock_guard<std::mutex> lock(g_cache.mutex);
+      if (!g_cache.file || std::fseek(g_cache.file, at + long(done), SEEK_SET) != 0 ||
+          std::fread(dst + done, 1, piece, g_cache.file) != piece)
+        return false;
+      done += piece;
+    }
+    return true;
+  };
+  long cache_end = 0;
+  {
+    std::lock_guard<std::mutex> lock(g_cache.mutex);
+    cache_end = g_cache.end;
+  }
+  uint64_t blocks = 0, block_bytes = 0;
+  double block_ms = 0.0;
+  const auto t_start = std::chrono::steady_clock::now();
   const plume::Deko3DStats &st = plume::GetDeko3DStats();
-  for (const uint64_t hash : hashes) {
+  for (const auto &[at, hash] : order) {
     if (g_prewarm_cancel.load(std::memory_order_acquire))
       break;
+    PrefetchBlock &b = t_prefetch;
+    if (at != LONG_MAX && at < cache_end &&
+        (b.data.empty() || at < b.begin || at + (64l << 10) > b.begin + long(b.data.size()))) {
+      // A record of up to 64 KB from 'at' fits the block; a larger one is read alone by the lookup.
+      const auto t0 = std::chrono::steady_clock::now();
+      const size_t len = size_t(std::min<long>(long(kPrefetchBytes), cache_end - at));
+      b.data.resize(len);
+      if (read_block(at, b.data.data(), len)) {
+        b.begin = at;
+        ++blocks;
+        block_bytes += len;
+      } else {
+        b.data.clear();
+      }
+      block_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    }
     const uint64_t compiles = st.shaderCompiles;
     if (auto shader = CreateGameShader(device, hash)) {
       if (!dev->loadVariant(static_cast<const plume::Deko3DShader *>(shader.get()), nullptr, 0))
@@ -518,6 +738,13 @@ bool PrewarmGameShaders(plume::RenderDevice *device, const std::function<void(co
     ++state.done;
     progress(state);
   }
+  t_prefetch = PrefetchBlock{};  // its memory back
+  if (ahead)
+    std::fclose(ahead);
+  REXLOG_INFO("[deko3d] startup preparation in file order: ordered in {:.0f} ms, then {:.1f} s with {} read-ahead "
+              "blocks ({:.1f} MB read in {:.0f} ms)",
+              order_ms, std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count(), blocks,
+              block_bytes / 1e6, block_ms);
   SaveShaderCache();
   REXLOG_INFO("[deko3d] startup preparation: {} shaders, {} compiled now (not in the DKSH cache), {} failed",
               state.total, state.compiled, state.failed);

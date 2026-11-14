@@ -33,7 +33,9 @@
 #define REX_EXPORT_CENSUS(name)                                                                     \
   do {                                                                                              \
     static std::atomic<uint64_t>* const rex_export_count_ = ::rex::syscount::ExportCounter(name);   \
-    rex_export_count_->fetch_add(1, std::memory_order_relaxed);                                     \
+    const uint64_t rex_export_n_ = rex_export_count_->fetch_add(1, std::memory_order_relaxed) + 1; \
+    if (::rex::syscount::g_trace_exports.load(std::memory_order_relaxed))                           \
+      ::rex::syscount::TraceExport(name, rex_export_n_);                                            \
   } while (0)
 #endif
 

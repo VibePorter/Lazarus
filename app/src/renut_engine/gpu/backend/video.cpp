@@ -515,9 +515,18 @@ static_assert(kKickListsAFrame <= VideoState::kKickLists);
 class RingCleaner {
 public:
   // The ranges, cleaned in order; the ticket that Wait takes for them.
-  uint64_t Enqueue(std::vector<UploadRing::Range> &&ranges) {
-    if (ranges.empty())
-      return 0;
+  // Dunwall (2026-11-13, the rainbow textures): with nothing new to clean it returned ticket 0, and Wait(0) returns
+  // at once. A list that ended at such a kick was submitted without waiting for the ranges handed off at the kicks
+  // before it (which nobody had waited for: their lists had not ended), so the GPU could copy a texture's staging
+  // bytes before the cleaner thread had written them out of the CPU's cache: the image got the ring's old bytes for
+  // good. Now the ticket of everything handed off so far; 'stale_risk' says ranges were still outstanding.
+  uint64_t Enqueue(std::vector<UploadRing::Range> &&ranges, bool *stale_risk = nullptr) {
+    if (ranges.empty()) {
+      std::lock_guard lock(mutex_);
+      if (stale_risk)
+        *stale_risk = !queue_.empty() || working_ != 0;
+      return last_ticket_;
+    }
     std::lock_guard lock(mutex_);
     Start();
     for (const UploadRing::Range &r : ranges)
@@ -1087,10 +1096,11 @@ void Video::KickLocked(bool force) {
 #endif
   // The ring written up to this kick (its fills included) to the cleaner.
   uint64_t ticket = 0;
+  bool stale_risk = false;  // Dunwall (2026-11-13): nothing new, but earlier ranges not clean yet (see Enqueue)
   if (detail::UseRingCleaner()) {
     std::vector<UploadRing::Range> ranges;
     s.uploads[cur].HandOff(ranges);
-    ticket = detail::RingCleaner::Instance().Enqueue(std::move(ranges));
+    ticket = detail::RingCleaner::Instance().Enqueue(std::move(ranges), &stale_risk);
   }
   // The list ended at the last kick: its memory is clean (its ranges were handed off then).
   if (s.pending_list) {
@@ -1141,6 +1151,15 @@ void Video::KickLocked(bool force) {
   current->end();
   s.pending_list = current;
   s.pending_ticket = detail::UseRingCleaner() ? ticket : 0;
+  if (stale_risk) {
+    // Dunwall (2026-11-13): the case that used to go to the GPU with its upload memory possibly not cleaned.
+    static uint32_t seen = 0;
+    if (++seen <= 16 || (seen & 255u) == 0)
+      RGPU_INFO("[ring] a list of {} draws ended at a kick with no new upload bytes while earlier ranges were still "
+                "with the cleaner: waited for them before the submit ({} such lists so far; before 2026-11-13 they "
+                "were submitted at once)",
+                s.list_draws, seen);
+  }
   ++s.kick_lists_used[cur];
   s.slot_list[cur] = next.get();
   s.command_list = banjo::renut_gpu::record::Wrap(next.get());
@@ -1269,6 +1288,7 @@ bool Video::UploadRGBA8Locked(plume::RenderTexture *texture, uint32_t width, uin
   auto *dst = static_cast<uint8_t *>(staging.cpu);
   for (uint32_t y = 0; y < height; ++y)
     std::memcpy(dst + size_t(y) * row_pitch, rgba + size_t(y) * row_bytes, row_bytes);
+  s.uploads[s.frame].CleanNow(staging);  // Dunwall (2026-11-13): see UploadRing::CleanNow
 
   s.command_list->barriers(plume::RenderBarrierStage::COPY,
                            plume::RenderTextureBarrier(texture, plume::RenderTextureLayout::COPY_DEST));

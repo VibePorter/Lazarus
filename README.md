@@ -271,6 +271,11 @@ About two weeks from the first NRO to the version in this repository. The full s
 - **1-2 Nov:** UE3's render thread in the cross-hairs; naruto-nx ports and size culling; the ME1 import worked out.
 - **3 Nov:** median 29.4 fps in gameplay (540p, overclocked); the port moves to **Title Update 2**; gyro aiming.
 - **4 Nov:** subtitle size, the import crash fixed, and the port becomes **Lazarus**.
+- **5-7 Nov:** a CPU occlusion rasterizer and a native visibility pass in place of Umbra's traversal, the lighting
+  blobs on characters fixed, HD button icons, the asset pack split into 3 GB parts.
+- **14 Nov:** Legendary Edition ME1 saves for the import, saves overwritten properly, `me2_fps_limit`, a third batch
+  of renderer fixes, and the room that vanished in Lair of the Shadow Broker's first shot (the rasterizer's near
+  plane).
 
 ## 📚 Documentation
 

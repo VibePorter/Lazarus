@@ -69,6 +69,7 @@ keys.txt
 /app/thirdparty/plume/contrib/Vulkan-Headers/
 /app/thirdparty/plume/contrib/VulkanMemoryAllocator/
 /app/thirdparty/reblue-XenosRecomp/thirdparty/*
+!/app/thirdparty/reblue-XenosRecomp/thirdparty/CMakeLists.txt
 !/app/thirdparty/reblue-XenosRecomp/thirdparty/fmt
 /app/thirdparty/reblue-XenosRecomp/thirdparty/fmt/*
 !/app/thirdparty/reblue-XenosRecomp/thirdparty/fmt/include
@@ -92,3 +93,6 @@ __pycache__/
 .claude/
 .DS_Store
 /tools/ext/
+
+# A personal ME1 save (the LE1 import template); generate your own, see app/me2_src/me2_me1_le1.cpp
+/app/me2_src/me2_me1_le1_template.inc

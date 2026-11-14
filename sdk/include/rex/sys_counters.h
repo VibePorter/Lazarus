@@ -75,6 +75,10 @@ size_t CensusSites(uint64_t* addresses, uint64_t* counts, size_t capacity);
 // on first use; call it once per export and keep the pointer); ExportCensus copies the `capacity` most called.
 std::atomic<uint64_t>* ExportCounter(const char* name);
 size_t ExportCensus(const char** names, uint64_t* counts, size_t capacity);
+// Dunwall (2026-11-09, trace_xam_calls): when on, the game's XAM / online calls (Xam*, XNet*, XMsg*, XContent*,
+// XUser*) are logged with the time and thread: the first 40 of each, then every 1000th.
+extern std::atomic<bool> g_trace_exports;
+void TraceExport(const char* name, uint64_t n);
 #endif
 
 }  // namespace rex::syscount

@@ -37,6 +37,7 @@ bool IsProxy(const plume::RenderCommandList *cmd);
 // kept with the same Deko3DPushUniform updates in command order (the buffer bound at uniform slot 2).
 #if defined(PLUME_DEKO3D)
 bool Deko3DBindMemExport(plume::RenderCommandList *cmd, const plume::RenderBuffer *buffer);
+bool Deko3DInvalidateZcull(plume::RenderCommandList *cmd);  // ME2 (2026-11-07, me2_deko3d_zcull_invalidate)
 bool Deko3DBindFetchData(plume::RenderCommandList *cmd, uint64_t address, uint32_t size);
 bool Deko3DBindUniform(plume::RenderCommandList *cmd, uint32_t slot, uint64_t address, uint32_t size);
 bool Deko3DPushUniform(plume::RenderCommandList *cmd, uint64_t address, uint32_t ubo_size, uint32_t offset,

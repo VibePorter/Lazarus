@@ -597,8 +597,12 @@ void TimedShared(PPCContext& ctx, uint8_t* base) {
   --t_in_shared;
 }
 
+extern "C" void Me2RasterNoteDrawn(uint32_t mesh);  // me2_occlusion_raster.cpp
 template <int I, PPCFunc* Original>
 void ElementDraw(PPCContext& ctx, uint8_t* base) {
+  // me2_occlusion_raster_drawn_frames: the element's FStaticMesh (element +4) is drawn by the game now.
+  if (ctx.r4.u32 >= 0x10000u && ctx.r4.u32 < 0xF0000000u)
+    Me2RasterNoteDrawn(__builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + ctx.r4.u32 + 4)));
   static const bool on = REXCVAR_GET(me2_element_diag);
   static const bool timing = REXCVAR_GET(me2_element_timing);
   if (timing && !on && t_time_depth == 0) {

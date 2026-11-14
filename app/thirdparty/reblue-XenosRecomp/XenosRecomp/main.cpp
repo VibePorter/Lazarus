@@ -365,7 +365,15 @@ int main(int argc, char** argv)
             fmt::println(stderr, "Recompile failures ({}):", g_failures.size());
             for (const auto& failure : g_failures)
                 fmt::println(stderr, "  hash=0x{:016X} reason={}", failure.hash, failure.reason);
-            return 2;
+            // Dunwall (2026-11-08): XENOS_RECOMP_MAX_FAILURES=<n> accepts up to n failed shaders (left out of the
+            // cache; the renderer logs a shader missing from its table when the game uses it). Default 0: any
+            // failure stops the build, as before.
+            const char* maxEnv = std::getenv("XENOS_RECOMP_MAX_FAILURES");
+            const size_t maxFailures = maxEnv ? size_t(std::strtoull(maxEnv, nullptr, 10)) : 0;
+            if (g_failures.size() > maxFailures)
+                return 2;
+            fmt::println(stderr, "{} failure(s) accepted (XENOS_RECOMP_MAX_FAILURES={}): those shaders are left out",
+                         g_failures.size(), maxFailures);
         }
 
 #ifdef RENUT_RECOMP

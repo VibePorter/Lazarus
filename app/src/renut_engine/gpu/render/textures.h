@@ -187,6 +187,9 @@ struct TextureBinding {
   // which drops every third texel column: the B's right bowls and the A's right leg went missing at 720p (PC at 1080p
   // draws them full size). The replacement icons are minified linearly; magnification keeps the game's point filter.
   bool smooth_minify = false;
+  // me2-nx-deko (2026-11-07, me2_renut_diag_stale_scale): drawn by the GPU (a resolve destination, depth words, the FSR
+  // copy), so a 1x scale is a render scale too and not an ordinary texture's.
+  bool from_target = false;
 };
 
 // Flags on a stacked texture's 3D descriptor index (RENUT_STACKED_TEXTURE,
@@ -200,6 +203,10 @@ constexpr uint32_t kStackedLayerWrapBit = 0x20000000u;
 // factor the shaders divide the texture's size by for texel offsets and
 // texel coordinates (RENUT_RESOLUTION_SCALE_SHIFT in shader_common.h).
 constexpr uint32_t kResolutionScaleShift = 26;
+// ME2 (2026-11-12, backported from the Dunwall port): bits 20-25 hold the fetch constant's exponent adjust (signed);
+// the shaders scale the fetched texel by 2^adjust (renutExpScale, RENUT_EXP_ADJUST_SHIFT in shader_common.h). The slot
+// itself stays below bit 20 (RENUT_DESCRIPTOR_INDEX_MASK; kTextureDescriptorCount is 8192).
+constexpr uint32_t kExpAdjustShift = 20;
 // The most host levels a resolve destination gets (ExtraLevels).
 constexpr uint32_t kMaxExtraLevels = 3;
 
@@ -288,6 +295,9 @@ void ReleaseHostTextureLocked(u32 texture_va);
 // them, and the game drops them by destroying the pool at a section change
 // (game/level_pools.cpp).
 void ReleaseHostTexturesInMemoryLocked(u32 physical, u32 size);
+// me2-nx-deko (2026-11-07, me2_renut_scale_switch_reset): every GPU-drawn texture and resolve spare dropped (surfaces.cpp
+// LatchResolutionScaleLocked at a render-scale change).
+void DropGpuDrawnTexturesLocked(size_t *textures, size_t *spares);
 
 void TransitionTextureLocked(HostTexture *texture, plume::RenderTextureLayout layout);
 // banjo-nx (2026-10-19): a layout a texture is only read in (banjo_deko3d_barrier_lean).

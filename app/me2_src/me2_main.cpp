@@ -237,10 +237,13 @@ class Me2App : public rex::ReXApp {
            // ME2 (2026-10-26): Wwise's audio thread (entry 82E22A90; the game asks for it above normal, which the
            // Switch dropped) one step above the other guest threads (0x3B), so loads and the game thread no longer
            // starve it (audio cut-outs = frames without data in rex_profile.log). It blocks between audio frames.
-           "switch_guest_thread_priority = \"82E22A90:3A\"\n"
+           // 2026-11-07 (console-tested): Wwise (82E22A90) and the XAudio2 mixer thread (82FE7F48) at 0x2B, above
+           // Renut's render thread (0x2C) on the audio cores 1-2: in a fight up to a death Wwise kept 1.9 buffers
+           // queued (was 1.35, 69 whole-mix dropouts at 0x3A/0x39). Both block between audio frames.
+           "switch_guest_thread_priority = \"82E22A90:2B,82FE7F48:2B\"\n"
            // 2026-10-26: Wwise's sound engine thread onto core 3 when the NSP forwarder allows it
            // (switch_audio_core_mask, sdk system/xthread.cpp); without the forwarder nothing changes.
-           "switch_audio_guest_entries = \"82E22A90\"\n"
+           "switch_audio_guest_entries = \"82E22A90,82FE7F48\"\n"
            // 2026-10-26 (the user's choice): A and B as the Switch names them in the game (the Switch's A acts as
            // the 360's A: confirm / use), X and Y stay by position. Only the game's input; the port's own menu keeps
            // input_xbox_layout. The on-screen legend still shows the 360's letters.

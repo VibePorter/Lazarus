@@ -44,6 +44,46 @@ namespace plume {
     extern "C" char *fake_heap_end; // libnx: the heap's end (sbrk grows towards it)
     static void memoryFigures(uint64_t &heapFree, uint64_t &processFree);
 }
+namespace plume { void Deko3DDumpBreadcrumbs(); void Deko3DDumpQueueOps(uint32_t done); }  // plume_deko3d_commands.cpp
+// Dunwall (2026-11-09): deko3d aborts on a failed GPU channel kickoff without its result ("gpu channel kickoff
+// failed, but no error was reported" in the debug library; diagAbortWithResult in the release one). The SDK's wrapper
+// of libnx's nvGpuChannelKickoff (switch_perf.cpp) calls this on a failure: the result and what was submitted.
+extern "C" void rex_switch_kickoff_failed(NvGpuChannel *c, u32 entries, Result rc) {
+    u32 cmds = 0;
+    for (u32 i = 0; c && i < entries && i < GPFIFO_QUEUE_SIZE; i++)
+        cmds += (c->entries[i].desc32[1] >> 10) & 0x1FFFFF;
+    plume::deko3dLog("gpu channel kickoff failed: result 0x%X (module %u, description %u), %u gpfifo entries "
+                     "(%u command words), fence increment %u", rc, R_MODULE(rc), R_DESCRIPTION(rc), entries, cmds,
+                     c ? c->fence_incr : 0);
+    // Dunwall (2026-11-12): the driver's record of why the channel died (MMU fault, semaphore timeout, ...).
+    if (c) {
+        NvNotification n{};
+        NvError e{};
+        const Result rn = nvGpuChannelGetErrorNotification(c, &n);
+        const Result re = nvGpuChannelGetErrorInfo(c, &e);
+        const char *kind = n.info32 == 8 ? "FIFO idle timeout" : n.info32 == 13 ? "GR software notify"
+                         : n.info32 == 24 ? "GR SEMAPHORE TIMEOUT" : n.info32 == 25 ? "GR illegal notify"
+                         : n.info32 == 31 ? "MMU FAULT" : n.info32 == 32 ? "PBDMA error"
+                         : n.info32 == 43 ? "reset channel verif error" : n.info32 == 80 ? "pushbuffer CRC mismatch" : "?";
+        plume::deko3dLog("gpu channel error: notification rc 0x%X type %u (%s) info16 %u status %u; error info rc 0x%X "
+                         "type %u info %08X %08X %08X %08X %08X %08X %08X %08X", rn, n.info32, kind, n.info16, n.status,
+                         re, e.type, e.info[0], e.info[1], e.info[2], e.info[3], e.info[4], e.info[5], e.info[6],
+                         e.info[7]);
+    }
+    plume::Deko3DDumpBreadcrumbs();  // Dunwall (2026-11-12): the work the GPU stopped in
+    plume::Deko3DDumpBlockEvents();  // Dunwall (2026-11-13): the blocks made and destroyed before it
+    plume::Deko3DDumpQueueOps(plume::Deko3DCrumbDone());  // Dunwall (2026-11-13): submissions, acquires, presents
+}
+// Dunwall (2026-11-13): the SDK's kickoff wrapper (switch_perf.cpp) retried a kickoff that found the GPU's 2048-entry
+// command ring full (the "timeout" 0xD5C that used to abort the game at level loads); logged at most 64 times.
+extern "C" void rex_switch_kickoff_retried(u32 entries, u32 tries, u64 waited_us) {
+    static std::atomic<uint32_t> count{0};
+    const uint32_t n = count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 64)
+        plume::deko3dLog("gpu channel: the GPU's command ring was full: kickoff of %u entries went through after %u tries "
+                         "(%.1f ms; GPU at breadcrumb #%u of #%u; %u such waits so far)", entries, tries,
+                         double(waited_us) / 1000.0, plume::Deko3DCrumbDone(), plume::Deko3DCrumbRecorded(), n);
+}
 // The heap census (sdk core/threading_posix.cpp switch_stack_census_s) reads these.
 extern "C" std::atomic<uint64_t> g_rex_gpu_arena_bytes, g_rex_gpu_arena_used, g_rex_gpu_heap_block_bytes;
 namespace plume {
@@ -85,6 +125,124 @@ namespace plume {
     std::atomic<bool> g_deko3dBudgetChunkFree{false};
     std::atomic<uint64_t> g_deko3dBudgetArenaFloor{128ull << 20};
     std::atomic<uint64_t> g_deko3dArenaMax{1024ull << 20};  // ME2 (2026-11-06): me2_deko3d_arena_max_mb
+    // Dunwall (2026-11-12): clean + invalidate the CPU cache of storage given to dkMemBlockCreate (makeBlock).
+    std::atomic<bool> g_deko3dFlushStorage{true};
+    std::atomic<uint32_t> g_deko3dArenaQuarantineMs{0};  // Dunwall (2026-11-13): dh_deko3d_arena_quarantine_ms
+
+    // ---- Dunwall (2026-11-13): memory block events for the GPU-timeout dump (Deko3DDumpBlockEvents)
+    namespace {
+        struct BlockEvent {
+            uint64_t tick = 0;          // armGetSystemTick
+            uint64_t gpu = 0;
+            uint64_t serial = 0, completed = 0;  // the device's submission serial / last completed one
+            int64_t arenaOffset = -1;   // -1: not in the arena
+            const char *what = "";
+            uint32_t size = 0;
+            uint32_t crumbRecorded = 0, crumbDone = 0;
+            bool destroy = false;
+        };
+        constexpr uint32_t kBlockEvents = 256;
+        BlockEvent g_blockEvents[kBlockEvents];
+        uint32_t g_blockEventCount = 0;
+        std::mutex g_blockEventMutex;
+        struct LiveBlock {
+            uint32_t size;
+            const char *what;
+        };
+        std::map<uint64_t, LiveBlock> g_liveBlocks;               // GPU address -> live block
+        std::unordered_map<DkMemBlock, const char *> g_blockWhat;  // block -> what it was made for
+
+        void noteBlockEvent(DkMemBlock block, const char *what, bool destroy, int64_t arenaOffset, uint64_t serial,
+                            uint64_t completed) {
+            BlockEvent e;
+            e.tick = armGetSystemTick();
+            e.gpu = dkMemBlockGetGpuAddr(block);
+            e.size = dkMemBlockGetSize(block);
+            e.serial = serial;
+            e.completed = completed;
+            e.arenaOffset = arenaOffset;
+            e.crumbRecorded = Deko3DCrumbRecorded();
+            e.crumbDone = Deko3DCrumbDone();
+            e.destroy = destroy;
+            std::lock_guard<std::mutex> lock(g_blockEventMutex);
+            if (destroy) {
+                auto it = g_blockWhat.find(block);
+                e.what = it != g_blockWhat.end() ? it->second : "?";
+                if (it != g_blockWhat.end())
+                    g_blockWhat.erase(it);
+                g_liveBlocks.erase(e.gpu);
+            }
+            else {
+                e.what = what ? what : "?";
+                g_blockWhat[block] = e.what;
+                g_liveBlocks[e.gpu] = {e.size, e.what};
+            }
+            g_blockEvents[g_blockEventCount % kBlockEvents] = e;
+            g_blockEventCount++;
+        }
+    }
+
+    void Deko3DDescribeGpuAddress(const char *label, uint64_t address) {
+        if (!address)
+            return;
+        std::unique_lock<std::mutex> lock(g_blockEventMutex, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            deko3dLog("blocks: %s 0x%llX: the event lock is held (not checked)", label, (unsigned long long)address);
+            return;
+        }
+        auto it = g_liveBlocks.upper_bound(address);
+        if (it != g_liveBlocks.begin()) {
+            --it;
+            if (address < it->first + it->second.size) {
+                deko3dLog("blocks: %s 0x%llX: inside a LIVE block (%s, GPU 0x%llX, %u KiB, offset 0x%llX)", label,
+                          (unsigned long long)address, it->second.what, (unsigned long long)it->first,
+                          it->second.size >> 10, (unsigned long long)(address - it->first));
+                return;
+            }
+        }
+        const uint64_t now = armGetSystemTick();
+        bool found = false;
+        const uint32_t n = std::min(g_blockEventCount, kBlockEvents);
+        for (uint32_t k = 0; k < n; k++) {
+            const BlockEvent &e = g_blockEvents[(g_blockEventCount - 1 - k) % kBlockEvents];
+            if (e.destroy && address >= e.gpu && address < e.gpu + e.size) {
+                deko3dLog("blocks: %s 0x%llX: inside a DESTROYED block (%s, GPU 0x%llX, %u KiB), destroyed %.3f s ago "
+                          "at breadcrumb #%u (GPU at #%u), serial %llu (completed %llu)", label,
+                          (unsigned long long)address, e.what, (unsigned long long)e.gpu, e.size >> 10,
+                          double(armTicksToNs(now - e.tick)) / 1e9, e.crumbRecorded, e.crumbDone,
+                          (unsigned long long)e.serial, (unsigned long long)e.completed);
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+            deko3dLog("blocks: %s 0x%llX: NOT IN ANY LIVE BLOCK and not in the last %u destroyed ones", label,
+                      (unsigned long long)address, n);
+    }
+
+    void Deko3DDumpBlockEvents() {
+        std::unique_lock<std::mutex> lock(g_blockEventMutex, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            deko3dLog("blocks: the event lock is held: no list");
+            return;
+        }
+        const uint64_t now = armGetSystemTick();
+        const uint32_t n = std::min(g_blockEventCount, 64u);
+        deko3dLog("blocks: the last %u of %u block events (newest last; %zu blocks live)", n, g_blockEventCount,
+                  g_liveBlocks.size());
+        for (uint32_t k = n; k > 0; k--) {
+            const BlockEvent &e = g_blockEvents[(g_blockEventCount - k) % kBlockEvents];
+            char where[48];
+            if (e.arenaOffset >= 0)
+                snprintf(where, sizeof(where), "arena +%llu KiB", (unsigned long long)(e.arenaOffset >> 10));
+            else
+                snprintf(where, sizeof(where), "heap");
+            deko3dLog("blocks: %8.3f s ago %s %s %u KiB GPU 0x%llX (%s) serial %llu completed %llu crumb #%u GPU #%u",
+                      double(armTicksToNs(now - e.tick)) / 1e9, e.destroy ? "DESTROY" : "make   ", e.what,
+                      e.size >> 10, (unsigned long long)e.gpu, where, (unsigned long long)e.serial,
+                      (unsigned long long)e.completed, e.crumbRecorded, e.crumbDone);
+        }
+    }
     // PLUME_DEKO3D_GUARDS: bytes after each block's storage, and their value.
     static constexpr uint32_t GuardBytes = 64u << 10;
     static constexpr uint8_t GuardByte = 0xA5;
@@ -555,7 +713,8 @@ namespace plume {
         dkImageLayoutInitialize(&layout, &m);
         const uint64_t size = dkImageLayoutGetSize(&layout);
         const uint32_t alignment = dkImageLayoutGetAlignment(&layout);
-        if (size > 0xFFFFFFFFull || !device->imageAlloc(uint32_t(size), alignment, alloc)) {
+        // Dunwall (2026-11-13): every render target (compressed or not) from the render-target chunks.
+        if (size > 0xFFFFFFFFull || !device->imageAlloc(uint32_t(size), alignment, alloc, render)) {
             logf("texture %ux%ux%u format %d: no memory for %" PRIu64 " bytes", desc.width, desc.height, desc.depth,
                  int(desc.format), size);
             return;
@@ -599,8 +758,18 @@ namespace plume {
             view->view.type = DkImageType_1D;
             break;
         case RenderTextureViewDimension::TEXTURE_2D:
-            if (type == DkImageType_2DArray || type == DkImageType_Cubemap || type == DkImageType_CubemapArray)
-                view->view.type = DkImageType_2D;
+            if (type == DkImageType_2DArray || type == DkImageType_Cubemap || type == DkImageType_CubemapArray) {
+                // ME2 backport from the Dunwall port (2026-11-09): as the Vulkan back end (toImageViewType): a 2D
+                // view that covers more than one layer is a 2D array view. Always 2D before, so Renut's view of a
+                // stacked texture (an array of StackedLayers layers, textures.cpp Create) showed the shaders one layer
+                // (Dunwall: UE3's colour-grading LUT, 16 slices read through sampler2DArray, collapsed into its
+                // first slice and tinted the 3D picture).
+                const uint32_t layers = std::max<uint32_t>(desc.arraySize, 1u);
+                const uint32_t first = std::min<uint32_t>(viewDesc.arrayIndex, layers - 1);
+                const uint32_t count = viewDesc.arraySize == 0 ? layers - first
+                                                                : std::min<uint32_t>(viewDesc.arraySize, layers - first);
+                view->view.type = count > 1 ? DkImageType_2DArray : DkImageType_2D;
+            }
             break;
         case RenderTextureViewDimension::TEXTURE_3D:
             view->view.type = DkImageType_3D;
@@ -884,8 +1053,10 @@ namespace plume {
         qm.commandMemorySize = 1u << 20;
         qm.flushThreshold = qm.commandMemorySize / 8;
         // Scratch (local) memory per warp: Renut's biggest vertex shaders need 32 KB (uam's DKSH headers; 81 of the 4,881
-        // need some), variants maybe more: 64 KB a warp (about 8 MB for the GPU's warps).
-        qm.perWarpScratchMemorySize = 64u << 10;
+        // need some), variants maybe more. ME2 (2026-11-12, backported from the Dunwall port): 128 KB a warp (about
+        // 16 MB for the GPU's warps): with COLOR0-5 the host geometry shader rectangle_list_gs needs 70656 bytes and was
+        // not loaded at 64 KB (its draws then failed to get a pipeline).
+        qm.perWarpScratchMemorySize = 128u << 10;
         perWarpScratch = qm.perWarpScratchMemorySize;
         queue = dkQueueCreate(&qm);
         if (!queue) {
@@ -1022,9 +1193,21 @@ namespace plume {
                 return nullptr;
             }
         }
-        if (storage)
+        if (storage) {
             m.storage = storage;
+            // Dunwall (2026-11-12, the GPU timeout 0xD5C at level loads): storage the caller gives deko3d is
+            // recycled memory (an arena range or a heap block another block or the game used). Its CPU cache lines
+            // may still be dirty: written back later, they land over what the GPU keeps in the new block (command
+            // memory, descriptors, index data, images). Cleaned and invalidated now, before deko3d maps it. With the
+            // arena off (deko3d's own storage) the crash did not happen. Off: g_deko3dFlushStorage = false.
+            if (g_deko3dFlushStorage.load(std::memory_order_relaxed))
+                armDCacheFlush(storage, m.size);
+        }
         DkMemBlock block = dkMemBlockCreate(&m);
+        if (block)
+            noteBlockEvent(block, what, false,
+                           fromArena ? int64_t(static_cast<uint8_t *>(storage) - arena.base) : -1,
+                           submitSerial.load(std::memory_order_relaxed), completedSerial.load(std::memory_order_relaxed));
         if (fromArena)
             arenaGive(block, storage, m.size);
         else if (storage) {
@@ -1114,6 +1297,7 @@ namespace plume {
         }
         if (!arena.base)
             return nullptr;
+        arenaReleaseQuarantineLocked(false);  // Dunwall (2026-11-13): ranges whose quarantine is over
         // Best fit: the smallest free range that holds it, so the big ranges stay whole for the 64 MB chunks.
         auto best = arena.free.end();
         for (auto it = arena.free.begin(); it != arena.free.end(); ++it) {
@@ -1142,6 +1326,26 @@ namespace plume {
                 logf("block arena: %" PRIu64 " of %" PRIu64 " MB used (new peak)", arena.used >> 20, arena.size >> 20);
         }
         return arena.base + offset;
+    }
+
+    // Dunwall (2026-11-13, g_deko3dArenaQuarantineMs): destroyed blocks' ranges back into `free` once they have waited
+    // long enough (all: every one). arena.mutex held.
+    void Deko3DDevice::arenaReleaseQuarantineLocked(bool all) {
+        if (arena.quarantine.empty())
+            return;
+        const uint64_t now = armGetSystemTick();
+        const uint64_t wait = armNsToTicks(uint64_t(g_deko3dArenaQuarantineMs.load(std::memory_order_relaxed)) * 1000000ull);
+        size_t kept = 0;
+        for (size_t i = 0; i < arena.quarantine.size(); i++) {
+            const auto q = arena.quarantine[i];
+            if (all || now - std::get<2>(q) >= wait) {
+                arena.quarantineBytes -= std::get<1>(q);
+                arenaFreeRangeLocked(std::get<0>(q), std::get<1>(q));
+            }
+            else
+                arena.quarantine[kept++] = q;
+        }
+        arena.quarantine.resize(kept);
     }
 
     void Deko3DDevice::arenaGive(DkMemBlock block, void *storage, uint32_t size) {
@@ -1211,9 +1415,24 @@ namespace plume {
                 g_rex_gpu_heap_block_bytes.fetch_sub(dkMemBlockGetSize(block), std::memory_order_relaxed);
             }
         }
+        noteBlockEvent(block, nullptr, true, inArena ? int64_t(start) : -1, submitSerial.load(std::memory_order_relaxed),
+                       completedSerial.load(std::memory_order_relaxed));
         dkMemBlockDestroy(block);
-        if (inArena)
-            arenaFreeRange(start, length);  // after the destroy: deko3d has unmapped the storage
+        if (inArena) {
+            // After the destroy: deko3d has unmapped the storage. Dunwall (2026-11-13): with
+            // g_deko3dArenaQuarantineMs, the range waits that long before a new block can get it.
+            const uint32_t ms = g_deko3dArenaQuarantineMs.load(std::memory_order_relaxed);
+            if (ms) {
+                std::lock_guard<std::mutex> lock(arena.mutex);
+                if (arena.quarantined == 0)
+                    logf("block arena: destroyed blocks' ranges wait %u ms before reuse (dh_deko3d_arena_quarantine_ms)", ms);
+                arena.quarantine.emplace_back(start, length, armGetSystemTick());
+                arena.quarantineBytes += length;
+                arena.quarantined++;
+            }
+            else
+                arenaFreeRange(start, length);
+        }
         free(heapStorage);
 #else
         uint8_t *storage = nullptr;
@@ -1272,6 +1491,7 @@ namespace plume {
 
     // Image heap: up to 64 MB chunks (bigger for a bigger image), first fit.
     static constexpr uint32_t ImageChunkSize = 64u << 20;
+    static constexpr uint32_t RenderChunkSize = 32u << 20;  // Dunwall (2026-11-13): render-target chunks
 
     static void chunkFree(Deko3DDevice::Chunk &c, uint32_t offset, uint32_t size) {
         auto it = std::lower_bound(c.freeList.begin(), c.freeList.end(), std::make_pair(offset, 0u));
@@ -1286,7 +1506,44 @@ namespace plume {
         }
     }
 
-    bool Deko3DDevice::imageAlloc(uint32_t size, uint32_t alignment, Deko3DImageAlloc &out) {
+    void Deko3DDevice::describeImageHeapAddress(const char *label, uint64_t address) {
+        std::unique_lock<std::mutex> heap(heapMutex, std::try_to_lock);
+        if (!heap.owns_lock()) {
+            logf("breadcrumbs: %s: the image heap lock is held (not checked)", label);
+            return;
+        }
+        for (size_t k = 0; k < chunks.size(); k++) {
+            const Chunk &c = chunks[k];
+            if (!c.block)
+                continue;
+            const uint64_t base = dkMemBlockGetGpuAddr(c.block);
+            if (address < base || address >= base + c.size)
+                continue;
+            const uint32_t offset = uint32_t(address - base);
+            for (const auto &f : c.freeList) {
+                if (offset >= f.first && offset < f.first + f.second) {
+                    logf("breadcrumbs: %s: FREE memory of image heap chunk %zu (offset 0x%X, in a free range at 0x%X of "
+                         "%u KiB)", label, k, offset, f.first, f.second >> 10);
+                    return;
+                }
+            }
+            std::unique_lock<std::mutex> ret(retireMutex, std::try_to_lock);
+            if (ret.owns_lock()) {
+                for (const Retired &r : retired) {
+                    if (r.image.chunk == int32_t(k) && offset >= r.image.offset && offset < r.image.offset + r.image.size) {
+                        logf("breadcrumbs: %s: RETIRED image memory of chunk %zu (offset 0x%X; freed once serial %llu "
+                             "completes, completed %llu)", label, k, offset, (unsigned long long)r.serial,
+                             (unsigned long long)completedSerial.load());
+                        return;
+                    }
+                }
+            }
+            logf("breadcrumbs: %s: allocated memory of image heap chunk %zu (offset 0x%X)", label, k, offset);
+            return;
+        }
+    }
+
+    bool Deko3DDevice::imageAlloc(uint32_t size, uint32_t alignment, Deko3DImageAlloc &out, bool render) {
         if (size > UINT32_MAX - 255u)
             return false;
         size = alignUp(size, 256);
@@ -1296,6 +1553,8 @@ namespace plume {
         for (int pass = 0; pass < 2; pass++) {
             for (size_t ci = 0; ci < chunks.size(); ci++) {
                 Chunk &c = chunks[ci];
+                if (c.render != render)
+                    continue;  // Dunwall (2026-11-13): render targets and textures in separate chunks
                 for (size_t i = 0; i < c.freeList.size(); i++) {
                     const auto [off, len] = c.freeList[i];
                     const uint32_t at = alignUp(off, alignment);
@@ -1320,17 +1579,21 @@ namespace plume {
                 // Keep the usual 64 MB chunk while it fits. Near exhaustion, use a smaller arena range rather than
                 // fall back to 64 MB from a heap whose free bytes may be scattered across 100,000 small pieces.
                 const uint64_t available = arenaLargestFree();
-                const uint32_t preferred = uint32_t(std::min<uint64_t>(ImageChunkSize,
+                // Render-target chunks are 32 MB (the targets are ~40 MB in all at the usual scales).
+                const uint32_t preferred = uint32_t(std::min<uint64_t>(render ? RenderChunkSize : ImageChunkSize,
                     available >= minimum ? available : 16u << 20));
                 const uint32_t chunkSize = std::max(preferred, uint32_t(minimum));
                 Chunk c;
-                c.block = makeBlock(chunkSize, DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image, "image heap chunk", true);
+                c.block = makeBlock(chunkSize, DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image,
+                                    render ? "render target heap chunk" : "image heap chunk", true);
                 if (!c.block)
                     return false;
                 c.size = chunkSize;
+                c.render = render;
                 c.freeList.push_back({0, chunkSize});
                 chunks.push_back(std::move(c));
-                logf("image heap: chunk %zu of %u MiB", chunks.size(), chunkSize >> 20);
+                logf("image heap: chunk %zu of %u MiB (%s)", chunks.size(), chunkSize >> 20,
+                     render ? "render targets" : "textures");
             }
         }
         return false;

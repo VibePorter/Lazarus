@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 
 namespace rex::filesystem {
 class PackStorage;
@@ -17,7 +18,9 @@ namespace rex::filesystem::readahead {
 // How the read-ahead thread reads a file on its own (it never uses the guest's handle, which the guest may close).
 struct Source {
   std::filesystem::path host_path;  // a game-folder file: the thread opens its own handle
-  PackStorage* storage = nullptr;   // an asset-pack file: positional reads of the pack (lives as long as the process)
+  // An asset-pack file: positional reads of the pack. Shared (2026-11-07): a DLC package's pack is unmounted when the
+  // game closes the package, and a block still queued keeps the pack open until the thread is done with it.
+  std::shared_ptr<PackStorage> storage;
   uint64_t base = 0;                // where the file starts in the pack
   uint64_t size = 0;                // file size (prefetches stop at the end)
 };

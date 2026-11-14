@@ -102,6 +102,9 @@ struct TextureFetch {
   u32 BasePage() const { return dword[1] >> 12; }
 
   u32 Swizzle() const { return (dword[3] >> 1) & 0xFFF; }
+  // ME2 (2026-11-12, backported from the Dunwall port): the fetch's exponent adjust (signed, bits 13-18): the texel
+  // is scaled by 2^adjust.
+  i32 ExpAdjust() const { return i32(dword[3] << 13) >> 26; }
   TextureFilter MagFilter() const { return TextureFilter((dword[3] >> 19) & 3); }
   TextureFilter MinFilter() const { return TextureFilter((dword[3] >> 21) & 3); }
   TextureFilter MipFilter() const { return TextureFilter((dword[3] >> 23) & 3); }

@@ -85,6 +85,7 @@ Result __real_threadCreate(Thread* t, ThreadFunc entry, void* arg, void* stack_m
 Result __real_threadClose(Thread* t);
 Result __real_nvFenceWait(NvFence* f, s32 timeout_us);
 Result __real_nvGpuChannelKickoff(NvGpuChannel* c);
+Result __real_nvGpuChannelAppendEntry(NvGpuChannel* c, iova_t start, size_t num_cmds, u32 flags, u32 flush_threshold);
 Result __real_nvMapCreate(NvMap* m, void* cpu_addr, u32 size, u32 align, NvKind kind, bool is_cpu_cacheable);
 Result __real_nvAddressSpaceAllocFixed(NvAddressSpace* a, bool sparse, u64 size, iova_t iova);
 Result __real_nvioctlNvhostAsGpu_MapBufferEx(u32 fd, u32 flags, u32 kind, u32 nvmap_handle, u32 page_size,
@@ -141,6 +142,10 @@ struct Slot {
 };
 Slot g_slots[kMaxThreads];
 int g_stacks_top = 0;  // switch_profile_stacks_top, read once at the start of sampling
+// me2-nx-deko (2026-11-07): switch_profile_stacks_always, name substrings of threads always in the focus set (a thread
+// that stalls by waiting uses no CPU and never made the busiest list), and how many threads the set holds.
+std::vector<std::string> g_stacks_always;
+size_t g_focus_count = 0;
 // Exclusive core for the hottest guest thread (the game's main thread): -1 = off. See ApplyExclusiveCore.
 std::atomic<int> g_exclusive_core{-1};
 std::atomic<bool> g_light_core{false};
@@ -542,6 +547,13 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
   if (g_stacks_top > 0) {
     for (auto& s : g_slots) s.focus = false;
     for (size_t k = 0; k < order.size() && k < size_t(g_stacks_top); ++k) g_slots[order[k]].focus = true;
+    for (size_t i : order) {
+      for (const std::string& want : g_stacks_always) {
+        if (!want.empty() && std::strstr(g_slots[i].name, want.c_str())) g_slots[i].focus = true;
+      }
+    }
+    g_focus_count = 0;
+    for (const auto& s : g_slots) g_focus_count += s.focus ? 1 : 0;
   }
 
   FILE* f = std::fopen(ReportPath().c_str(), "a");
@@ -1109,6 +1121,16 @@ void ProfilerMain(void*) {
   {
     const std::string top = rex::cvar::GetFlagByName("switch_profile_stacks_top");
     g_stacks_top = std::max(0, std::min(16, std::atoi(top.c_str())));
+    const std::string always = rex::cvar::GetFlagByName("switch_profile_stacks_always");
+    for (size_t start = 0; start <= always.size();) {
+      size_t end = always.find(',', start);
+      if (end == std::string::npos) end = always.size();
+      std::string item = always.substr(start, end - start);
+      while (!item.empty() && (item.front() == ' ' || item.front() == '"')) item.erase(item.begin());
+      while (!item.empty() && (item.back() == ' ' || item.back() == '"')) item.pop_back();
+      if (!item.empty()) g_stacks_always.push_back(item);
+      start = end + 1;
+    }
   }
   // me2-nx-deko (2026-11-02): the report's period, switch_profile_report_s (default 10 s).
   u64 report_seconds = kReportSeconds;
@@ -1200,7 +1222,7 @@ void ProfilerMain(void*) {
         }
       }
       svcSetThreadActivity(h, ThreadActivity_Runnable);
-      if (!focused || ++sampled_this_tick >= size_t(g_stacks_top)) break;
+      if (!focused || ++sampled_this_tick >= std::max(g_focus_count, size_t(g_stacks_top))) break;
     }
 
     const u64 now = armGetSystemTick();
@@ -1280,11 +1302,60 @@ Result __wrap_nvFenceWait(NvFence* f, s32 timeout_us) {
   return rc;
 }
 
+// ME2 (2026-11-12, backported from the Dunwall port): deko3d aborts on a failed kickoff without its result; the
+// renderer's hook (plume_deko3d.cpp, weak: none in a build without it) logs the result and what was submitted first.
+extern "C" void rex_switch_kickoff_failed(NvGpuChannel* c, u32 entries, Result rc) __attribute__((weak));
+
+// ME2 (2026-11-14, from the Dunwall port 2026-11-13): told once a kickoff that found the GPU's command ring full went
+// through on a retry (plume_deko3d.cpp logs it).
+extern "C" void rex_switch_kickoff_retried(u32 entries, u32 tries, u64 waited_us) __attribute__((weak));
+
+// ME2 (2026-11-14, from the Dunwall port 2026-11-13, the level-load "GPU timeout" 0xD5C): the channel's hardware ring
+// holds GPFIFO_QUEUE_SIZE (2048) entries (libnx nvGpuChannelCreate). When the CPU is further ahead than that (texture
+// streaming at a level load: Dunwall had ~8,400 pieces of work queued), the submit finds no room and the driver says
+// "try again" (EAGAIN), which nvservices returns as Timeout (libnx 0xD5C); deko3d then aborted the game. It is not a GPU
+// hang: the breadcrumbs showed the GPU still finishing work up to the failure. So a Timeout is retried while the GPU
+// drains the ring; only after kKickoffRetryLimitUs is it a real failure (then logged as before).
+constexpr u64 kKickoffRetryLimitUs = 20'000'000;
+
 Result __wrap_nvGpuChannelKickoff(NvGpuChannel* c) {
+  const u32 entries = c ? c->num_entries : 0;
+  const u32 fenceIncr = c ? c->fence_incr : 0;
   const u64 from = armGetSystemTick();
-  const Result rc = __real_nvGpuChannelKickoff(c);
+  Result rc = __real_nvGpuChannelKickoff(c);
+  u32 tries = 1;
+  while (c && R_FAILED(rc) && R_MODULE(rc) == Module_LibnxNvidia && R_DESCRIPTION(rc) == LibnxNvidiaError_Timeout &&
+         armTicksToNs(armGetSystemTick() - from) / 1000 < kKickoffRetryLimitUs) {
+    // The same entries again (libnx keeps them on a failure; restored should a version clear them: nothing appends
+    // in between, the array still holds them).
+    if (c->num_entries == 0 && entries != 0) {
+      c->num_entries = entries;
+      c->fence_incr = fenceIncr;
+    }
+    svcSleepThread(tries < 20 ? 100'000ll : 1'000'000ll);  // 0.1 ms, then 1 ms
+    rc = __real_nvGpuChannelKickoff(c);
+    ++tries;
+  }
   Note(kKickoff, from);
+  if (tries > 1 && R_SUCCEEDED(rc) && rex_switch_kickoff_retried)
+    rex_switch_kickoff_retried(entries, tries, armTicksToNs(armGetSystemTick() - from) / 1000);
+  if (R_FAILED(rc) && rex_switch_kickoff_failed) rex_switch_kickoff_failed(c, entries, rc);
   return rc;
+}
+
+// ME2 (2026-11-12, backported from the Dunwall port): at most kMaxKickoffEntries gpfifo entries a kickoff. libnx
+// kicks off by itself only when its 2048-entry queue is nearly full (deko3d appends with threshold 0), and Ryujinx
+// refuses a large kickoff (Dunwall: a loading screen's frame of 591 entries failed with NvResult 1, libnx 0x559, and
+// deko3d aborted the game; 269 went through). The console takes either. Kicking off earlier is what libnx does at its
+// own threshold: the same commands, in order, the fence increments with the entries they follow.
+constexpr u32 kMaxKickoffEntries = 256;
+
+Result __wrap_nvGpuChannelAppendEntry(NvGpuChannel* c, iova_t start, size_t num_cmds, u32 flags, u32 flush_threshold) {
+  if (c && c->num_entries >= kMaxKickoffEntries) {
+    const Result rc = nvGpuChannelKickoff(c);  // through the wrapper above (--wrap)
+    if (R_FAILED(rc)) return rc;
+  }
+  return __real_nvGpuChannelAppendEntry(c, start, num_cmds, flags, flush_threshold);
 }
 
 Result __wrap_nvMapCreate(NvMap* m, void* cpu_addr, u32 size, u32 align, NvKind kind, bool is_cpu_cacheable) {

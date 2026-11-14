@@ -46,6 +46,8 @@
 #include <rex/system/xam/content_manager.h>
 #include <rex/system/xam/user_profile.h>
 
+#include "me2_me1_le1.h"
+
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
@@ -76,6 +78,17 @@
 #pragma GCC diagnostic pop
 #endif
 
+// ME2 (2026-11-14): zlib streams (with their header) for the LE1 saves (me2_me1_le1.cpp).
+static bool InflateZlib(const uint8_t* in, size_t in_size, uint8_t* out, size_t out_size) {
+  return in_size <= 0x7FFFFFFF && out_size <= 0x7FFFFFFF &&
+         stbi_zlib_decode_buffer(reinterpret_cast<char*>(out), int(out_size), reinterpret_cast<const char*>(in),
+                                 int(in_size)) == int(out_size);
+}
+
+REXCVAR_DEFINE_STRING(me2_me1_import_le1_latin_names, "auto", "ME2",
+                      "ME1 Legendary Edition saves: the first name in Latin letters (the default Джон / Джейн -> John / "
+                      "Jane, other Cyrillic transliterated). auto = only when the game is not in Russian (user_language "
+                      "12; the other languages' fonts have no Cyrillic: squares); on; off = as LE1 stored it");
 REXCVAR_DEFINE_BOOL(me2_me1_import, true, "ME2",
                     "New Game -> Import ME1 Character: the port prepares the character itself (no Unreap.xex)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
@@ -721,6 +734,7 @@ struct Candidate {
   uint64_t time = 0;
   bool package = false;  // an Xbox 360 save package (STFS "CON " file), read through the SDK's STFS device
   std::string display;   // its display name (the Xbox's), for the list
+  bool le1 = false;      // ME2 (2026-11-14): an ME1 Legendary Edition save (.pcsav), converted by me2_me1_le1.cpp
 };
 
 constexpr uint32_t kMe1Title = 0x4D5307E8;  // Mass Effect (Xbox 360)
@@ -779,6 +793,13 @@ bool ReadPackage(const fs::path& path, std::vector<File>& files, std::string& wh
   return true;
 }
 
+le1::Options Le1Options() {
+  le1::Options o;
+  const std::string mode = Lower(REXCVAR_GET(me2_me1_import_le1_latin_names));
+  o.latin_names = mode == "on" || mode == "true" || (mode == "auto" && rex::cvar::GetFlagByName("user_language") != "12");  // the SDK's XGetLanguage answer
+  return o;
+}
+
 std::vector<Candidate> FindSaves(const fs::path& dir) {
   std::vector<Candidate> list;
   for (const auto& info : rex::filesystem::ListFiles(dir)) {
@@ -787,6 +808,14 @@ std::vector<Candidate> FindSaves(const fs::path& dir) {
       std::error_code ec;
       if (!fs::exists(c.path / "player.sav", ec)) continue;
       c.folder = true;
+    } else if (Lower(c.name).size() > 6 && Lower(c.name).rfind(".pcsav") == Lower(c.name).size() - 6) {
+      // ME2 (2026-11-14): ME1 Legendary Edition saves (the "Char_NN.pcsav" LE1 writes at the end of the game).
+      std::vector<uint8_t> d;
+      if (!ReadAll(c.path, d) || !le1::LooksLikeLe1(d) || !le1::DisplayName(d, InflateZlib, Le1Options(), c.display)) {
+        REXLOG_WARN("[me1-import] {}: not an ME1 Legendary Edition save (or damaged); left out", c.name);
+        continue;
+      }
+      c.le1 = true;
     } else if (Lower(c.name).size() < 15 || Lower(c.name).rfind(".masseffectsave") != Lower(c.name).size() - 15) {
       if (!XboxPackage(c.path, c.display)) continue;
       c.package = true;
@@ -814,6 +843,16 @@ bool LoadSave(const Candidate& c, std::vector<File>& files, bool& pc, std::strin
     }
   } else if (c.package) {
     if (!ReadPackage(c.path, files, why)) return false;
+  } else if (c.le1) {
+    // ME2 (2026-11-14): LE1 -> ME1 Xbox player.sav + state.sav (already in the Xbox's byte order: pc stays false).
+    std::vector<uint8_t> d;
+    if (!ReadAll(c.path, d)) return why = "cannot read the file", false;
+    le1::Converted conv;
+    if (!le1::Convert(d, InflateZlib, Le1Options(), conv, why)) return why = "LE1: " + why, false;
+    REXLOG_INFO("[me1-import] {}: ME1 Legendary Edition save converted ({}; player.sav {} B, state.sav {} B)", c.name,
+                conv.summary, conv.player.size(), conv.state.size());
+    files.push_back(File{"player.sav", std::move(conv.player)});
+    files.push_back(File{"state.sav", std::move(conv.state)});
   } else {
     std::vector<uint8_t> d;
     if (!ReadAll(c.path, d)) return why = "cannot read the file", false;
@@ -908,7 +947,7 @@ bool PrepareCharacter(std::string& command_line) {
       break;
     }
   if (!pick) {
-    REXLOG_ERROR("[me1-import] no ME1 save to import{} (put .MassEffectSave files or Xbox save folders in {})",
+    REXLOG_ERROR("[me1-import] no ME1 save to import{} (put .MassEffectSave / LE1 .pcsav files or Xbox save folders in {})",
                  wanted.empty() ? "" : " named '" + wanted + "'", rex::path_to_utf8(dir));
     return false;
   }
@@ -1408,9 +1447,10 @@ struct GuestCalls {
   ~GuestCalls() { ctx = saved; }
   // FString(const TCHAR*) into the (zeroed) FString at 'at'.
   void String(uint32_t at, const std::string& value) {
-    const std::string v = value.substr(0, 300);
+    // ME2 (2026-11-14): UTF-8 decoded (an LE1 save's display name can be Cyrillic: "Джон Шепард : Уровень – 60").
+    const std::u16string v = rex::string::to_utf16(value).substr(0, 300);
     for (size_t i = 0; i <= v.size(); ++i) {
-      const uint16_t c = i < v.size() ? uint16_t(uint8_t(v[i])) : 0;
+      const uint16_t c = i < v.size() ? uint16_t(v[i]) : 0;
       base[text + 2 * i] = uint8_t(c >> 8);
       base[text + 2 * i + 1] = uint8_t(c);
     }

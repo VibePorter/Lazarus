@@ -50,10 +50,19 @@ namespace rex::audio {
 namespace {
 constexpr std::chrono::milliseconds kWorkerShutdownTimeout{500};
 std::atomic<HookBeforeFrame> g_hook_before_frame{nullptr};
+std::atomic<GuestVoiceProbe> g_guest_voice_probe{nullptr};
 }  // namespace
 
 void SetHookBeforeFrame(HookBeforeFrame hook) {
   g_hook_before_frame.store(hook, std::memory_order_release);
+}
+
+void SetGuestVoiceProbe(GuestVoiceProbe probe) {
+  g_guest_voice_probe.store(probe, std::memory_order_release);
+}
+
+GuestVoiceProbe GetGuestVoiceProbe() {
+  return g_guest_voice_probe.load(std::memory_order_acquire);
 }
 
 AudioSystem::AudioSystem(runtime::FunctionDispatcher* function_dispatcher)

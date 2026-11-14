@@ -116,6 +116,18 @@ void UploadRing::HandOff(std::vector<Range> &out) {
   }
 }
 
+void UploadRing::CleanNow(const UploadAllocation &alloc) {
+  if (!host_cached_ || !alloc || !alloc.size)
+    return;
+  for (Chunk &chunk : chunks_) {
+    if (chunk.buffer.get() != alloc.ref.ref)
+      continue;
+    const plume::RenderRange range(alloc.ref.offset, alloc.ref.offset + alloc.size);
+    chunk.buffer->unmap(0, &range);  // plume: cleans the range of a persistently mapped buffer
+    return;
+  }
+}
+
 uint64_t UploadRing::Bytes() const {
   uint64_t bytes = 0;
   for (const Chunk &chunk : chunks_)

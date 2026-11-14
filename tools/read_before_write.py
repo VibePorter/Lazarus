@@ -115,6 +115,12 @@ def uses_defs(s):
     if m and m.group(1) in idx:
         defs |= 1 << idx[m.group(1)]
         s2 = s2[len(m.group(1)):]
+    # Dunwall (2026-11-09): fp_compares_modeless writes fcmpu/fcmpo in VMX mode as rex::ppc::CompareAnyMode(crN, a, b),
+    # which sets crN (4 false reports: sub_82F8E460, sub_82F8E990, sub_82F90020, sub_82F901D8)
+    m = re.match(r'^rex::ppc::CompareAnyMode\((cr[0-7]),', s2)
+    if m and m.group(1) in idx:
+        defs |= 1 << idx[m.group(1)]
+        s2 = s2[m.end():]
     ms = re.match(r'^simde_mm_store\w*\(\(?(?:simde__m128i?\*\))?(' + REG + r')\.\w+,(.*)$', s2)
     if ms:
         defs |= 1 << idx[ms.group(1)]

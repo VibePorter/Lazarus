@@ -162,6 +162,7 @@ X_STATUS HostPathEntry::RenameEntryInternal(const std::vector<std::string_view>&
     return X_STATUS_ACCESS_DENIED;
   }
 
+  rex::filesystem::RenameTimestamp(host_path_, new_host_path);  // dunwall-nx: SetTimestampStore
   host_path_ = new_host_path;
   return X_STATUS_SUCCESS;
 }

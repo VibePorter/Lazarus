@@ -91,6 +91,15 @@ struct HostSurface {
   // only when nothing has. A stencil nothing writes is undefined either way (a depth resolve's words read it as is).
   std::vector<DepthImage::View> handover_views;
   uint32_t handed = 0;
+  // ME2 (2026-11-12, sa2_renut_clear_repeat, backported from the Dunwall port / sa2-nx / naruto-nx 7509546;
+  // render/draw.cpp ClearTargets): the last whole clear's values and the image (generation), writes and write order it
+  // left; a whole clear of the same values while these still hold writes nothing new.
+  bool clear_known = false;
+  uint64_t clear_generation = 0, clear_writes = 0, clear_write_seq = 0;
+  float clear_color[4] = {};
+  bool clear_depth_known = false, clear_stencil_known = false;
+  float clear_depth = 0.0f;
+  uint32_t clear_stencil = 0;
   bool stencil_used = false;
 
   // gpu_profile labels of draws with it as the first target: color only,
@@ -108,6 +117,8 @@ struct HostSurface {
 // LatchResolutionScaleLocked (at Swap) so a frame never mixes scales. Targets
 // and resolve destinations of another scale are rebuilt on their next use.
 RenderScale ResolutionScale();
+// me2-nx-deko (2026-11-07): how many times the render scale changed after the first latch (docked/handheld switches).
+uint64_t ResolutionChangesLocked();
 void LatchResolutionScaleLocked();
 // me2-nx-deko (2026-10-26, me2_renut_ui_height_*): the frame's final pass (tonemap, HUD, menus, the front buffer
 // resolve) at a finer scale than the scene. Before a draw gathers its targets: the pass starts when the draw's pixel

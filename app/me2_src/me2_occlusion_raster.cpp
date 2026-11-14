@@ -182,6 +182,20 @@ REXCVAR_DEFINE_DOUBLE(me2_occlusion_raster_recent_s, 0.25, "ME2",
                       "does not show (a closed door swapped out while it opens) stops occluding. 0 = every occluder")
     .range(0.0, 60.0)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_DOUBLE(me2_occlusion_raster_recent_abs_s, 0.0, "ME2",
+                      "me2_occlusion_raster_recent_s: an occluder the game has not rendered for this many seconds of "
+                      "the world's clock stops occluding as well (a still camera behind a hidden occluder: nothing "
+                      "behind it is rendered, so 'the newest among the candidates' never moves on). 0 = off (the "
+                      "default: written on 2026-11-14 on a hypothesis that was not the cause; untested otherwise)")
+    .range(0.0, 60.0)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(me2_occlusion_raster_drawn_frames, 0, "ME2",
+                     "Only occluders whose static mesh the game itself drew (base pass or depth pass) within this "
+                     "many frames: a mesh the game hides but keeps in its draw lists (a wall hidden for a cutscene "
+                     "camera) stops occluding. 0 = off (the default: written for the Liara apartment bug of "
+                     "2026-11-14, which turned out to be the near plane; untested otherwise)")
+    .range(0, 600)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(me2_occlusion_raster_reuse_max, 8, "ME2",
                      "me2_occlusion_raster_reuse: at most this many jobs in a row take the previous buffer (the "
                      "occluders' render times are not part of the reuse check)")
@@ -329,6 +343,35 @@ const uint8_t* g_base = nullptr;  // guest memory (trace reads after the test)
 uint32_t g_trace_next = 0;         // me2_occlusion_raster_trace: the next record of the ring
 uint32_t g_trace_frame_first = 0;  // g_trace_next at the frame's start (Me2RasterAfterView marks from here)
 std::vector<uint32_t> g_drawn_slots;  // the occluders rasterized this frame (trace: share the game drew)
+
+// 2026-11-14 (Lair of the Shadow Broker, Liara's apartment: a wall-sized slab, mesh id 95, filled the buffer and hid
+// the room behind it, while the game showed the room through it): a static mesh the game hides stays in the depth
+// draw lists, and its primitive's LastRenderTime keeps moving (Umbra / the native traversal report the primitive
+// visible; UE3 then draws none of its elements), so me2_occlusion_raster_recent_s cannot tell. What the game really
+// drew: the FStaticMesh of every static element draw of the base pass and the depth pass (me2_shadow_diag.cpp /
+// me2_cull_distance.cpp hooks -> Me2RasterNoteDrawn) with the frame, here. An occluder whose mesh the game has not
+// drawn for me2_occlusion_raster_drawn_frames frames does not occlude. Written by the UE3 render thread, read by the
+// rasterizer (the worker): a fixed table, 8 probes, the slot unused longest is taken over.
+struct DrawnSlot {
+  std::atomic<uint32_t> mesh{0};
+  std::atomic<uint32_t> frame{0};
+};
+constexpr uint32_t kDrawnBits = 15, kDrawnProbe = 8;
+DrawnSlot g_drawn_tab[1u << kDrawnBits];
+std::atomic<uint64_t> g_drawn_notes{0};
+inline uint32_t DrawnHome(uint32_t mesh) { return ((mesh >> 4) * 2654435761u) >> (32 - kDrawnBits); }
+// The frame the game last drew 'mesh' (low 32 bits of the frame counter); false = not in the table.
+bool DrawnFrame(uint32_t mesh, uint32_t& frame) {
+  const uint32_t home = DrawnHome(mesh);
+  for (uint32_t i = 0; i < kDrawnProbe; ++i) {
+    const DrawnSlot& s = g_drawn_tab[(home + i) & ((1u << kDrawnBits) - 1)];
+    if (s.mesh.load(std::memory_order_relaxed) == mesh) {
+      frame = s.frame.load(std::memory_order_relaxed);
+      return true;
+    }
+  }
+  return false;
+}
 uint32_t g_scene = 0, g_prepass_scene = 0;
 uint64_t g_scene_mismatch = 0;
 
@@ -622,7 +665,25 @@ void Walk(const uint8_t* base, uint32_t scene, uint64_t frame) {
 }
 
 // ---- rasterizer -------------------------------------------------------------------------------------------------
-constexpr float kNear = 1.0f;  // clip w below which a point counts as at the near plane (ME2's projection: near 10)
+// The near plane, as clip w. 2026-11-14 (Lair of the Shadow Broker, the security camera in Liara's apartment: the room
+// not drawn): this was a constant 1.0 while the game's projection clips at 10. That camera sits 4 units behind a wall
+// panel (mesh id 95); the GPU clips the panel away (RenderDoc pixel history: "depthClipped"), the rasterizer drew it
+// over the whole buffer and every instance behind it was "occluded". Occluders must be clipped exactly where the game
+// clips them: the projection's own near plane, read from each view-projection (NearOfVp, set by Rasterize); for the
+// box tests a larger near plane only answers "visible" more often.
+thread_local float t_near = 10.0f;
+// ME2's projection (row vectors): clip z = P22 * view z + P32, clip w = view z, so the view-projection's z column is
+// P22 times its w column plus (0, 0, 0, P32); the near plane (z = 0) is at w = -P32 / P22.
+float NearOfVp(const float* m) {
+  int k = 3;
+  if (std::fabs(m[7]) > std::fabs(m[k])) k = 7;
+  if (std::fabs(m[11]) > std::fabs(m[k])) k = 11;
+  if (!(std::fabs(m[k]) > 1e-6f)) return 10.0f;
+  const float p22 = m[k - 1] / m[k];
+  const float p32 = m[14] - p22 * m[15];
+  const float n = std::fabs(p22) > 1e-6f ? -p32 / p22 : 10.0f;
+  return std::isfinite(n) && n >= 1.0f && n <= 500.0f ? n : 10.0f;
+}
 
 struct V4 {
   float x, y, z, w;
@@ -751,7 +812,7 @@ void DrawClipTri(Buffer& b, const V4& v0, const V4& v1, const V4& v2, int cull, 
   const V4 in[3] = {v0, v1, v2};
   V4 poly[4];
   int n = 0;
-  const bool all_in = v0.w > kNear && v1.w > kNear && v2.w > kNear;
+  const bool all_in = v0.w > t_near && v1.w > t_near && v2.w > t_near;
   if (all_in) {
     poly[0] = v0;
     poly[1] = v1;
@@ -762,11 +823,11 @@ void DrawClipTri(Buffer& b, const V4& v0, const V4& v1, const V4& v2, int cull, 
     for (int i = 0; i < 3; ++i) {
       const V4& p = in[i];
       const V4& q = in[(i + 1) % 3];
-      const bool pin = p.w > kNear, qin = q.w > kNear;
+      const bool pin = p.w > t_near, qin = q.w > t_near;
       if (pin) poly[n++] = p;
       if (pin != qin) {
-        const float t = (kNear - p.w) / (q.w - p.w);
-        poly[n++] = {p.x + (q.x - p.x) * t, p.y + (q.y - p.y) * t, p.z + (q.z - p.z) * t, kNear};
+        const float t = (t_near - p.w) / (q.w - p.w);
+        poly[n++] = {p.x + (q.x - p.x) * t, p.y + (q.y - p.y) * t, p.z + (q.z - p.z) * t, t_near};
       }
     }
     if (n < 3) return;
@@ -840,6 +901,15 @@ bool HiddenAlready(const Buffer& b, const Candidate& c) {
 // Draws the cached occluders with view-projection vp into bufs[0] (and bufs[1] with the other winding when nb == 2).
 // Reads g_occ: the caller holds g_cache_mutex. Statistics go to *t_st.
 void Rasterize(const float* vp, const float cam[3], float lod_factor, Buffer* bufs, int nb) {
+  t_near = NearOfVp(vp);
+  {
+    static std::atomic<int> logged{0};
+    static std::atomic<float> last{0.0f};
+    if (std::fabs(last.load(std::memory_order_relaxed) - t_near) > 0.01f && logged.fetch_add(1) < 20) {
+      last.store(t_near, std::memory_order_relaxed);
+      REXLOG_INFO("[occlusion-raster] near plane {:.3f} units (from the view-projection)", t_near);
+    }
+  }
   static const uint64_t budget = uint64_t(REXCVAR_GET(me2_occlusion_raster_tris));
   static const float min_px_std = float(REXCVAR_GET(me2_occlusion_raster_min_px));
   static const float min_ppt_std = float(REXCVAR_GET(me2_occlusion_raster_min_px_per_tri));
@@ -891,12 +961,12 @@ void Rasterize(const float* vp, const float cam[3], float lod_factor, Buffer* bu
         return mid + spread + 1e-4f * (std::fabs(mid) + spread + 1.0f);
       };
       const float* m = vp;
-      // x + w < 0 (left), w - x < 0 (right), y + w < 0 (below), w - y < 0 (above), w - kNear <= 0 (near)
+      // x + w < 0 (left), w - x < 0 (right), y + w < 0 (below), w - y < 0 (above), w - t_near <= 0 (near)
       if (top(m[0] + m[3], m[4] + m[7], m[8] + m[11], m[12] + m[15]) < 0.0f ||
           top(m[3] - m[0], m[7] - m[4], m[11] - m[8], m[15] - m[12]) < 0.0f ||
           top(m[1] + m[3], m[5] + m[7], m[9] + m[11], m[13] + m[15]) < 0.0f ||
           top(m[3] - m[1], m[7] - m[5], m[11] - m[9], m[15] - m[13]) < 0.0f ||
-          top(m[3], m[7], m[11], m[15] - kNear) < 0.0f) {
+          top(m[3], m[7], m[11], m[15] - t_near) < 0.0f) {
         ++st.off;
         ++st.off_fast;
         continue;
@@ -911,7 +981,7 @@ void Rasterize(const float* vp, const float cam[3], float lod_factor, Buffer* bu
       out_r += p.x > p.w;
       out_b += p.y < -p.w;
       out_t += p.y > p.w;
-      if (p.w <= kNear) {
+      if (p.w <= t_near) {
         ++out_n;
         continue;
       }
@@ -949,10 +1019,21 @@ void Rasterize(const float* vp, const float cam[3], float lod_factor, Buffer* bu
   // then culled. Only candidates rendered recently by the game draw: LastRenderTime (primitive scene info +0xAC, the
   // world time it was last drawn) within recent_s of the newest among the candidates. A mesh just come on screen joins
   // one frame late (more draws, never fewer).
+  // 2026-11-14 (Lair of the Shadow Broker's opening shot in Liara's apartment: the room not drawn until the camera
+  // changed; 872 of ~1,155 instances a query occluded): "newest among the candidates" latches. With a still camera an
+  // occluder the game does not show hides everything behind it, nothing behind it is rendered, so no candidate's time
+  // moves on and the hidden occluder is never older than the newest (and with no time above 0, right after a load,
+  // the filter did not run at all). A candidate is now also dropped when its time is more than
+  // me2_occlusion_raster_recent_abs_s behind the world's clock (WorldInfo.TimeSeconds, the clock LastRenderTime is
+  // stamped from): whatever the game has not drawn for that long stops occluding, is then drawn if it is really
+  // there, and occludes again a frame later.
   static const float recent_s = float(REXCVAR_GET(me2_occlusion_raster_recent_s));
+  static const float recent_abs_s = float(REXCVAR_GET(me2_occlusion_raster_recent_abs_s));
   if (recent_s > 0.0f && g_base && !cands.empty()) {
     static std::vector<float> lrt;
-    lrt.assign(cands.size(), -1.0f);
+    static std::vector<uint8_t> known;
+    lrt.assign(cands.size(), 0.0f);
+    known.assign(cands.size(), 0);
     float newest = -1.0f;
     for (size_t i = 0; i < cands.size(); ++i) {
       const uint32_t psi = g_occ[cands[i].slot].psi;
@@ -960,13 +1041,26 @@ void Rasterize(const float* vp, const float cam[3], float lod_factor, Buffer* bu
       const float t = LF(g_base, psi + 0xAC);
       if (std::isfinite(t)) {
         lrt[i] = t;
+        known[i] = 1;
         newest = std::max(newest, t);
       }
     }
-    if (newest > 0.0f) {
+    float world_now = -1.0f;
+    if (recent_abs_s > 0.0f) {
+      const uint32_t a = Readable(0x833D60B0u, 4) ? L32(g_base, 0x833D60B0u) : 0;  // GEngine (me2_anim_lod.cpp)
+      const uint32_t b = Readable(a + 84, 4) ? L32(g_base, a + 84) : 0;
+      const uint32_t c = Readable(b + 60, 4) ? L32(g_base, b + 60) : 0;
+      const uint32_t d = Readable(c, 4) ? L32(g_base, c) : 0;
+      if (Readable(d + 776, 4)) {
+        const float t = LF(g_base, d + 776);
+        if (std::isfinite(t) && t > 0.0f) world_now = t;
+      }
+    }
+    if (newest > 0.0f || world_now > 0.0f) {
       size_t keep = 0;
       for (size_t i = 0; i < cands.size(); ++i) {
-        if (lrt[i] >= 0.0f && newest - lrt[i] > recent_s) {
+        if (known[i] && ((newest > 0.0f && newest - lrt[i] > recent_s) ||
+                         (world_now > 0.0f && world_now - lrt[i] > recent_abs_s))) {
           ++st.not_recent;
           continue;
         }
@@ -974,6 +1068,22 @@ void Rasterize(const float* vp, const float cam[3], float lod_factor, Buffer* bu
       }
       cands.resize(keep);
     }
+  }
+  // me2_occlusion_raster_drawn_frames (see g_drawn_tab): only meshes the game itself drew lately. Off until the hooks
+  // have noted a draw at all (a build / path without them keeps every occluder).
+  static const uint32_t drawn_frames = uint32_t(REXCVAR_GET(me2_occlusion_raster_drawn_frames));
+  if (drawn_frames > 0 && !cands.empty() && g_drawn_notes.load(std::memory_order_relaxed) != 0) {
+    const uint32_t now = uint32_t(g_sa2_game_frames.load(std::memory_order_relaxed));
+    size_t keep = 0;
+    for (size_t i = 0; i < cands.size(); ++i) {
+      uint32_t f = 0;
+      if (!DrawnFrame(g_occ[cands[i].slot].mesh, f) || now - f > drawn_frames) {
+        ++st.not_recent;
+        continue;
+      }
+      cands[keep++] = cands[i];
+    }
+    cands.resize(keep);
   }
   std::sort(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b) { return a.area > b.area; });
   uint64_t tris = 0;
@@ -1013,7 +1123,7 @@ void Rasterize(const float* vp, const float cam[3], float lod_factor, Buffer* bu
       const float32x4_t m8 = vdupq_n_f32(vp[8]), m9 = vdupq_n_f32(vp[9]), m10 = vdupq_n_f32(vp[10]), m11 = vdupq_n_f32(vp[11]);
       const float32x4_t m12 = vdupq_n_f32(vp[12]), m13 = vdupq_n_f32(vp[13]), m14 = vdupq_n_f32(vp[14]), m15 = vdupq_n_f32(vp[15]);
       const float32x4_t half = vdupq_n_f32(0.5f), one = vdupq_n_f32(1.0f), vw = vdupq_n_f32(W), vh = vdupq_n_f32(H);
-      const float32x4_t nearv = vdupq_n_f32(kNear);
+      const float32x4_t nearv = vdupq_n_f32(t_near);
       const float* src = o.v.data();
       for (; i0 + 4 <= nv; i0 += 4) {
         const float32x4x3_t p = vld3q_f32(src + 3 * i0);
@@ -1042,7 +1152,7 @@ void Rasterize(const float* vp, const float cam[3], float lod_factor, Buffer* bu
       clip[i] = p;
       ScreenVert& q = sv[i];
       q.out = uint32_t(p.x < -p.w) | uint32_t(p.x > p.w) << 1 | uint32_t(p.y < -p.w) << 2 |
-              uint32_t(p.y > p.w) << 3 | uint32_t(p.w <= kNear) << 4;
+              uint32_t(p.y > p.w) << 3 | uint32_t(p.w <= t_near) << 4;
       if (!(q.out & 16)) {
         const float iw = 1.0f / p.w;
         q.x = (p.x * iw * 0.5f + 0.5f) * W;
@@ -1074,7 +1184,45 @@ void Rasterize(const float* vp, const float cam[3], float lod_factor, Buffer* bu
 void Dump(uint64_t frame) {
   if (!g_cur) return;
   const Buffer& b = *g_cur;
-  if (FILE* f = std::fopen("occlusion_raster.pgm", "wb")) {
+  // 2026-11-14 (Liara's apartment): with me2_occlusion_raster_trace every dump keeps its own file and the occluders
+  // that own the most pixels are logged (what fills the buffer in a shot that lasts three seconds).
+  char dump_name[64] = "occlusion_raster.pgm";
+  if (!b.pix_id.empty()) {
+    std::snprintf(dump_name, sizeof(dump_name), "occlusion_raster_%06llu.pgm", static_cast<unsigned long long>(frame));
+    std::vector<uint32_t> px(g_occ.size(), 0);
+    uint32_t empty = 0;
+    for (size_t i = 0; i < b.pix_id.size() && i < b.pix.size(); ++i) {
+      if (!(b.pix[i] > 0.0f) || b.pix_id[i] >= px.size()) ++empty;
+      else ++px[b.pix_id[i]];
+    }
+    std::vector<uint32_t> order;
+    for (uint32_t s = 0; s < px.size(); ++s)
+      if (px[s]) order.push_back(s);
+    std::sort(order.begin(), order.end(), [&px](uint32_t a, uint32_t c) { return px[a] > px[c]; });
+    float world_now = -1.0f;
+    if (g_base) {
+      const uint32_t a = Readable(0x833D60B0u, 4) ? L32(g_base, 0x833D60B0u) : 0;
+      const uint32_t b2 = Readable(a + 84, 4) ? L32(g_base, a + 84) : 0;
+      const uint32_t c = Readable(b2 + 60, 4) ? L32(g_base, b2 + 60) : 0;
+      const uint32_t d = Readable(c, 4) ? L32(g_base, c) : 0;
+      if (Readable(d + 776, 4)) world_now = LF(g_base, d + 776);
+    }
+    REXLOG_INFO("[occlusion-raster] dump frame {}: {} of {} pixels empty, {} occluders own pixels; camera ({:.0f},{:.0f},"
+                "{:.0f}); world time {:.2f}",
+                frame, empty, b.pix.size(), order.size(), g_cam[0], g_cam[1], g_cam[2], world_now);
+    for (size_t k = 0; k < order.size() && k < 8; ++k) {
+      const Occluder& o = g_occ[order[k]];
+      const float lrt = g_base && o.psi && Readable(o.psi, 0xB0) ? LF(g_base, o.psi + 0xAC) : -1.0f;
+      uint32_t drawn_f = 0;
+      REXLOG_INFO("[occlusion-raster]   #{} {} px: mesh {:08X} id {} list {} cull {} {} tris, box [{:.0f},{:.0f},{:.0f}]-"
+                  "[{:.0f},{:.0f},{:.0f}], flags {:08X}, psi {:08X} last rendered {:.2f}, its mesh drawn by the game "
+                  "{} frames ago",
+                  k, px[order[k]], o.mesh, o.mesh_id, o.list, o.cull, o.tri.size() / 3, o.lo[0], o.lo[1], o.lo[2],
+                  o.hi[0], o.hi[1], o.hi[2], o.flags, o.psi, lrt,
+                  DrawnFrame(o.mesh, drawn_f) ? int64_t(uint32_t(frame) - drawn_f) : int64_t(-1));
+    }
+  }
+  if (FILE* f = std::fopen(dump_name, "wb")) {
     std::fprintf(f, "P5\n%d %d\n255\n", b.w, b.h);
     std::vector<uint8_t> row(size_t(b.w));
     for (int y = 0; y < b.h; ++y) {
@@ -1156,7 +1304,7 @@ uint8_t BoxCodeRect(const Buffer& b, const BoxPlanes& pl, const float* mn, const
     out_b += p.y < -p.w;
     out_t += p.y > p.w;
     behind += p.w <= 0.0f;
-    if (p.w <= kNear) {
+    if (p.w <= t_near) {
       near_cut = true;
       continue;
     }
@@ -1587,6 +1735,30 @@ extern "C" void Me2RasterFrame(const uint8_t* base, uint32_t scene, const float*
   }
 }
 
+// A static element draw of the game (base pass / depth pass): its FStaticMesh. UE3 render thread.
+extern "C" void Me2RasterNoteDrawn(uint32_t mesh) {
+  if (!mesh) return;
+  const uint32_t now = uint32_t(g_sa2_game_frames.load(std::memory_order_relaxed));
+  const uint32_t home = DrawnHome(mesh);
+  DrawnSlot* victim = nullptr;
+  uint32_t victim_age = 0;
+  for (uint32_t i = 0; i < kDrawnProbe; ++i) {
+    DrawnSlot& s = g_drawn_tab[(home + i) & ((1u << kDrawnBits) - 1)];
+    const uint32_t m = s.mesh.load(std::memory_order_relaxed);
+    if (m == mesh) {
+      s.frame.store(now, std::memory_order_relaxed);
+      return;
+    }
+    const uint32_t age = m ? now - s.frame.load(std::memory_order_relaxed) : 0xFFFFFFFFu;
+    if (!victim || age > victim_age) victim = &s, victim_age = age;
+  }
+  // The frame first: a reader that still sees the old mesh gets a newer frame for it for a moment (it occludes one
+  // frame longer), never an old frame for the new mesh.
+  victim->frame.store(now, std::memory_order_relaxed);
+  victim->mesh.store(mesh, std::memory_order_relaxed);
+  g_drawn_notes.fetch_add(1, std::memory_order_relaxed);
+}
+
 // me2_prepass.cpp's gameplay prepass hook: [renderer +0] there, to check sub_8274AA38's r6 is the same FScene.
 extern "C" void Me2RasterNotePrepassScene(uint32_t scene) {
   if (scene != g_prepass_scene) g_prepass_scene = scene;
@@ -1844,7 +2016,7 @@ uint8_t PreciseTest(const uint8_t* base, const Buffer& b, uint32_t verts_va, uin
   for (uint32_t i = 0; i < count; ++i) {
     const uint32_t a = verts_va + 12 * i;
     clip[i] = Xform(b.vp, LF(base, a), LF(base, a + 4), LF(base, a + 8));
-    in_front = in_front && clip[i].w > kNear;
+    in_front = in_front && clip[i].w > t_near;
   }
   // 2026-11-05: a closed box (Umbra's 8 corners, 12 triangles) wholly in front of the camera, so the camera is outside
   // it: its back faces lie behind its front faces over the same silhouette; only the front faces are tested. Front =
@@ -1904,11 +2076,11 @@ uint8_t PreciseTest(const uint8_t* base, const Buffer& b, uint32_t verts_va, uin
     for (int i = 0; i < 3; ++i) {
       const V4& p = in[i];
       const V4& q = in[(i + 1) % 3];
-      const bool pin = p.w > kNear, qin = q.w > kNear;
+      const bool pin = p.w > t_near, qin = q.w > t_near;
       if (pin) poly[n++] = p;
       if (pin != qin) {
-        const float u = (kNear - p.w) / (q.w - p.w);
-        poly[n++] = {p.x + (q.x - p.x) * u, p.y + (q.y - p.y) * u, p.z + (q.z - p.z) * u, kNear};
+        const float u = (t_near - p.w) / (q.w - p.w);
+        poly[n++] = {p.x + (q.x - p.x) * u, p.y + (q.y - p.y) * u, p.z + (q.z - p.z) * u, t_near};
       }
     }
     if (n < 3) continue;
@@ -1956,11 +2128,11 @@ uint8_t PreciseBox(const Buffer& b, const float* mn, const float* mx, float bias
       for (int i = 0; i < 3; ++i) {
         const V4& p = in[i];
         const V4& q = in[(i + 1) % 3];
-        const bool pin = p.w > kNear, qin = q.w > kNear;
+        const bool pin = p.w > t_near, qin = q.w > t_near;
         if (pin) poly[n++] = p;
         if (pin != qin) {
-          const float u = (kNear - p.w) / (q.w - p.w);
-          poly[n++] = {p.x + (q.x - p.x) * u, p.y + (q.y - p.y) * u, p.z + (q.z - p.z) * u, kNear};
+          const float u = (t_near - p.w) / (q.w - p.w);
+          poly[n++] = {p.x + (q.x - p.x) * u, p.y + (q.y - p.y) * u, p.z + (q.z - p.z) * u, t_near};
         }
       }
       if (n < 3) continue;
@@ -1992,7 +2164,7 @@ extern "C" uint8_t Me2RasterTest(const uint8_t* base, uint32_t verts_va, uint32_
   for (uint32_t i = 0; !code && i < count; ++i) {
     const uint32_t a = verts_va + 12 * i;
     const V4 p = Xform(b0.vp, LF(base, a), LF(base, a + 4), LF(base, a + 8));
-    if (p.w <= kNear) {
+    if (p.w <= t_near) {
       code = 3;
       break;
     }

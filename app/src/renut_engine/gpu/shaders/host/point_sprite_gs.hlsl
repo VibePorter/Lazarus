@@ -13,7 +13,7 @@ struct Vertex
 {
     float4 position : SV_Position;
     float4 texcoord[16] : TEXCOORD0;
-    float4 color[2] : COLOR0;
+    float4 color[6] : COLOR0;  // COLOR0-5 (XenosRecomp INTERPOLATORS); with 2, POINTCOORD sat 4 locations early
     float4 normal[3] : NORMAL0;
     float4 tangent : TANGENT0;
     float4 binormal : BINORMAL0;

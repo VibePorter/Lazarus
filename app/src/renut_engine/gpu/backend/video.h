@@ -29,7 +29,11 @@ namespace renut::gpu {
 
 constexpr uint32_t kFramesInFlight = 2;
 constexpr uint32_t kTextureDescriptorCount = 8192;
-constexpr uint32_t kSamplerDescriptorCount = 256;
+// Dunwall (2026-11-14): 256 -> 1024. Slots are never freed, and every Dunwall console session filled the 256
+// ("Sampler table full; falling back to linear clamp": each later sampler, wrap or point too, became linear clamp);
+// the progressive texture uploads (me2_renut_upload_budget_kb) add a sampler per resident level on top. deko3d's
+// texture handle carries the sampler id in 12 bits (up to 4096); Vulkan binds them as a bindless array.
+constexpr uint32_t kSamplerDescriptorCount = 1024;
 constexpr uint32_t kInvalidDescriptor = UINT32_MAX;
 
 // Fixed bindless slots. The table is shared by the 2D, 3D and cube arrays the

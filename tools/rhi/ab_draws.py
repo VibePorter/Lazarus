@@ -37,15 +37,16 @@ def main():
         last_t = t
         if sec_in == 0 or frames == 0:
             continue
-        e = slots.setdefault((run, slot), [off, 0, 0, 0])
+        e = slots.setdefault((run, slot), [off, 0, 0, 0, 0])
         e[1] += frames
         e[2] += draws
         e[3] += int(m.group(8) or 0)  # Begin*Vertices draws (Umbra test boxes)
+        e[4] += 1  # Dunwall (2026-11-09): seconds, for the frame rate
     keys = list(slots)
     per_cut = collections.defaultdict(list)
     skipped = collections.Counter()
     for i, k in enumerate(keys):
-        off, frames, draws, _ = slots[k]
+        off, frames, draws, _, _ = slots[k]
         if off == '-':
             continue
         prev = slots.get((k[0], k[1] - 1))
@@ -59,18 +60,22 @@ def main():
             skipped[off] += 1
             continue
         boxes = slots[k][3] / frames - (prev[3] / prev[1] + nxt[3] / nxt[1]) / 2
-        per_cut[off].append((base, draws / frames, boxes))
-    print('cut              pairs  all-on draws/f  cut-off draws/f  saved by the cut (draws/f, %)   test boxes saved/f   [pairs left out]')
-    for cut in sorted(per_cut, key=lambda c: -statistics.mean(o - b for b, o, _ in per_cut[c])):
+        fps_on = (prev[1] / prev[4] + nxt[1] / nxt[4]) / 2
+        per_cut[off].append((base, draws / frames, boxes, fps_on, frames / slots[k][4]))
+    print('cut              pairs  all-on draws/f  cut-off draws/f  saved by the cut (draws/f, %)   test boxes saved/f'
+          '   fps all-on / cut off   [pairs left out]')
+    for cut in sorted(per_cut, key=lambda c: -statistics.mean(p[1] - p[0] for p in per_cut[c])):
         pairs = per_cut[cut]
-        base = statistics.mean(b for b, _, _ in pairs)
-        offv = statistics.mean(o for _, o, _ in pairs)
-        saved = [o - b for b, o, _ in pairs]
-        boxes = statistics.mean(x for _, _, x in pairs)
+        base = statistics.mean(p[0] for p in pairs)
+        offv = statistics.mean(p[1] for p in pairs)
+        saved = [p[1] - p[0] for p in pairs]
+        boxes = statistics.mean(p[2] for p in pairs)
+        fps_on = statistics.mean(p[3] for p in pairs)
+        fps_off = statistics.mean(p[4] for p in pairs)
         sd = statistics.stdev(saved) if len(saved) > 1 else 0.0
-        print('%-16s %5d  %14.1f  %15.1f  %8.1f +- %5.1f  (%5.1f %%)   %10.1f          [%d]' %
+        print('%-16s %5d  %14.1f  %15.1f  %8.1f +- %5.1f  (%5.1f %%)   %10.1f          %5.1f / %5.1f        [%d]' %
               (cut, len(pairs), base, offv, statistics.mean(saved), sd, 100 * statistics.mean(saved) / base, boxes,
-               skipped[cut]))
+               fps_on, fps_off, skipped[cut]))
     for cut in sorted(set(skipped) - set(per_cut)):
         print('%-16s     0  (all %d pairs left out: view changed)' % (cut, skipped[cut]))
 

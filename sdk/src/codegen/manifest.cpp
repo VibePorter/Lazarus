@@ -222,6 +222,12 @@ bool ManifestConfig::WriteSdkVersionStamp(const std::filesystem::path& path,
     }
   }
 
+  // Dunwall (2026-11-12): already stamped with this version -> the file is left alone. Rewriting it every run made the
+  // manifest (an input of the build's codegen step, through its depfile) newer than codegen.build.stamp, written just
+  // before: ninja re-ran the generator and the post-codegen passes on every PC build (a full recompile each time).
+  if (stamp_idx && lines[*stamp_idx] == stamp_line) {
+    return true;
+  }
   if (stamp_idx) {
     lines[*stamp_idx] = stamp_line;
   } else if (project_header_idx) {

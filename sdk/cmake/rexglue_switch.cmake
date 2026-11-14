@@ -87,7 +87,7 @@ if(NOT TARGET rexglue_switch_startup)
     # queue and svcSleepThread) and the time the calling threads spend inside.
     target_link_options(rexglue_switch_startup INTERFACE
         "LINKER:--wrap=threadCreate,--wrap=threadClose"
-        "LINKER:--wrap=nvFenceWait,--wrap=nvGpuChannelKickoff,--wrap=nvMapCreate"
+        "LINKER:--wrap=nvFenceWait,--wrap=nvGpuChannelKickoff,--wrap=nvGpuChannelAppendEntry,--wrap=nvMapCreate"
         "LINKER:--wrap=nvAddressSpaceAllocFixed,--wrap=nvioctlNvhostAsGpu_MapBufferEx"
         "LINKER:--wrap=armDCacheClean,--wrap=nwindowQueueBuffer,--wrap=bqDequeueBuffer"
         "LINKER:--wrap=svcSleepThread")

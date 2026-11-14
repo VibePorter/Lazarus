@@ -13,7 +13,12 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <cstdlib>
+#include <ctime>
 #include <iostream>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -223,6 +228,141 @@ bool CreateEmptyFile(const std::filesystem::path& path) {
   return false;
 }
 
+// dunwall-nx (2026-11-10, SetTimestampStore): the times of the files under a root whose file system keeps none.
+// The store is text, one "<FILETIME> <path under the root>" line a file, rewritten whole after each write (a few
+// dozen lines: the saves and their folders).
+namespace {
+struct TimeStore {
+  std::mutex mutex;
+  std::string root;   // e.g. "me2save:/" (empty: off)
+  std::string store;  // e.g. "me2save:/.rex_times"
+  std::string store_name;
+  std::unordered_map<std::string, uint64_t> times;  // path under the root -> FILETIME
+};
+TimeStore& Times() {
+  static TimeStore t;
+  return t;
+}
+
+uint64_t UnixToFiletime(time_t unixtime) { return convertUnixtimeToWinFiletime(unixtime); }
+
+// The path under the root, or empty when it is not under it.
+std::string UnderRoot(const TimeStore& t, const std::filesystem::path& path) {
+  if (t.root.empty()) return {};
+  std::string s = path.lexically_normal().generic_string();
+  while (s.size() > 1 && s.back() == '/') s.pop_back();
+  if (s.size() <= t.root.size() || s.compare(0, t.root.size(), t.root) != 0) return {};
+  return s.substr(t.root.size());
+}
+
+void SaveLocked(const TimeStore& t) {
+  std::string text;
+  for (const auto& [rel, ft] : t.times) {
+    text += std::to_string(ft);
+    text += ' ';
+    text += rel;
+    text += '\n';
+  }
+  if (FILE* f = fopen(t.store.c_str(), "wb")) {
+    fwrite(text.data(), 1, text.size(), f);
+    fclose(f);
+  }
+}
+
+// A file under the root was written: it and its folders up to the root get the time now (the console's clock).
+void RecordWrite(const std::filesystem::path& path) {
+  TimeStore& t = Times();
+  std::lock_guard<std::mutex> lock(t.mutex);
+  std::string rel = UnderRoot(t, path);
+  if (rel.empty() || rel == t.store_name) return;
+  const uint64_t now = UnixToFiletime(time(nullptr));
+  for (;;) {
+    t.times[rel] = now;
+    const size_t slash = rel.rfind('/');
+    if (slash == std::string::npos) break;
+    rel.resize(slash);
+  }
+  SaveLocked(t);
+}
+
+// The stored time of a path with no time of its own (0 when there is none).
+uint64_t StoredTime(const std::filesystem::path& path) {
+  TimeStore& t = Times();
+  std::lock_guard<std::mutex> lock(t.mutex);
+  const std::string rel = UnderRoot(t, path);
+  if (rel.empty()) return 0;
+  auto it = t.times.find(rel);
+  return it == t.times.end() ? 0 : it->second;
+}
+
+void FillTimes(const std::filesystem::path& path, const struct stat& st, FileInfo& info) {
+  info.create_timestamp = UnixToFiletime(st.st_ctime);
+  info.access_timestamp = UnixToFiletime(st.st_atime);
+  info.write_timestamp = UnixToFiletime(st.st_mtime);
+  if (st.st_mtime == 0) {
+    if (const uint64_t stored = StoredTime(path)) {
+      info.create_timestamp = info.access_timestamp = info.write_timestamp = stored;
+    }
+  }
+}
+
+bool IsStoreFile(const std::filesystem::path& path) {
+  TimeStore& t = Times();
+  std::lock_guard<std::mutex> lock(t.mutex);
+  return !t.root.empty() && UnderRoot(t, path) == t.store_name;
+}
+}  // namespace
+
+void SetTimestampStore(const std::string& root, const std::string& store) {
+  TimeStore& t = Times();
+  std::lock_guard<std::mutex> lock(t.mutex);
+  t.root = root;
+  t.store = store;
+  t.times.clear();
+  t.store_name = UnderRoot(t, store);
+  size_t lines = 0;
+  if (FILE* f = fopen(store.c_str(), "rb")) {
+    std::string text;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) text.append(buf, n);
+    fclose(f);
+    size_t at = 0;
+    while (at < text.size()) {
+      size_t end = text.find('\n', at);
+      if (end == std::string::npos) end = text.size();
+      const std::string line = text.substr(at, end - at);
+      at = end + 1;
+      const size_t space = line.find(' ');
+      if (space == std::string::npos || space + 1 >= line.size()) continue;
+      const uint64_t ft = std::strtoull(line.c_str(), nullptr, 10);
+      if (ft) t.times[line.substr(space + 1)] = ft, ++lines;
+    }
+  }
+  REXLOG_INFO("[fs] file times under {} kept in {} (its file system has none): {} known", root, store, lines);
+}
+
+void RenameTimestamp(const std::filesystem::path& from, const std::filesystem::path& to) {
+  TimeStore& t = Times();
+  std::lock_guard<std::mutex> lock(t.mutex);
+  const std::string a = UnderRoot(t, from), b = UnderRoot(t, to);
+  if (a.empty() || b.empty()) return;
+  // The entry and everything under it (a renamed folder).
+  std::unordered_map<std::string, uint64_t> moved;
+  for (auto it = t.times.begin(); it != t.times.end();) {
+    if (it->first == a || (it->first.size() > a.size() && it->first.compare(0, a.size(), a) == 0 &&
+                           it->first[a.size()] == '/')) {
+      moved[b + it->first.substr(a.size())] = it->second;
+      it = t.times.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  if (moved.empty()) return;
+  for (auto& [k, v] : moved) t.times[k] = v;
+  SaveLocked(t);
+}
+
 class PosixFileHandle : public FileHandle {
  public:
   PosixFileHandle(std::filesystem::path path, int handle)
@@ -230,6 +370,7 @@ class PosixFileHandle : public FileHandle {
   ~PosixFileHandle() override {
     close(handle_);
     handle_ = -1;
+    if (written_) RecordWrite(path());  // SetTimestampStore
   }
   bool Read(size_t file_offset, void* buffer, size_t buffer_length,
             size_t* out_bytes_read) override {
@@ -249,13 +390,18 @@ class PosixFileHandle : public FileHandle {
       return false;
     }
     *out_bytes_written = static_cast<size_t>(out);
+    written_ = true;
     return true;
   }
-  bool SetLength(size_t length) override { return ftruncate(handle_, length) >= 0 ? true : false; }
+  bool SetLength(size_t length) override {
+    written_ = true;
+    return ftruncate(handle_, length) >= 0 ? true : false;
+  }
   void Flush() override { fsync(handle_); }
 
  private:
   int handle_ = -1;
+  bool written_ = false;
 };
 
 std::unique_ptr<FileHandle> FileHandle::OpenExisting(const std::filesystem::path& path,
@@ -303,9 +449,7 @@ bool GetInfo(const std::filesystem::path& path, FileInfo* out_info) {
     }
     out_info->path = path.parent_path();
     out_info->name = path.filename();
-    out_info->create_timestamp = convertUnixtimeToWinFiletime(st.st_ctime);
-    out_info->access_timestamp = convertUnixtimeToWinFiletime(st.st_atime);
-    out_info->write_timestamp = convertUnixtimeToWinFiletime(st.st_mtime);
+    FillTimes(path, st, *out_info);
     return true;
   }
   return false;
@@ -327,11 +471,10 @@ std::vector<FileInfo> ListFiles(const std::filesystem::path& path) {
     FileInfo info;
 
     info.name = ent->d_name;
-    struct stat st;
+    if (IsStoreFile(path / info.name)) continue;  // SetTimestampStore's file is not the game's
+    struct stat st = {};
     stat((path / info.name).c_str(), &st);
-    info.create_timestamp = convertUnixtimeToWinFiletime(st.st_ctime);
-    info.access_timestamp = convertUnixtimeToWinFiletime(st.st_atime);
-    info.write_timestamp = convertUnixtimeToWinFiletime(st.st_mtime);
+    FillTimes(path / info.name, st, info);
     info.path = path;
     if (ent->d_type == DT_DIR) {
       info.type = FileInfo::Type::kDirectory;

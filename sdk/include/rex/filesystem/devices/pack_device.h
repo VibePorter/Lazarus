@@ -77,7 +77,9 @@ class PackFile : public File {
   X_STATUS ReadSyncPack(std::span<uint8_t> buffer, size_t byte_offset, size_t* out_bytes_read);
 
   PackEntry* pack_entry_;
-  uint32_t readahead_id_ = 0;  // "pack:" + path, the range cache's id (0 = not asked yet)
+  // The read-ahead's and the range cache's id of this file: cache_prefix() + path, taken at open (2026-11-07; was a
+  // thread_local keyed by the entry's address, which a DLC pack's freed and reused entries could fool).
+  uint32_t cache_id_ = 0;
   // Small reads (<= half the window) are served from a window of the file, as asset_pack.c does per handle.
   std::mutex cache_mutex_;
   std::vector<uint8_t> cache_;
@@ -90,7 +92,9 @@ class PackDevice : public Device {
   PackDevice(const std::string_view mount_path, const std::filesystem::path& folder);
   ~PackDevice() override;
 
-  // The pack files of a data folder: <folder>.nxpack and <folder>.nxidx, next to it.
+  // The pack files of a data folder: <folder>/<name>.nxpack + .nxidx inside it when both are there (an SD card's
+  // game/ folder holding only the pack; split parts <name>.nxpack.N beside part 0), else <folder>.nxpack and
+  // <folder>.nxidx next to it.
   static std::filesystem::path PackPath(const std::filesystem::path& folder);
   static std::filesystem::path IndexPath(const std::filesystem::path& folder);
   static bool Exists(const std::filesystem::path& folder);
@@ -108,17 +112,24 @@ class PackDevice : public Device {
   uint32_t attributes() const override { return 0; }
   uint32_t component_name_max_length() const override { return 255; }
   uint32_t total_allocation_units() const override { return 128 * 1024; }
-  uint32_t available_allocation_units() const override { return 0; }
+  // ME2 backport from the Dunwall port (2026-11-09): free space as HostPathDevice reports it, not 0. A volume with
+  // no free space looks like the DVD to a game asking GetDiskFreeSpaceEx on GAME:.
+  uint32_t available_allocation_units() const override { return 128 * 1024; }
   uint32_t sectors_per_allocation_unit() const override { return 1; }
   uint32_t bytes_per_sector() const override { return 0x200; }
 
   PackStorage* storage() const { return storage_.get(); }
+  const std::shared_ptr<PackStorage>& shared_storage() const { return storage_; }
   size_t entry_count() const { return entry_count_; }
+  // "pack:<pack file>|": what the RAM caches' file ids start with. Several packs are mounted at once since the DLC
+  // packs (2026-11-07), and every DLC package has its own CookedXenon/Mount.dlc: the entry path alone is not unique.
+  const std::string& cache_prefix() const { return cache_prefix_; }
 
  private:
   std::string name_ = "PACK";
   std::filesystem::path folder_;
-  std::unique_ptr<PackStorage> storage_;
+  std::string cache_prefix_;
+  std::shared_ptr<PackStorage> storage_;
   std::unique_ptr<PackEntry> root_entry_;
   size_t entry_count_ = 0;
 };

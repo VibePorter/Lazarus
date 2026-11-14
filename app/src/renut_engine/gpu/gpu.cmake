@@ -199,17 +199,20 @@ function(renut_xenos_shader_cache TARGET)
     # first dumps the pixel shaders' HLSL (BANJO_HLSL_DUMP_ONLY), the pass gives the alpha-tested ones their early alpha
     # copy (self-checked against the original), the second compiles them (BANJO_HLSL_OVERRIDE). The dumps are game
     # data (build tree only). OFF: one run, as before.
+    # Dunwall (2026-11-08): how many shaders may fail to translate before the build stops (XenosRecomp leaves
+    # them out and lists them; the renderer logs a missing shader if the game uses one). 0 = any failure stops.
+    set(RENUT_SHADER_MAX_FAILURES "0" CACHE STRING "Shaders allowed to fail translation (XENOS_RECOMP_MAX_FAILURES)")
     option(BANJO_RENUT_EARLY_ALPHA "Early alpha copies in Renut's pixel shaders (tools/renut_early_alpha.py)" ON)
     set(early_alpha_dir "${RENUT_GPU_GEN_DIR}/early_alpha_hlsl")
     if(BANJO_RENUT_EARLY_ALPHA)
         set(early_alpha_commands
             COMMAND ${CMAKE_COMMAND} -E rm -rf "${early_alpha_dir}"
             COMMAND ${CMAKE_COMMAND} -E make_directory "${early_alpha_dir}"
-            COMMAND ${CMAKE_COMMAND} -E env BANJO_HLSL_DUMP_ONLY=1 "${recomp_exe}" "${RENUT_SHADER_DUMP_DIR}"
+            COMMAND ${CMAKE_COMMAND} -E env BANJO_HLSL_DUMP_ONLY=1 "XENOS_RECOMP_MAX_FAILURES=${RENUT_SHADER_MAX_FAILURES}" "${recomp_exe}" "${RENUT_SHADER_DUMP_DIR}"
                     "${RENUT_GPU_GEN_DIR}/early_alpha_pass1.cpp" "${RENUT_SHADER_COMMON_DIR}/shader_common.h"
                     "${early_alpha_dir}"
             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/../tools/renut_early_alpha.py" "${early_alpha_dir}")
-        set(early_alpha_env ${CMAKE_COMMAND} -E env "BANJO_HLSL_OVERRIDE=${early_alpha_dir}")
+        set(early_alpha_env "BANJO_HLSL_OVERRIDE=${early_alpha_dir}")
         set(early_alpha_depends "${CMAKE_SOURCE_DIR}/../tools/renut_early_alpha.py"
                                 "${CMAKE_SOURCE_DIR}/../tools/early_alpha.py")
     else()
@@ -224,9 +227,15 @@ function(renut_xenos_shader_cache TARGET)
                 -P "${CMAKE_SOURCE_DIR}/cmake/collect_captured_shaders.cmake"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${RENUT_GPU_GEN_DIR}"
         ${early_alpha_commands}
-        COMMAND ${early_alpha_env} "${recomp_exe}" "${RENUT_SHADER_DUMP_DIR}" "${cache_cpp}"
+        COMMAND ${CMAKE_COMMAND} -E env ${early_alpha_env} "XENOS_RECOMP_MAX_FAILURES=${RENUT_SHADER_MAX_FAILURES}"
+                "${recomp_exe}" "${RENUT_SHADER_DUMP_DIR}" "${cache_cpp}"
                 "${RENUT_SHADER_COMMON_DIR}/shader_common.h"
-        DEPENDS renut_xenos_recomp "${recomp_exe}" "${RENUT_SHADER_COMMON_DIR}/shader_common.h"
+        # Dunwall (2026-11-08): the translator's executable, not its target. renut_xenos_recomp builds with
+        # BUILD_ALWAYS, and a dependency on that target made Ninja re-run this whole translation (~45,000 shaders,
+        # 10-17 min) at every build, even after a C++-only change. The executable is the step's byproduct, so Ninja
+        # re-checks its time after the always-run step and translates again only when it was relinked, or when
+        # shader_common.h, the containers or the captures changed.
+        DEPENDS "${recomp_exe}" "${RENUT_SHADER_COMMON_DIR}/shader_common.h"
                 "${CMAKE_SOURCE_DIR}/cmake/collect_captured_shaders.cmake"
                 ${dump_outputs} ${shader_inputs} ${captured_inputs} ${early_alpha_depends}
         COMMENT "Recompiling Xenos shaders (RENUT_RECOMP) from ${RENUT_SHADER_DUMP_DIR}"
@@ -234,6 +243,7 @@ function(renut_xenos_shader_cache TARGET)
 
     # 3. Compile into the executable.
     add_custom_target(renut_shader_cache_gen DEPENDS "${cache_cpp}")
+    add_dependencies(renut_shader_cache_gen renut_xenos_recomp)  # order only (see DEPENDS above)
     add_dependencies(${TARGET} renut_shader_cache_gen)
     target_sources(${TARGET} PRIVATE "${cache_cpp}")
     # The generated file is large and only holds byte arrays.

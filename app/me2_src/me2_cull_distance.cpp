@@ -322,16 +322,23 @@ extern "C" double me2_cull_max_distance_sq(double max_sq, uint32_t compact, uint
   return d2;
 }
 
+extern "C" void Me2RasterNoteDrawn(uint32_t mesh);  // me2_occlusion_raster.cpp (me2_occlusion_raster_drawn_frames)
+static void NoteDepthElement(uint32_t element, const uint8_t* base) {
+  if (element >= 0x10000u && element < 0xF0000000u)
+    Me2RasterNoteDrawn(__builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + element + 4)));
+}
 REX_EXTERN(__imp__sub_826A07E8);
 REX_HOOK_RAW(sub_826A07E8) {
   if (PrepassSkip(ctx.r4.u32, base))
     return;
+  NoteDepthElement(ctx.r4.u32, base);
   __imp__sub_826A07E8(ctx, base);
 }
 REX_EXTERN(__imp__sub_826A08D0);
 REX_HOOK_RAW(sub_826A08D0) {
   if (PrepassSkip(ctx.r4.u32, base))
     return;
+  NoteDepthElement(ctx.r4.u32, base);
   __imp__sub_826A08D0(ctx, base);
 }
 

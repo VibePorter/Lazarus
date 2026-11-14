@@ -175,9 +175,12 @@ inline void RenderThreadLayoutOnce() {
 }
 }  // namespace
 
+extern "C" void Me2LoadShaderConstantBlocks(uint8_t* base, uint32_t device);  // me2_constant_blocks.cpp
+
 REX_EXTERN(__imp__sub_82A9F3C0);
 REX_HOOK_RAW(sub_82A9F3C0) {  // D3DDevice_DrawIndexedVertices (UE3's RHI sub_826AC170, sub_827DBE38)
   RenderThreadLayoutOnce();
+  Me2LoadShaderConstantBlocks(base, ctx.r3.u32);
   DiagPrepassStack(ctx, base, "DrawIndexedVertices");
   SA2_RENUT_YIELD_SHARED(sub_82A9F3C0);
   __imp__sub_82A9F3C0(ctx, base);
@@ -187,6 +190,7 @@ REX_HOOK_RAW(sub_82A9F3C0) {  // D3DDevice_DrawIndexedVertices (UE3's RHI sub_82
 
 REX_EXTERN(__imp__sub_82A9EFD0);
 REX_HOOK_RAW(sub_82A9EFD0) {  // D3DDevice_DrawVertices (sub_826913A0)
+  Me2LoadShaderConstantBlocks(base, ctx.r3.u32);
   DiagPrepassStack(ctx, base, "DrawVertices");
   SA2_RENUT_YIELD_SHARED(sub_82A9EFD0);
   __imp__sub_82A9EFD0(ctx, base);

@@ -87,8 +87,11 @@ struct PipelineKey {
   int32_t depth_bias;
   uint32_t depth_bias_slope;
   uint32_t depth_bias_clamp;  // float bits: the guest's offset as an absolute depth (see MakeKey)
-  uint32_t reserved;  // 0 (the key is compared and hashed as bytes)
+  uint32_t reserved;  // 0 (the key is compared and hashed as bytes); bits: 0 / 1 the A/B halves, 2 kKeyDynamicBias
 };
+// ME2 (2026-11-12, me2_renut_poly_offset_dynamic, backported from the Dunwall port): the draw sets the depth bias (the
+// polygon offset) itself; the key's depth_bias fields are 0 and the pipeline is built with a dynamic bias.
+constexpr uint32_t kKeyDynamicBias = 4u;
 
 // banjo-nx (banjo_gpu_blend_skip): for the key's other fields, 1 when its one target keeps its value for a source alpha
 // of 0 or less, 2 when it does for a whole source of 0 or less, 0 otherwise (shader_common.h, banjoBlendSkip).

@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <fstream>
 #include <iomanip>
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
@@ -144,29 +145,68 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
   // It only shows data: no navigation and no focus when it appears. On Switch
   // the menus are driven with the game controller, and opening this overlay
   // (L+R+Up) must not take the controller away while driving.
+  // AlwaysAutoResize (2026-11-14): the window fits the lines and the frame graph it shows.
   if (ImGui::Begin("Debug##overlay", nullptr,
                    ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoNavInputs |
-                       ImGuiWindowFlags_NoFocusOnAppearing)) {
+                       ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_AlwaysAutoResize)) {
 #if REX_PLATFORM_SWITCH
     PositionAfterBegin(io);
 #endif
+    bool provider_graph = false;
     if (stats_provider_) {
       auto stats = stats_provider_();
       if (stats.frame_count > 0) {
-        ImGui::Text("Guest: %.1f FPS (%.2f ms)", stats.fps, stats.frame_time_ms);
+        if (stats.worst_ms > 0.0)
+          ImGui::Text("Guest: %.1f FPS (%.2f ms, worst %.1f ms)", stats.fps, stats.frame_time_ms,
+                      stats.worst_ms);
+        else  // ME2 (2026-11-14): a provider that does not fill the detail fields (ME2's) shows the line as before
+          ImGui::Text("Guest: %.1f FPS (%.2f ms)", stats.fps, stats.frame_time_ms);
+        // Dunwall (2026-11-14): where the frame's time goes, when the provider knows.
+        char line[160];
+        int used = 0;
+        const auto part = [&](const char* name, double ms) {
+          if (ms >= 0.0 && used < static_cast<int>(sizeof(line)))
+            used += std::snprintf(line + used, sizeof(line) - used, "%s%s %.1f ms", used ? "  " : "",
+                                  name, ms);
+        };
+        part("CPU", stats.cpu_ms);
+        part("GPU", stats.gpu_ms);
+        part("Render", stats.render_thread_ms);
+        if (used > 0)
+          ImGui::TextUnformatted(line);
+      }
+      // The last frames' lengths. The scale grows past 50 ms when a frame is longer; the 33.3 ms
+      // (30 fps) line is the game's own target.
+      if (!stats.frame_history_ms.empty()) {
+        provider_graph = true;
+        const auto& h = stats.frame_history_ms;
+        const float peak = *std::max_element(h.begin(), h.end());
+        const float scale = std::max(50.0f, std::ceil(peak / 25.0f) * 25.0f);
+        char label[48];
+        std::snprintf(label, sizeof(label), "frame ms (0-%.0f)", scale);
+        const ImVec2 graph_size(300.0f, 70.0f);
+        ImGui::PlotLines("##frames", h.data(), static_cast<int>(h.size()), 0, label, 0.0f, scale,
+                         graph_size);
+        const ImVec2 lo = ImGui::GetItemRectMin();
+        const ImVec2 hi = ImGui::GetItemRectMax();
+        const float y30 = hi.y - (hi.y - lo.y) * (33.333f / scale);
+        ImGui::GetWindowDrawList()->AddLine(ImVec2(lo.x, y30), ImVec2(hi.x, y30),
+                                            IM_COL32(80, 200, 120, 160));
       }
     }
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
     ImGui::Separator();
 
-    // Frame time graph
-    auto ft_us = rex::perf::GetSnapshotCounter(rex::perf::CounterId::kFrameTimeUs);
-    float ft_ms = static_cast<float>(ft_us) / 1000.0f;
-    frame_time_history_[frame_history_idx_] = ft_ms;
-    frame_history_idx_ = (frame_history_idx_ + 1) % kFrameHistorySize;
-    ImGui::PlotLines("##ft", frame_time_history_.data(), kFrameHistorySize,
-                     static_cast<int>(frame_history_idx_), "Frame (ms)", 0.0f, 50.0f,
-                     ImVec2(200, 40));
+    // Frame time graph (the SDK's own counter; the provider's graph above replaces it)
+    if (!provider_graph) {
+      auto ft_us = rex::perf::GetSnapshotCounter(rex::perf::CounterId::kFrameTimeUs);
+      float ft_ms = static_cast<float>(ft_us) / 1000.0f;
+      frame_time_history_[frame_history_idx_] = ft_ms;
+      frame_history_idx_ = (frame_history_idx_ + 1) % kFrameHistorySize;
+      ImGui::PlotLines("##ft", frame_time_history_.data(), kFrameHistorySize,
+                       static_cast<int>(frame_history_idx_), "Frame (ms)", 0.0f, 50.0f,
+                       ImVec2(200, 40));
+    }
 
     // GPU
     ImGui::Text("Draw: %" PRId64 "  Stalls: %" PRId64 "  Verts: %" PRId64,
