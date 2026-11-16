@@ -96,3 +96,5 @@ __pycache__/
 
 # A personal ME1 save (the LE1 import template); generate your own, see app/me2_src/me2_me1_le1.cpp
 /app/me2_src/me2_me1_le1_template.inc
+# Derived from the game's BIOG_MORPH_FACE.xxx (game data); generate it with tools/me2_me1_face_tables.py
+/app/me2_src/me2_me1_le1_faces.inc

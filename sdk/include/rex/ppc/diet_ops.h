@@ -13,6 +13,23 @@
 
 #include <rex/platform/fpscr.h>
 
+// ME2 (2026-11-15, renut_nx_ultimate_base's CG-13, blur-nx BLUR_FPCR_ONE_MODE): with REX_PPC_FIXED_FLUSH (rex/ppc/
+// context.h: on the Switch flush-to-zero stays on for all guest code, since 2026-10-27) the any-mode forms below are the
+// plain operations: their denormal tests and cold paths (which cleared the flush mode for one operation) only kept
+// scalar denormals exact in a build that flushes them everywhere else. The PC (REX_PPC_FIXED_FLUSH 0) keeps them.
+#ifndef REX_PPC_FIXED_FLUSH
+#if defined(__SWITCH__)
+#define REX_PPC_FIXED_FLUSH 1
+#else
+#define REX_PPC_FIXED_FLUSH 0
+#endif
+#endif
+#if REX_PPC_FIXED_FLUSH
+#define REX_ONE_MODE_PLAIN(...) return __VA_ARGS__
+#else
+#define REX_ONE_MODE_PLAIN(...) ((void)0)
+#endif
+
 #include <simde/x86/sse2.h>
 
 // PC diagnostic (sa2-nx, 2026-10-12): how often the any-mode helpers below run, and how often they take a cold path.
@@ -259,6 +276,7 @@ template <typename CR>
 /// lfs: the single's bits to the double register value. A denormal single (exponent 0, fraction not 0) takes the
 /// slow path; zero, normal, infinite and NaN inputs convert the same in either mode.
 inline double SingleToDoubleAnyMode(uint32_t bits) noexcept {
+  REX_ONE_MODE_PLAIN(double(std::bit_cast<float>(bits)));
   REX_DIET_CENSUS(0);
   if (uint32_t((bits & 0x7FFFFFFFu) - 1u) < 0x007FFFFFu) [[unlikely]] {
     REX_DIET_CENSUS(3);
@@ -271,6 +289,7 @@ inline double SingleToDoubleAnyMode(uint32_t bits) noexcept {
 /// double) takes the slow path: only there can the result be tiny. From FLT_MIN up, and for zero, infinity and NaN,
 /// neither an input flush nor an output flush can apply, on AArch64 (tininess before rounding) or x86 (after).
 inline float DoubleToSingleAnyMode(double d) noexcept {
+  REX_ONE_MODE_PLAIN(float(d));
   REX_DIET_CENSUS(0);
   const uint64_t a = std::bit_cast<uint64_t>(d) & 0x7FFFFFFFFFFFFFFFull;
   if (a - 1u < 0x3810000000000000ull - 1u) [[unlikely]] {
@@ -293,6 +312,10 @@ inline bool IsDenormalDouble(double d) noexcept {
 /// a denormal double the answer is the same in either mode. Those compare in the cold helper with the mode cleared.
 template <typename CR>
 inline void CompareAnyMode(CR& cr, double a, double b) noexcept {
+#if REX_PPC_FIXED_FLUSH
+  cr.compare(a, b);
+  return;
+#endif
   REX_DIET_CENSUS(1);
   if (IsDenormalDouble(a) || IsDenormalDouble(b)) [[unlikely]] {
     REX_DIET_CENSUS(3);
@@ -304,6 +327,7 @@ inline void CompareAnyMode(CR& cr, double a, double b) noexcept {
 
 /// frsp: the stfs conversion followed by the lfs one, each exact in either mode (above).
 inline double RoundToSingleAnyMode(double d) noexcept {
+  REX_ONE_MODE_PLAIN(double(float(d)));
   return SingleToDoubleAnyMode(std::bit_cast<uint32_t>(DoubleToSingleAnyMode(d)));
 }
 
@@ -319,6 +343,7 @@ inline double RoundToSingleAnyMode(double d) noexcept {
 ///     dividend) and recomputed otherwise;
 ///   - the rounding to single and the widening back: RoundToSingleAnyMode (above).
 inline double AddSingleAnyMode(double a, double b) noexcept {
+  REX_ONE_MODE_PLAIN(double(float(a + b)));
   REX_DIET_CENSUS(2);
   if (IsDenormalDouble(a) || IsDenormalDouble(b)) [[unlikely]] return detail::AddSingleSlow(a, b);
   const double d = a + b;
@@ -326,6 +351,7 @@ inline double AddSingleAnyMode(double a, double b) noexcept {
   return RoundToSingleAnyMode(d);
 }
 inline double SubSingleAnyMode(double a, double b) noexcept {
+  REX_ONE_MODE_PLAIN(double(float(a - b)));
   REX_DIET_CENSUS(2);
   if (IsDenormalDouble(a) || IsDenormalDouble(b)) [[unlikely]] return detail::SubSingleSlow(a, b);
   const double d = a - b;
@@ -333,6 +359,7 @@ inline double SubSingleAnyMode(double a, double b) noexcept {
   return RoundToSingleAnyMode(d);
 }
 inline double MulSingleAnyMode(double a, double b) noexcept {
+  REX_ONE_MODE_PLAIN(double(float(a * b)));
   REX_DIET_CENSUS(2);
   if (IsDenormalDouble(a) || IsDenormalDouble(b)) [[unlikely]] return detail::MulSingleSlow(a, b);
   const double d = a * b;
@@ -340,6 +367,7 @@ inline double MulSingleAnyMode(double a, double b) noexcept {
   return RoundToSingleAnyMode(d);
 }
 inline double DivSingleAnyMode(double a, double b) noexcept {
+  REX_ONE_MODE_PLAIN(double(float(a / b)));
   REX_DIET_CENSUS(2);
   if (IsDenormalDouble(a) || IsDenormalDouble(b)) [[unlikely]] return detail::DivSingleSlow(a, b);
   const double d = a / b;

@@ -120,6 +120,7 @@ REX_EXTERN(__imp__sub_82AA5238);
 REX_HOOK_RAW(sub_82AA5238) {  // D3DDevice_Swap (called by UE3's RHI sub_827DE208 after SynchronizeToPresentationInterval)
   Me2AbTick();  // me2-nx-deko (2026-11-04): the draw-count rotation (me2_ab_cycle.cpp)
   Me2CompositeLightsTick(base);  // me2-nx-deko (2026-11-06): CompositeDynamicLights (me2_ab_cycle.cpp)
+  Me2TilingTick(base);  // me2-nx-deko (2026-11-15): UE3's tiling flag (me2_ab_cycle.cpp)
   Me2CerberusOnSwap(base);  // me2_cerberus.cpp (before the yield: with Renut it returns from here)
   SA2_RENUT_YIELD_SHARED(sub_82AA5238);
   __imp__sub_82AA5238(ctx, base);

@@ -931,7 +931,20 @@ REX_HOOK_RAW(sub_8287A818) {
   __imp__sub_8287A818(ctx, base);
   t_gc_caller = outer;
 }
-ME2_GC_CALLER(8297C628)
+// sub_8297C628 = the ME1 import (opens the saved game, reads player.sav / state.sav; 1 = imported). me2_me1_import.cpp
+// may answer 1 without it, once (the load screen's command when the prologue imports instead).
+extern "C" bool me2_me1_import_skip_menu_load();
+REX_EXTERN(__imp__sub_8297C628);
+REX_HOOK_RAW(sub_8297C628) {
+  if (me2_me1_import_skip_menu_load()) {
+    ctx.r3.u64 = 1;
+    return;
+  }
+  const uint32_t outer = t_gc_caller;
+  t_gc_caller = 0x8297C628u;
+  __imp__sub_8297C628(ctx, base);
+  t_gc_caller = outer;
+}
 ME2_GC_CALLER(829F6990)
 ME2_GC_CALLER(829FA268)
 #undef ME2_GC_CALLER

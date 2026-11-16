@@ -42,6 +42,12 @@ void FreeRaw(void *host);
 void Register(u32 guest_va, RecordKind kind);
 void Unregister(u32 guest_va);
 bool Lookup(u32 guest_va, RecordKind *out_kind);
+
+// ME2 (2026-11-15, rr6_records_lockfree, from rr6-nx through renut_nx_ultimate_base port 47): the lock-free table over
+// the record heap. MarkOwned keeps resource.cpp's owned headers in it (called under that set's lock: true when one is
+// added, false only when one was erased). OwnedFast: 1 or 0, or -1 when the locked set must answer.
+void MarkOwned(u32 guest_va, bool owned);
+int OwnedFast(u32 guest_va);
 // Changes whenever a record is unregistered: lookups cached under an older
 // value may name a destroyed record.
 uint64_t Generation();

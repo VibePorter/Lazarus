@@ -26,6 +26,7 @@ enum class Me2Ab : int {
   kOcclNoWaitShadow,  // me2_occlusion_nowait_shadows (off = a late hidden shadow result is waited for)
   kRasterLean,
   kDeltaRaw,         // me2_renut_watch_raw (off = the marked chunks compared on the UE3 render thread, as before)       // me2_occlusion_raster_lean limits (off = me2_occlusion_raster_min_px / _min_px_per_tri)
+  kTiling,          // me2_game_tiling 0: UE3's two-tile base pass off (off slot = the game's value, tiled)
   kCount
 };
 
@@ -39,3 +40,6 @@ void Me2AbTick();
 // me2-nx-deko (2026-11-06): once a frame after Me2AbTick (the Swap hook): UE3's CompositeDynamicLights as
 // me2_composite_lights and the rotation want it.
 void Me2CompositeLightsTick(unsigned char* base);
+// me2-nx-deko (2026-11-15): once a frame (the Swap hook, UE3's render thread between frames): UE3's tiling flag as
+// me2_game_tiling and the rotation want it.
+void Me2TilingTick(unsigned char* base);

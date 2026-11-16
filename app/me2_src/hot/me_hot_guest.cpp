@@ -159,6 +159,22 @@ void Check(Hook& h, PPCContext& ctx, uint8_t* base) {
     h.orig(ctx, base);
     return;
   }
+  // ME2 (2026-11-15): another guest thread writing a declared range between the private copy below and the original's
+  // run makes the two results differ with a correct native (n_827DB818: device +10552 commit word, console 2026-11-07,
+  // and a bit-56 dirty mismatch 11-06: a second thread's render-state reset sub_827D8738 is the suspect). The declared
+  // bytes are taken here and compared again right before the original: changed -> the check is skipped ("raced"), the
+  // native stays on. A difference with unchanged inputs still switches it off.
+  uint8_t before[512];
+  uint32_t before_len = 0;
+  bool can_race_check = true;
+  for (int i = 0; i < w.n && can_race_check; ++i) {
+    if (before_len + w.r[i].len > sizeof(before)) {
+      can_race_check = false;
+      break;
+    }
+    std::memcpy(before + before_len, base + w.r[i].addr, w.r[i].len);
+    before_len += w.r[i].len;
+  }
   // Private copy of the declared ranges; guest memory is only read here.
   ShadowView view;
   std::vector<uint8_t> storage;
@@ -177,8 +193,27 @@ void Check(Hook& h, PPCContext& ctx, uint8_t* base) {
   const uint32_t hw_native = nat.fpscr.getcsr();
   ctx.fpscr.setcsr(hw_before);
   ctx.fpscr.csr = csr_before;
+  uint32_t raced_at = 0;
+  if (can_race_check && handled) {
+    for (int i = 0, off = 0; i < w.n && !raced_at; off += int(w.r[i].len), ++i)
+      if (std::memcmp(before + off, base + w.r[i].addr, w.r[i].len) != 0)
+        for (uint32_t k = 0; k < w.r[i].len; ++k)
+          if (before[off + k] != base[w.r[i].addr + k]) {
+            raced_at = w.r[i].addr + k;
+            break;
+          }
+  }
   h.orig(ctx, base);  // the call for real: the only writer of guest memory
   if (!handled) return;  // declined: the original ran, nothing to compare
+  if (raced_at) {
+    static std::atomic<uint32_t> raced{0};
+    const uint32_t n = raced.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 8 || (n & 255) == 0)
+      REXLOG_WARN("[hot] {}: check skipped ({} so far): guest byte {:#010x} changed by another thread before the original "
+                  "ran (a race, not a difference of the native); the native stays on",
+                  h.name, n, raced_at);
+    return;
+  }
   const uint32_t hw_orig = ctx.fpscr.getcsr();
 
   std::string diff = CompareRegs(h.cmp, nat, ctx);

@@ -54,6 +54,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <atomic>
 #include <filesystem>
 #include <optional>
 #include <span>
@@ -88,7 +89,22 @@ static bool InflateZlib(const uint8_t* in, size_t in_size, uint8_t* out, size_t 
 REXCVAR_DEFINE_STRING(me2_me1_import_le1_latin_names, "auto", "ME2",
                       "ME1 Legendary Edition saves: the first name in Latin letters (the default Джон / Джейн -> John / "
                       "Jane, other Cyrillic transliterated). auto = only when the game is not in Russian (user_language "
-                      "12; the other languages' fonts have no Cyrillic: squares); on; off = as LE1 stored it");
+                      "12, or a game_overlay_root with BIOGame_RUS.tlk; the other languages' fonts have no Cyrillic: squares); on; off = as LE1 stored it");
+REXCVAR_DEFINE_BOOL(me2_me1_import_preload, true, "ME2",
+                    "ME1 import: load the hair / face texture packages the save refers to before importing (as the "
+                    "Xbox's prologue has them loaded); false = import as is (custom faces lose their hair textures)");
+REXCVAR_DEFINE_BOOL(me2_me1_import_le1_skin_map, true, "ME2",
+                    "ME1 Legendary Edition saves: the skin tone moved onto ME1 / ME2's skin palette, keeping its "
+                    "lightness (LE1's own tones render pale grey on ME2's face texture); false = as LE1 stored it");
+REXCVAR_DEFINE_BOOL(me2_me1_import_le1_makeup_map, true, "ME2",
+                    "ME1 Legendary Edition saves: blush / lips / eye shadow / brow strengths as ME2's creator pairs "
+                    "them with the stored colour preset (LE1's go past ME2's range: heavy blush); false = as stored");
+REXCVAR_DEFINE_BOOL(me2_me1_import_le1_hair_map, true, "ME2",
+                    "ME1 Legendary Edition saves: a hair colour beyond ME2's presets (LE1's vivid red) toned into their "
+                    "saturation / brightness range, hue kept; false = as stored");
+REXCVAR_DEFINE_BOOL(me2_me1_import_le1_face, true, "ME2",
+                    "ME1 Legendary Edition saves: carry the custom face over (hair, sliders, vertices, skin / eye / "
+                    "hair colours); false = the default face of the character's gender");
 REXCVAR_DEFINE_BOOL(me2_me1_import, true, "ME2",
                     "New Game -> Import ME1 Character: the port prepares the character itself (no Unreap.xex)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
@@ -793,10 +809,25 @@ bool ReadPackage(const fs::path& path, std::vector<File>& files, std::string& wh
   return true;
 }
 
+// ME2 (2026-11-15): is the game itself in Russian? ME2 takes its language from its own default.xex, not from
+// XGetLanguage: the Switch profiles make it Russian with game_overlay_root alone (the RU disc's files, among them the
+// BIOGame_RUS.tlk the English disc lacks) and leave user_language unset -> auto gave "Emili Шепард".
+bool GameInRussian() {
+  if (rex::cvar::GetFlagByName("user_language") == "12") return true;  // the SDK's XGetLanguage answer
+  const std::string overlay = rex::cvar::GetFlagByName("game_overlay_root");
+  if (overlay.empty()) return false;
+  std::error_code ec;
+  return fs::exists(fs::path(overlay) / "BioGame" / "CookedXenon" / "BIOGame_RUS.tlk", ec);
+}
+
 le1::Options Le1Options() {
   le1::Options o;
   const std::string mode = Lower(REXCVAR_GET(me2_me1_import_le1_latin_names));
-  o.latin_names = mode == "on" || mode == "true" || (mode == "auto" && rex::cvar::GetFlagByName("user_language") != "12");  // the SDK's XGetLanguage answer
+  o.latin_names = mode == "on" || mode == "true" || (mode == "auto" && !GameInRussian());
+  o.keep_face = REXCVAR_GET(me2_me1_import_le1_face);
+  o.map_skin_tone = REXCVAR_GET(me2_me1_import_le1_skin_map);
+  o.map_makeup = REXCVAR_GET(me2_me1_import_le1_makeup_map);
+  o.map_hair_colour = REXCVAR_GET(me2_me1_import_le1_hair_map);
   return o;
 }
 
@@ -1251,6 +1282,52 @@ REX_HOOK_RAW(sub_82C4BB80) {
 // -legacydataready on the command line first: the prologue's LegacyDataCallback (DetermineParams) reads it when the
 // new game's map starts, and without it UpdateOp takes the canon (no import) branch.
 // The hook itself is me2_frame_diag.cpp's ME2_GC_CALLER(8287A818), which calls this before the original.
+// ME2 (2026-11-15): and loads the save's content imports first (PreloadContentImports, below).
+namespace {
+void PreloadContentImports(PPCContext& ctx, uint8_t* base, const std::string& save);
+}
+extern bool g_imported_this_session;  // FixOverrideTextures, below
+// ME2 (2026-11-15): the import at the console's moment. The load-screen route ran ME1's player.sav import at the main
+// menu ("defer importcharacter <save> 1 forcenewgame"), before BioP_ProNor's content was loaded; the Xbox imports
+// inside BioP_ProNor (the prologue's SFXSeqAct_LegacyDataCallback.UpdateOp -> TryImport -> "defer importcharacter
+// Char_Prep <autodevice>", reached only while ImportedDataManager.m_bImportedData is false). Imported at the menu, the
+// hair was drawn without its HAIR_* material and skin + hair looked wrong for the whole session (reloads too; fine
+// after a restart; 2026-11-15 device logs; skipping the script's m_oBaseHead = None did not help). With this cvar the
+// menu's command only starts the new game: the chosen save becomes Char_Prep, -legacydataready -autodevice1
+// -expectuser0 go on the command line, and the import function (sub_8297C628, called by the console Exec
+// sub_8287A818: 1 = imported, then the forcenewgame function by name through ProcessEvent) answers 1 without
+// importing, once (me2_me1_import_skip_menu_load, called by me2_frame_diag.cpp's hook). No preload in either step.
+REXCVAR_DEFINE_BOOL(me2_me1_import_in_prologue, true, "ME2",
+                    "ME1 import: the load screen only starts the new game, the prologue imports (Char_Prep) inside "
+                    "BioP_ProNor as on the Xbox; false = import at the main menu (with the preload)");
+bool g_skip_menu_import = false;
+extern "C" bool me2_me1_import_skip_menu_load() {
+  if (!g_skip_menu_import) return false;
+  g_skip_menu_import = false;
+  REXLOG_INFO("[me1-import] menu-time import skipped (answered 1): the new game starts, the prologue imports");
+  return true;
+}
+namespace {
+bool CopyToPrep(const std::string& save) {
+  auto* content = Content();
+  if (!content || save.empty()) return false;
+  const uint64_t xuid = Xuid();
+  const fs::path from = SavesFolder(content, xuid) / save, to = SavesFolder(content, xuid) / kPrepName;
+  std::error_code ec;
+  if (!fs::is_directory(from, ec)) return false;
+  fs::remove_all(to, ec);
+  fs::create_directories(to, ec);
+  fs::copy(from, to, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+  if (ec) {
+    REXLOG_WARN("[me1-import] copy {} -> {}: {}", rex::path_to_utf8(from), rex::path_to_utf8(to), ec.message());
+    return false;
+  }
+  fs::copy_file(HeaderFile(content, xuid, save), HeaderFile(content, xuid, kPrepName),
+                fs::copy_options::overwrite_existing, ec);
+  content->NotifySavedGameWritten("me1 import");
+  return true;
+}
+}  // namespace
 extern "C" void me2_me1_import_console_exec(PPCContext& ctx, uint8_t* base) {
   static const bool on = REXCVAR_GET(me2_me1_import);
   if (on && ctx.r4.u32) {
@@ -1264,7 +1341,36 @@ extern "C" void me2_me1_import_console_exec(PPCContext& ctx, uint8_t* base) {
       match = c < 128 && std::tolower(int(c)) == kWord[i];
     }
     const uint16_t next = ch(sizeof(kWord) - 1);
-    if (match && (next == 0 || next == u' ' || next == u'\t')) AppendCommandLine(base, "-legacydataready");
+    if (match && (next == 0 || next == u' ' || next == u'\t')) {
+      AppendCommandLine(base, "-legacydataready");
+      // The save's name: the word after the command.
+      uint32_t i = sizeof(kWord) - 1;
+      while (ch(i) == u' ' || ch(i) == u'\t') ++i;
+      std::string save;
+      for (; ch(i) && ch(i) != u' ' && ch(i) != u'\t' && save.size() < 128; ++i) save.push_back(ch(i) < 128 ? char(ch(i)) : '?');
+      std::string rest;  // the rest of the line: "forcenewgame" = the load screen's command
+      for (; ch(i) && rest.size() < 128; ++i) rest.push_back(ch(i) < 128 ? char(std::tolower(int(ch(i)))) : '?');
+      g_imported_this_session = true;
+      if (REXCVAR_GET(me2_me1_import_in_prologue)) {
+        if (rest.find("forcenewgame") != std::string::npos && Lower(save) != Lower(kPrepName)) {
+          if (CopyToPrep(save)) {
+            AppendCommandLine(base, fmt::format("-autodevice{}", kDevice));
+            AppendCommandLine(base, "-expectuser0");
+            g_skip_menu_import = true;
+            REXLOG_INFO("[me1-import] '{}' -> Char_Prep; the new game starts without importing, the prologue's "
+                        "LegacyDataCallback imports Char_Prep inside BioP_ProNor (the console's timing)",
+                        save);
+            return;
+          }
+          REXLOG_WARN("[me1-import] Char_Prep from '{}' failed: importing at the menu as before", save);
+        } else {
+          REXLOG_INFO("[me1-import] '{}' imported by the game ({}) without a preload", save,
+                      rest.empty() ? std::string("the prologue") : rest);
+          return;
+        }
+      }
+      PreloadContentImports(ctx, base, save);
+    }
   }
 }
 
@@ -1409,6 +1515,56 @@ REX_HOOK_RAW(sub_82429A88) {
   REXLOG_INFO("[me1-import] Import ME1 Character: the load screen's ME1 list (the PC version's route)");
 }
 
+// ME2 (2026-11-15): pale / white hair and skin for the whole session that imported (any reload in it too; a restart
+// fixed it). SFXLegacyData.ApplyImportedMorphFaceFromSaveObject (SFXGame):
+//   +0x54  oLegacyFace = BioMorphFace(DynamicLoadObject(bIsFemale ? FemaleBaseFace : MaleBaseFace, BioMorphFace))
+//   +0x9D  BioMorphFaceSaveObject(oMorphImportObj).LoadObject(oLegacyFace)
+//   +0xBA  oLegacyFace.m_oBaseHead = None        0F 19 00 <obj> 00 05 04 01 <property> 2A  (16 bytes)
+//   +0xCA  CurrentGame.NewPlayer.MorphHead = oLegacyFace
+// DynamicLoadObject returns the SHARED BIOG_MORPH_FACE.Player_Base_Female / _Male (no copy), so its m_oBaseHead
+// stays None until the game exits; a career loaded after a restart gets the package's own one (device logs: the hair
+// is then drawn through its HAIR_* material, in the import session never). The statement is skipped: when that
+// function calls DynamicLoadObject (execDynamicLoadObject sub_82780830, the caller's FFrame r4: +4 Node), it becomes
+// "goto +0xCA" and EX_Nothing (same length, patched once in the UFunction's Script, +0x54 data / +0x58 count; the
+// running frame is at +0x54, before it). cvar me2_me1_import_keep_base_head.
+REXCVAR_DEFINE_BOOL(me2_me1_import_keep_base_head, false, "ME2",
+                    "ME1 import: skip the game script's 'm_oBaseHead = None' on the shared base face (it left the "
+                    "imported character's hair / skin wrong until a restart); false = the game's script as is");
+REX_EXTERN(__imp__sub_82780830);
+REX_HOOK_RAW(sub_82780830) {
+  const uint32_t frame = ctx.r4.u32;
+  auto Get32 = [](const uint8_t* b, uint32_t va) { return __builtin_bswap32(*reinterpret_cast<const uint32_t*>(b + va)); };
+  static bool done = false;
+  if (!done && frame && REXCVAR_GET(me2_me1_import_keep_base_head)) {
+    const uint32_t node = Get32(base, frame + 4);
+    if (node && NameOf(base, node) == "ApplyImportedMorphFaceFromSaveObject") {
+      done = true;
+      const uint32_t script = Get32(base, node + 0x54), num = Get32(base, node + 0x58);
+      constexpr uint32_t at = 0xBA, back = 0xCA;
+      uint8_t* c = base + script;
+      // 0F Let, 19 Context, 00 local <obj 4>, skip 00 05, size 04, 01 instance variable <property 4>, 2A None
+      const uint32_t property = script && num > back + 1 ? Get32(base, script + at + 11) : 0;
+      if (script && num > back + 1 && c[at] == 0x0F && c[at + 1] == 0x19 && c[at + 2] == 0x00 && c[at + 7] == 0x00 &&
+          c[at + 8] == 0x05 && c[at + 9] == 0x04 && c[at + 10] == 0x01 && c[at + 15] == 0x2A && c[back] == 0x0F &&
+          property &&
+          NameOf(base, property) == "m_oBaseHead") {
+        c[at] = 0x06;  // goto back
+        c[at + 1] = uint8_t(back >> 8);
+        c[at + 2] = uint8_t(back);
+        for (uint32_t i = at + 3; i < back; ++i) c[i] = 0x0B;  // EX_Nothing, never run
+        REXLOG_INFO("[me1-import] ApplyImportedMorphFaceFromSaveObject: 'm_oBaseHead = None' skipped (shared base face "
+                    "keeps its head)");
+      } else {
+        REXLOG_WARN("[me1-import] ApplyImportedMorphFaceFromSaveObject: not the expected code at +0x{:X} ({:02X} {:02X} "
+                    "{:02X}, property {}); left as the game's",
+                    at, script ? c[at] : 0, script ? c[at + 1] : 0, script ? c[at + 2] : 0,
+                    property ? NameOf(base, property) : std::string("-"));
+      }
+    }
+  }
+  __imp__sub_82780830(ctx, base);
+}
+
 // ---------------------------------------------------------------------------------------------------------------------
 // The ME1 list. SFXSFHandler_Load (vtable 0x821EC848) native InitializeLoadList = slot 99, sub_8294D838 (this r3,
 // CareerIdx r4). Fields: SaveList +132 (TArray<SaveGUIRecord>, 40 bytes: SaveGame +0, FriendlyName +4, AreaImage +16,
@@ -1471,6 +1627,61 @@ struct GuestCalls {
   }
 };
 
+// ME2 (2026-11-15): the content objects the save's player.sav imports, loaded before IMPORTCHARACTER reads it.
+// ME2 Xbox resolves a package's imports among the objects in memory (seek-free); the Xbox imported in the prologue
+// (BioP_ProNor, whose BioD_ProNor carries the creator's hair / face textures), this port imports from the main menu,
+// where they are not loaded: the BioMorphFaceSaveObject / BioMaterialOverrideSaveObject references came out None
+// and the imported face's hair rendered with the engine's default textures (white hair; capture 39652, also with PC
+// saves). StaticLoadObject (sub_827AAF18: class r3, outer r4, name TCHAR* r5, filename r6, flags r7, sandbox r8,
+// reconcile r9; DynamicLoadObject's flags LOAD_NoWarn | LOAD_Quiet) with UObject::StaticClass() (sub_822B0970) loads
+// each object's package if needed; BIOG_MORPH_FACE first (it holds most of a custom face's hair and textures).
+REX_EXTERN(__imp__sub_827AAF18);
+REX_EXTERN(__imp__sub_822B0970);
+void PreloadContentImports(PPCContext& ctx, uint8_t* base, const std::string& save) {
+  if (!REXCVAR_GET(me2_me1_import_preload) || save.empty() || save.find_first_of("/\\.") != std::string::npos) return;
+  auto* content = Content();
+  if (!content) return;
+  std::vector<uint8_t> player;
+  if (!ReadAll(SavesFolder(content, Xuid()) / save / "player.sav", player)) {
+    REXLOG_WARN("[me1-import] preload: no player.sav for '{}'", save);
+    return;
+  }
+  std::vector<std::string> paths;
+  if (!le1::ContentImports(player, paths)) {
+    REXLOG_WARN("[me1-import] preload: the import table of '{}' does not parse", save);
+    return;
+  }
+  GuestCalls g(ctx, base);
+  __imp__sub_822B0970(ctx, base);
+  const uint32_t object_class = ctx.r3.u32;
+  if (!object_class) return;
+  int loaded = 0;
+  std::string missing;
+  for (const std::string& path : paths) {
+    if (path.size() > 250) continue;
+    for (size_t i = 0; i <= path.size(); ++i) {
+      const uint16_t c = i < path.size() ? uint16_t(uint8_t(path[i])) : 0;
+      base[g.text + 2 * i] = uint8_t(c >> 8);
+      base[g.text + 2 * i + 1] = uint8_t(c);
+    }
+    ctx.r3.u64 = object_class;
+    ctx.r4.u64 = 0;
+    ctx.r5.u64 = g.text;
+    ctx.r6.u64 = 0;
+    ctx.r7.u64 = 2 | 8192;
+    ctx.r8.u64 = 0;
+    ctx.r9.u64 = 1;
+    __imp__sub_827AAF18(ctx, base);
+    if (ctx.r3.u32) {
+      ++loaded;
+    } else {
+      missing += (missing.empty() ? "" : ", ") + path;
+    }
+  }
+  REXLOG_INFO("[me1-import] preload for '{}': {} of {} content object(s) in memory{}{}", save, loaded, paths.size(),
+              missing.empty() ? "" : "; not found: ", missing);
+}
+
 void FillLegacyList(PPCContext& ctx, uint8_t* base, uint32_t self) {
   GuestCalls g(ctx, base);
   // LegacyRecords from an earlier opening: destroyed, then empty.
@@ -1510,6 +1721,134 @@ void FillLegacyList(PPCContext& ctx, uint8_t* base, uint32_t self) {
 }  // namespace
 
 REX_EXTERN(__imp__sub_8294D838);
+// ME2 (2026-11-15): an imported face's texture overrides. In the session that imports (and only there: after a
+// restart the career's own save loads the same textures fine) the hair rendered with the engine's default textures
+// (captures 39652 / 40020: checker + flat normal), Default Appearance was fine: the BioMaterialOverride's texture
+// pointers that came from player.sav (ME2's ME1 reader) are not the loaded textures. BioMaterialOverride::Apply
+// (sub_82965DB0: this r3, mesh component r4; BioMorphFace::ApplyMaterialOverrides(ToPawn) sub_82918FC0 / FE0 pass
+// this+100) sets m_aTextureOverrides (+60 data / +64 count; 12 bytes: FName, UTexture* +8) on the component's
+// materials (vtable +440). Before it runs, in an importing session, each texture is looked up again by its path
+// (UObject Outer +0x28, Name +0x2C / number +0x30; StaticLoadObject as in PreloadContentImports) and replaced when
+// that finds another object.
+bool g_imported_this_session = false;
+std::string ObjectPath(const uint8_t* base, uint32_t object) {
+  std::string path;
+  for (int depth = 0; object && depth < 16; ++depth) {
+    char text[128];
+    if (!me2_name_text(base, Get32(base, object + 0x2C), text, sizeof(text))) return {};
+    std::string part = text;
+    const uint32_t number = Get32(base, object + 0x30);
+    if (number) part += "_" + std::to_string(number - 1);
+    path = path.empty() ? part : part + "." + path;
+    object = Get32(base, object + 0x28);
+  }
+  return path;
+}
+void FixOverrideTextures(PPCContext& ctx, uint8_t* base, uint32_t overrides) {
+  static int logged = 0;
+  const uint32_t data = Get32(base, overrides + 60), count = Get32(base, overrides + 64);
+  if (!data || count == 0 || count > 256) return;
+  GuestCalls g(ctx, base);
+  __imp__sub_822B0970(ctx, base);
+  const uint32_t object_class = ctx.r3.u32;
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint32_t at = data + 12 * i, tex = Get32(base, at + 8);
+    if (!tex) continue;
+    const std::string path = ObjectPath(base, tex);
+    if (path.empty() || path.size() > 250) continue;
+    for (size_t k = 0; k <= path.size(); ++k) {
+      const uint16_t c = k < path.size() ? uint16_t(uint8_t(path[k])) : 0;
+      base[g.text + 2 * k] = uint8_t(c >> 8);
+      base[g.text + 2 * k + 1] = uint8_t(c);
+    }
+    ctx.r3.u64 = object_class;
+    ctx.r4.u64 = 0;
+    ctx.r5.u64 = g.text;
+    ctx.r6.u64 = 0;
+    ctx.r7.u64 = 2 | 8192;
+    ctx.r8.u64 = 0;
+    ctx.r9.u64 = 1;
+    __imp__sub_827AAF18(ctx, base);
+    const uint32_t found = ctx.r3.u32;
+    const uint64_t flags = uint64_t(Get32(base, tex + 8)) << 32 | Get32(base, tex + 12);
+    if (found && found != tex) Put32(base, at + 8, found);
+    if (logged < 400) {
+      ++logged;
+      REXLOG_INFO("[me1-import] override texture {}: {:08X} (flags {:016X}) -> {}", path, tex, flags,
+                  !found ? std::string("not found") : found == tex ? std::string("same object")
+                                                                    : fmt::format("replaced by {:08X}", found));
+    }
+  }
+}
+
+// ME2 (2026-11-15): until now this hook never ran: tools/direct_calls.py had made the 5 game call sites direct
+// (__imp__) before it existed (re-run after adding a hook!). Diagnostic, every session (import or not, so a restart
+// gives the good control): each Apply with the override's path, its texture count and the component's material slots
+// (+448 data / +452 count: object, class, path) before and after the original.
+std::string MaterialSlots(const uint8_t* base, uint32_t component) {
+  if (!component) return "no component";
+  const uint32_t data = Get32(base, component + 448), count = Get32(base, component + 452);
+  if (count > 16) return fmt::format("{} slot(s)?", count);
+  std::string out = fmt::format("{} slot(s)", count);
+  for (uint32_t i = 0; i < count && data; ++i) {
+    const uint32_t m = Get32(base, data + 4 * i);
+    const uint32_t cls = m ? Get32(base, m + 0x34) : 0;
+    out += fmt::format(" [{}] {:08X} {} {}", i, m, cls ? ObjectPath(base, cls) : std::string("-"),
+                       m ? ObjectPath(base, m) : std::string("None"));
+  }
+  return out;
+}
+REXCVAR_DEFINE_INT32(me2_material_override_diag, 0, "ME2",
+                     "Log this many BioMaterialOverride::Apply calls (override path, texture overrides, the mesh "
+                     "component's materials before / after); 0 = off");
+
+REX_EXTERN(__imp__sub_82965DB0);
+REX_HOOK_RAW(sub_82965DB0) {
+  const uint32_t self = ctx.r3.u32, component = ctx.r4.u32;
+  static std::atomic<int> calls{0};
+  const int n = calls.fetch_add(1);
+  const bool log = self && n < REXCVAR_GET(me2_material_override_diag);
+  std::string before;
+  if (log) {
+    std::string textures;
+    const uint32_t data = Get32(base, self + 60), count = Get32(base, self + 64);
+    for (uint32_t i = 0; i < count && i < 8 && data; ++i) {
+      char name[128] = {};
+      me2_name_text(base, Get32(base, data + 12 * i), name, sizeof(name));
+      const uint32_t tex = Get32(base, data + 12 * i + 8);
+      textures += fmt::format(" {}={:08X} {}", name, tex, tex ? ObjectPath(base, tex) : std::string("None"));
+    }
+    before = MaterialSlots(base, component);
+    REXLOG_INFO("[mat-override] #{} {} on {} (import session {}): {} texture(s){}; colours {}, scalars {}", n,
+                ObjectPath(base, self), component ? ObjectPath(base, component) : std::string("-"),
+                g_imported_this_session, count, textures, Get32(base, self + 76), Get32(base, self + 88));
+    // 2026-11-15 (device: same textures in the import session and after a restart, but skin + hair pale until a
+    // restart): the values. Colours +72/+76 (24 B: FName, FLinearColor), scalars +84/+88 (12 B: FName, float).
+    auto f = [&](uint32_t at) { const uint32_t w = Get32(base, at); float v; std::memcpy(&v, &w, 4); return v; };
+    std::string values;
+    const uint32_t cdata = Get32(base, self + 72), ccount = Get32(base, self + 76);
+    for (uint32_t i = 0; i < ccount && i < 64 && cdata; ++i) {
+      char name[128] = {};
+      const uint32_t e = cdata + 24 * i;
+      me2_name_text(base, Get32(base, e), name, sizeof(name));
+      values += fmt::format(" {}=({:.3f} {:.3f} {:.3f} {:.3f})", name, f(e + 8), f(e + 12), f(e + 16), f(e + 20));
+    }
+    const uint32_t sdata = Get32(base, self + 84), scount = Get32(base, self + 88);
+    for (uint32_t i = 0; i < scount && i < 64 && sdata; ++i) {
+      char name[128] = {};
+      const uint32_t e = sdata + 12 * i;
+      me2_name_text(base, Get32(base, e), name, sizeof(name));
+      values += fmt::format(" {}={:.3f}", name, f(e + 8));
+    }
+    if (!values.empty()) REXLOG_INFO("[mat-override] #{} values:{}", n, values);
+  }
+  if (g_imported_this_session && self && REXCVAR_GET(me2_me1_import_preload)) FixOverrideTextures(ctx, base, self);
+  ctx.r3.u64 = self;
+  ctx.r4.u64 = component;
+  __imp__sub_82965DB0(ctx, base);
+  if (log) REXLOG_INFO("[mat-override] #{} materials before: {} | after: {}", n, before, MaterialSlots(base, component));
+}
+
 REX_HOOK_RAW(sub_8294D838) {
   const uint32_t self = ctx.r3.u32;
   const int32_t career = ctx.r4.s32;

@@ -36,6 +36,19 @@ REXCVAR_DEFINE_INT32(me2_composite_lights, -1, "ME2",
                      "\"composite_lights\" alternates 1 and the game's")
     .range(-1, 1)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// me2-nx-deko (2026-11-15): UE3's tiling flag (TU2: 0x833D580C, the console command "TILING" toggles it; InitD3D
+// 0x827DDE34 and FEngineLoop 0x82862D70 set it). Set, the scene is drawn as on the Xbox 360: "1280x720 2xAA, 2 tiles"
+// (GTilingMode 0x8337AFD8 = 1): Umbra sorts the visible instances into two batches by a screen-splitting plane
+// (sub_82DDDA78 with a count of 2 at 0x8274AC2C) and the base pass is flushed once per tile (op 164 twice), an
+// instance across the split drawn in both. Clear (as the game itself has it during scene captures 0x8269DE58 and
+// multi-view culling 0x8274AFBC, and as Xenia's "Black Shading Fix" patch forces it): no batches, one flush. The
+// host has no 10 MB EDRAM to fit. Written between frames (the Swap hook runs on UE3's render thread).
+REXCVAR_DEFINE_INT32(me2_game_tiling, -1, "ME2",
+                     "UE3's Xbox 360 tiling (the base pass drawn in two screen tiles, objects across the split "
+                     "twice): 0 = off (one pass), 1 = on, -1 = the game's (on). me2_ab_cycle \"tiling\" alternates "
+                     "0 and the game's")
+    .range(-1, 1)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(me2_ab_cycle_s, 6, "ME2/Diagnostics", "Draw-count rotation: seconds of a slot")
     .range(2, 600)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
@@ -58,7 +71,7 @@ constexpr const char* kNames[int(Me2Ab::kCount)] = {"occlusion", "light_small", 
                                                     "small_mesh", "prepass",     "lod",         "retest_occluded", "light_boost",
                                                     "raster",    "relink",      "material",  "native_vis", "reader_raster",
                                                     "color_handover", "light_occ", "composite_lights", "occl_nowait",
-                                                    "occl_nowait_shadow", "raster_lean", "delta_raw"};
+                                                    "occl_nowait_shadow", "raster_lean", "delta_raw", "tiling"};
 
 struct Rotation {
   std::vector<int> cuts;  // Me2Ab values in rotation order
@@ -181,4 +194,37 @@ void Me2CompositeLightsTick(unsigned char* base) {
   static uint32_t changes = 0;
   if (++changes <= 8 || changes % 64 == 0)
     REXLOG_INFO("[composite] CompositeDynamicLights {} -> {} (change {})", now, want, changes);
+}
+
+// me2-nx-deko (2026-11-15): UE3's tiling flag (see me2_game_tiling above).
+void Me2TilingTick(unsigned char* base) {
+  constexpr uint32_t kUseTiling = 0x833D580Cu, kTilingMode = 0x8337AFD8u;
+  static const int setting = REXCVAR_GET(me2_game_tiling);
+  static const bool in_rotation = Me2AbInRotation(Me2Ab::kTiling);
+  if (setting < 0 && !in_rotation) return;
+  const auto load = [base](uint32_t va) { return __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + va)); };
+  static int state = 0;  // 0 the game has not set its flag yet, 1 usable, -1 refused
+  static uint32_t game_value = 0;
+  static uint32_t frames = 0;
+  if (state == 0) {
+    // InitD3D sets the flag before the first frame; a clear flag after many frames means the game runs untiled
+    // already (nothing to do), anything but 0 / 1 or an unknown mode another layout.
+    const uint32_t flag = load(kUseTiling), mode = load(kTilingMode);
+    ++frames;
+    if (flag == 0 && frames < 600) return;
+    const bool ok = flag <= 1 && mode <= 4;
+    REXLOG_INFO("[tiling] UE3 tiling flag at {:08X}: {} (mode {} at {:08X}) ({}; me2_game_tiling {}, rotation {})",
+                kUseTiling, flag, mode, kTilingMode, ok ? "as expected" : "NOT as expected: left alone", setting,
+                in_rotation ? "on" : "off");
+    state = ok ? 1 : -1;
+    game_value = flag;
+  }
+  if (state < 0) return;
+  uint32_t want = setting < 0 ? game_value : uint32_t(setting);
+  if (in_rotation) want = Me2AbOff(Me2Ab::kTiling) ? game_value : 0u;
+  const uint32_t now = load(kUseTiling);
+  if (now == want) return;
+  *reinterpret_cast<uint32_t*>(base + kUseTiling) = __builtin_bswap32(want);
+  static uint32_t changes = 0;
+  if (++changes <= 8 || changes % 64 == 0) REXLOG_INFO("[tiling] UE3 tiling flag {} -> {} (change {})", now, want, changes);
 }

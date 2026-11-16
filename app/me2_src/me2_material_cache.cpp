@@ -28,7 +28,11 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
+#include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 REXCVAR_DEFINE_BOOL(me2_material_cache, false, "ME2",
                     "Cache UE3's material instance parameter lookups (GetVectorValue / GetScalarValue / "
@@ -246,9 +250,63 @@ REX_EXTERN(__imp__sub_82311D40);
 REX_HOOK_RAW(sub_82311D40) {  // ::GetScalarValue
   Lookup<__imp__sub_82311D40>(ctx, base, kScalar);
 }
+// ME2 (2026-11-15): which texture parameters come back empty. The character creator's hair meshes (and an imported
+// face's hair) rendered with the engine's default textures (captures 112997 / 113258: their pixel shader bound the
+// default checker + normal, the head's scalp textures were fine). The texture setup (me2_material_params.cpp's notes)
+// binds the default texture when GetTextureValue is not found or gives null. Logged once per (proxy, name) for the
+// names starting with me2_tex_param_diag: found, the FTexture* it wrote, and the proxy's parent chain (+20).
+// 2026-11-15: OFF by default ("" ): on, every lookup of the UE3 render thread took a mutex and scanned the names seen
+// (console diag_1115, Kasumi's party at 1020 MHz: 16.3 fps with the UE3 render thread at 95.7 % vs 23.3 fps on 11-06).
+REXCVAR_DEFINE_STRING(me2_tex_param_diag, "", "ME2",
+                      "Log the answers of UE3's material texture parameter lookups (GetTextureValue) for parameter names "
+                      "starting with this, once per material proxy and name; empty = off");
+extern "C" bool me2_name_text(const uint8_t* base, uint32_t index, char* out, size_t size);  // me2_cerberus.cpp
+namespace {
+void TextureParamDiag(uint8_t* base, uint32_t proxy, uint32_t name, uint32_t out, uint32_t found) {
+  static const std::string prefix = REXCVAR_GET(me2_tex_param_diag);
+  if (prefix.empty() || !GuestOk(name)) return;
+  static std::mutex mutex;
+  static std::vector<std::pair<uint32_t, bool>> names;  // name index -> matches the prefix
+  static std::vector<uint64_t> seen;
+  static int logged = 0;
+  const uint32_t index = LoadBE32(base, name);
+  std::lock_guard lock(mutex);
+  bool match = false, known = false;
+  for (const auto& [i, m] : names)
+    if (i == index) {
+      known = true, match = m;
+      break;
+    }
+  char text[128] = {};
+  if (!known) {
+    match = me2_name_text(base, index, text, sizeof(text)) && std::strncmp(text, prefix.c_str(), prefix.size()) == 0;
+    if (names.size() < 4096) names.emplace_back(index, match);
+  }
+  if (!match || logged >= 300) return;
+  const uint64_t key = uint64_t(proxy) << 32 | index;
+  for (uint64_t k : seen)
+    if (k == key) return;
+  seen.push_back(key);
+  ++logged;
+  if (!text[0]) me2_name_text(base, index, text, sizeof(text));
+  const uint32_t value = found && GuestOk(out) ? LoadBE32(base, out) : 0;
+  std::string chain;
+  uint32_t p = proxy;
+  for (int depth = 0; depth < 6 && GuestOk(p + 20); ++depth) {
+    p = LoadBE32(base, p + 20);
+    if (!p) break;
+    chain += fmt::format(" <- {:08X}", p);
+  }
+  REXLOG_INFO("[tex-param] proxy {:08X}{} {}: {}{}", proxy, chain, text, found ? "found" : "NOT FOUND",
+              found ? fmt::format(", texture resource {:08X}", value) : std::string());
+}
+}  // namespace
+
 REX_EXTERN(__imp__sub_82311DF8);
 REX_HOOK_RAW(sub_82311DF8) {  // ::GetTextureValue
+  const uint32_t proxy = ctx.r3.u32, name = ctx.r4.u32, out = ctx.r5.u32;
   Lookup<__imp__sub_82311DF8>(ctx, base, kTexture);
+  TextureParamDiag(base, proxy, name, out, ctx.r3.u32);
 }
 
 REX_EXTERN(__imp__sub_82348E48);
