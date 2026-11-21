@@ -1582,7 +1582,13 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t 
   alignment = rex::round_up(alignment, page_size_);
   uint32_t page_count = get_page_count(size, page_size_, page_size_shift_);
   low_address = std::max(heap_base_, rex::align(low_address, alignment));
-  high_address = std::min(heap_base_ + (heap_size_ - 1), rex::align(high_address, alignment));
+  // 2026-11-16: high_address is inclusive (0x...FFF); rex::align rounds it UP into the next page, which
+  // let a block extend one page past the requested range. A ranged physical allocation whose range is exactly its
+  // size (a game pinning 0x6000 blocks to physical 198FB000-19900FFF) then came back one page high (198FC000,
+  // virtual F98FB000 instead of F98FA000), and the game's own address arithmetic read into the unallocated page
+  // below it (NtReadFile -> STATUS_ACCESS_VIOLATION -> XamShowDirtyDiscErrorUI). The page number computed from the
+  // inclusive bound below already rounds down, so the bound is kept as given.
+  high_address = std::min(heap_base_ + (heap_size_ - 1), high_address);
   if (high_address < low_address) {
     REXSYS_ERROR("BaseHeap::Alloc invalid requested range");
     return false;
@@ -1761,6 +1767,8 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t 
 }
 
 bool BaseHeap::Decommit(uint32_t address, uint32_t size) {
+  if (memory_)
+    memory_->BumpReleaseGeneration(0);  // 2026-11-19: Memory::release_generation
   uint32_t page_count = get_page_count(size, page_size_, page_size_shift_);
   uint32_t start_page_number = (address - heap_base_) >> page_size_shift_;
   uint32_t end_page_number = start_page_number + page_count - 1;
@@ -1797,6 +1805,8 @@ bool BaseHeap::Decommit(uint32_t address, uint32_t size) {
 }
 
 bool BaseHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
+  if (memory_)
+    memory_->BumpReleaseGeneration(1);  // 2026-11-19: Memory::release_generation
   // Global critical region before heap_mutex_ - see
   // AcquireHostPageReconcileLock for why the order matters.
   auto global_lock = AcquireHostPageReconcileLock();
@@ -1859,6 +1869,8 @@ bool BaseHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
 }
 
 bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect, uint32_t* old_protect) {
+  if (memory_ && !(protect & memory::kMemoryProtectRead))
+    memory_->BumpReleaseGeneration(2);  // 2026-11-19: Memory::release_generation
   if (!size) {
     REXSYS_ERROR("BaseHeap::Protect failed due to zero size");
     return false;

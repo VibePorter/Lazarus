@@ -14,6 +14,7 @@
 #include <rex/sys_counters.h>
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/platform.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/overlay_device.h>
@@ -51,6 +52,18 @@ REXCVAR_DEFINE_STRING(game_overlay_root, "", "Runtime",
 REXCVAR_DEFINE_STRING(update_game_dir, "", "Runtime",
                       "Folder of the game data mounted as update: when update_data_root is empty (e.g. \"update\"); "
                       "empty = none");
+// me2-nx-deko (2026-11-19): the Russian voice-over (SynthVoiceRu's LE2 lines converted to the 360's Wwise Vorbis, built
+// by tools/ru_vo/build_ru_vo.py). <root>/game is laid over the game data AFTER game_overlay_root (so it
+// works with Russian or English text), <root>/dlc is the DLC overlay (content_manager.cpp, unless content_overlay_root
+// is set). Both halves belong together: DLC lines also live in the game's afc files. SetupVfs stores the resolved root
+// back into me2_russian_voiceover_root, and turns the flag off when <root>/game is missing.
+REXCVAR_DEFINE_BOOL(me2_russian_voiceover, false, "Runtime",
+                    "Russian voice-over: the folder of me2_russian_voiceover_root (game/ and dlc/) over the game data "
+                    "and the DLC. false = the original voices")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_STRING(me2_russian_voiceover_root, "", "Runtime",
+                      "Folder of the Russian voice-over (game/, dlc/); empty = ru_vo beside the game data folder")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_STRING(cache_root, "", "Runtime", "Override shader cache path");
 #if !defined(__SWITCH__)
 REXCVAR_DEFINE_BOOL(trace_xam_calls, false, "Runtime",
@@ -403,6 +416,49 @@ bool Runtime::SetupVfs() {
         REXSYS_ERROR("Runtime::SetupVfs: game_overlay_root {} could not be read: the game data alone",
                      abs_overlay.string());
       }
+    }
+  }
+  // me2_russian_voiceover: <root>/game over everything above (the DLC half: content_manager.cpp).
+  if (REXCVAR_GET(me2_russian_voiceover)) {
+    std::string vo = REXCVAR_GET(me2_russian_voiceover_root);
+    std::erase(vo, '"');
+    std::filesystem::path vo_root;
+    if (vo.empty()) {
+      std::filesystem::path game = abs_game_root;
+      if (!game.has_filename()) game = game.parent_path();  // ".../game/"
+      vo_root = game.parent_path() / "ru_vo";
+    } else {
+      vo_root = std::filesystem::absolute(rex::to_path(vo));
+    }
+    REXCVAR_SET(me2_russian_voiceover_root, rex::path_to_utf8(vo_root));
+    const auto vo_game = vo_root / "game";
+    std::error_code ec;
+    // 2026-11-21: <root>/game may hold just its pack, game/game.nxpack + .nxidx (build_asset_pack.py --inside, or
+    // ru_vo/game.nxpack beside it): 2 files on the SD card instead of ~1,400. The pack wins over loose files.
+    std::unique_ptr<rex::filesystem::Device> overlay;
+    const char* kind = "folder";
+    if (rex::filesystem::PackDevice::Exists(vo_game)) {
+      auto pack = std::make_unique<rex::filesystem::PackDevice>(mount_path, vo_game);
+      if (pack->Initialize()) {
+        overlay = std::move(pack);
+        kind = "pack";
+      } else {
+        REXSYS_ERROR("Runtime::SetupVfs: me2_russian_voiceover: the pack of {} could not be mounted, trying the "
+                     "loose files", rex::path_to_utf8(vo_game));
+      }
+    }
+    if (!overlay && std::filesystem::is_directory(vo_game, ec)) {
+      auto loose = std::make_unique<rex::filesystem::HostPathDevice>(mount_path, vo_game, true);
+      if (loose->Initialize()) overlay = std::move(loose);
+    }
+    if (!overlay) {
+      REXSYS_ERROR("Runtime::SetupVfs: me2_russian_voiceover: {} is missing or unreadable: the original voices",
+                   rex::path_to_utf8(vo_game));
+      REXCVAR_SET(me2_russian_voiceover, false);  // the DLC half stays off too
+    } else {
+      device = std::make_unique<rex::filesystem::OverlayDevice>(std::move(device), std::move(overlay));
+      device->Initialize();
+      REXSYS_INFO("[overlay] Russian voice-over: {} ({}) over the game data", rex::path_to_utf8(vo_game), kind);
     }
   }
   if (!file_system_->RegisterDevice(std::move(device))) {

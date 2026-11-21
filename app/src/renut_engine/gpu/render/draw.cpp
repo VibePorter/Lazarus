@@ -3537,6 +3537,11 @@ UploadAllocation UploadVertexFetchData(const GuestDevice &device, const DrawCall
   // chunk the allocation goes to are read there (before, their room was taken anyway, and cleaned at the submit). If
   // the allocation lands in another chunk, none is (that chunk has none of them): then room for all.
   bool reused[32] = {};
+  // 2026-11-18 (meshes exploded for one frame): the offset each reused copy was found at, taken here.
+  // The copy loop below overwrites g_fetch_copies entries for the copies it queues, and the table is direct-mapped: two
+  // fetches of one draw whose keys share an entry made the reused one look the entry up again after the other had
+  // replaced it, and read the other's data (RenderDoc: two vertex fetch slots of one draw at one offset).
+  u32 reused_offset[32] = {};
   u32 needed = total;
   const plume::RenderBuffer *chunk = shared ? Video::UploadsLocked().CurrentBuffer() : nullptr;
   if (shared && chunk) {
@@ -3547,6 +3552,7 @@ UploadAllocation UploadVertexFetchData(const GuestDevice &device, const DrawCall
         const FetchCopy &known = FetchCopyFor(c.src, c.size);
         reused[i] = known.generation == g_fetch_copy_generation && known.src == c.src && known.size == c.size &&
                     known.buffer == chunk;
+        reused_offset[i] = known.offset;
       }
       if (!reused[i])
         needed += (c.size + 15u) & ~15u;
@@ -3568,7 +3574,7 @@ UploadAllocation UploadVertexFetchData(const GuestDevice &device, const DrawCall
     u32 at = u32(chunk_offset) + offset;
     if (reused[i]) {
       // Queued in this chunk by an earlier draw: read there, no room here.
-      sc.vertex_fetch_slots[c.index] = FetchCopyFor(c.src, c.size).offset | c.endian;
+      sc.vertex_fetch_slots[c.index] = reused_offset[i] | c.endian;
       continue;
     }
     if (c.size && !c.exported) {
@@ -4672,12 +4678,178 @@ namespace {
 // read guest memory that was no longer mapped (the start of a page: a vertex buffer freed, or a stream sized past its
 // allocation, between the draw and this flush, there a forced submit for a memexport draw). The render thread faulted.
 // Each fill's guest pages are checked first; one that cannot be read is converted from zeros and logged.
+bool GuestRangeReadableUncached(const u8 *guest, size_t bytes);
+
+// 2026-11-21 (Switch: GuestRangeReadable + QueryRegionInfo 4-10 % of the render
+// thread): the same ranges are checked at every flush of every frame. A range found readable is remembered until the
+// guest heaps change what is mapped (Memory::release_generation: any Decommit, Release, or Protect without read
+// access); then every range is checked again. A direct-mapped table of exact ranges (render thread only). Code default
+// off; renut_readable_memo = true in the toml.
+REXCVAR_DEFINE_BOOL(renut_readable_memo, false, "Nuts&Bolts/Renderer",
+                    "The deferred vertex fills' check that guest memory is still mapped remembers a readable range "
+                    "until the guest heaps decommit, release or read-protect any memory")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+struct ReadableMemo {
+  const u8 *guest = nullptr;
+  size_t bytes = 0;
+  uint64_t generation = 0;  // release_generation + 1 when it was found readable (0: empty)
+};
+ReadableMemo g_readable_memo[4096];
+uint64_t g_readable_memo_hits = 0, g_readable_memo_checks = 0;
+uint64_t g_release_kinds_seen[3] = {};
+
 bool GuestRangeReadable(const u8 *guest, size_t bytes) {
-  // The host mapping itself (the Switch's guest memory core tracks it; VirtualQuery / mincore elsewhere), not the
-  // guest heap's page table: Renut's own blocks (the Begin*Vertices scratch, records::AllocPhysicalBlock) are mapped
-  // without being in it.
   if (!guest || !bytes)
     return true;
+  static const bool memo_on = REXCVAR_GET(renut_readable_memo);
+  auto *memory = memo_on ? REX_KERNEL_MEMORY() : nullptr;
+  if (!memory)
+    return GuestRangeReadableUncached(guest, bytes);
+  const uint64_t generation = memory->release_generation() + 1;
+  const uint64_t key = uint64_t(reinterpret_cast<uintptr_t>(guest)) ^ (uint64_t(bytes) << 36);
+  ReadableMemo &m = g_readable_memo[(key * 0x9E3779B97F4A7C15ull) >> 52];
+  ++g_readable_memo_checks;
+  if ((g_readable_memo_checks & 4095) == 0) {  // [readable-memo]
+    static auto window = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - window >= std::chrono::seconds(10)) {
+      window = now;
+      uint64_t kinds[3];
+      for (int k = 0; k < 3; ++k)
+        kinds[k] = memory->release_kind_count(k);
+      RGPU_INFO("[readable-memo] 10 s: {} of {} checks memoized; heap releases decommit {} release {} protect {} "
+                "(renut_readable_memo)",
+                g_readable_memo_hits, g_readable_memo_checks, kinds[0] - g_release_kinds_seen[0],
+                kinds[1] - g_release_kinds_seen[1], kinds[2] - g_release_kinds_seen[2]);
+      std::copy(std::begin(kinds), std::end(kinds), std::begin(g_release_kinds_seen));
+      g_readable_memo_hits = 0;
+      g_readable_memo_checks = 1;
+    }
+  }
+  if (m.generation == generation && m.guest == guest && m.bytes == bytes) {
+    ++g_readable_memo_hits;
+    return true;
+  }
+  // By physical page as well (2026-11-19: the exact ranges answered 57 %, with no release at all: draws read other
+  // vertex ranges of the same buffers): a range of physical memory whose 4 KB pages were all found readable at this
+  // generation. u32 generations (0: never; a wrap after 4 billion releases would only give stale "unknown").
+  static std::vector<u32> page_generation(0x20000u, 0u);
+  const u32 generation32 = u32(generation) ? u32(generation) : 1u;
+  // Only pointers into the raw physical view (all of physical memory, one host mapping): the guest's virtual views of it
+  // (0xA0000000...) are protected per view, so a page readable through one is not proven readable through another.
+  static const uintptr_t physical_base = reinterpret_cast<uintptr_t>(memory->physical_membase());
+  const uintptr_t raw = reinterpret_cast<uintptr_t>(guest) - physical_base;
+  const u32 physical = physical_base && raw < 0x20000000u ? u32(raw) : UINT32_MAX;
+  const bool paged = physical != UINT32_MAX && bytes <= 0x20000000u - physical;
+  const u32 first_page = paged ? physical >> 12 : 0, last_page = paged ? u32((uint64_t(physical) + bytes - 1) >> 12) : 0;
+  if (paged) {
+    bool all = true;
+    for (u32 page = first_page; page <= last_page && all; ++page)
+      all = page_generation[page] == generation32;
+    if (all) {
+      ++g_readable_memo_hits;
+      m = {guest, bytes, generation};
+      return true;
+    }
+  }
+  if (!GuestRangeReadableUncached(guest, bytes))
+    return false;
+  m = {guest, bytes, generation};  // the generation read before the check: a release during it misses the memo
+  if (paged)
+    std::fill(page_generation.begin() + first_page, page_generation.begin() + last_page + 1, generation32);
+  return true;
+}
+
+bool GuestRangeReadableUncached(const u8 *guest, size_t bytes) {
+  // The host mapping itself (the Switch's guest memory core tracks it; VirtualQuery / mincore elsewhere), not the
+  // guest heap's page table: Renut's own blocks (the Begin*Vertices scratch, records::AllocPhysicalBlock) are mapped
+  // without being in it (2026-11-09: 16,000 false "not mapped" in 3 minutes, their vertices drawn as zeros).
+  if (!guest || !bytes)
+    return true;
+  // 2026-11-17 (1 fps in the world: 77 % of the render thread here, in VirtualQuery): the write tracking
+  // protects single pages, so a large stream's span is one VirtualQuery per 4 KB page. First the guest heap's own page
+  // table (no system call; a freed or decommitted page reads as no access there): readable there is readable. Only a
+  // range it does not vouch for (Renut's own blocks are in no heap's table, or memory really gone) takes the host
+  // mapping walk below.
+  if (auto *memory = REX_KERNEL_MEMORY()) {
+    const uintptr_t membase = reinterpret_cast<uintptr_t>(memory->virtual_membase());
+    const uintptr_t at = reinterpret_cast<uintptr_t>(guest);
+    // Whether the physical heap has [phys, phys + bytes) committed (all of physical memory is one host view, so
+    // committed there is readable through every view of it).
+    auto physical_committed = [&](uint64_t phys) {
+      auto *physical = memory->GetPhysicalHeap();
+      const uint64_t high_phys = phys + bytes - 1;
+      if (!physical || high_phys > 0x1FFFFFFFull)
+        return false;
+      u32 at_phys = u32(phys) & ~0xFFFu;
+      for (int i = 0; i < 64 && uint64_t(at_phys) <= high_phys; ++i) {
+        rex::memory::HeapAllocationInfo info{};
+        if (!physical->QueryRegionInfo(at_phys, &info) || !(info.state & rex::memory::kMemoryAllocationCommit) ||
+            !info.region_size)
+          return false;
+        if (uint64_t(at_phys) + info.region_size > high_phys)
+          return true;
+        at_phys += info.region_size;
+      }
+      return false;
+    };
+    // 2026-11-17 (still 1 fps in the world with the fast paths below: 98 % of the render thread in the
+    // walk at the end, and no [readable-slow] line): the stream pointers are in the host's *physical* view
+    // (physical_membase, TranslatePhysical), which the checks below (the virtual view) never saw.
+    {
+      const uintptr_t physbase = reinterpret_cast<uintptr_t>(memory->physical_membase());
+      if (physbase && at >= physbase && at - physbase < 0x20000000u) {
+        if (physical_committed(at - physbase))
+          return true;
+        static std::atomic<uint32_t> slow_phys{0};
+        const uint32_t n = slow_phys.fetch_add(1, std::memory_order_relaxed);
+        if (n < 8 || (n & (n - 1)) == 0)
+          RGPU_INFO("[readable-slow] physical #{}: {:08X} + {:#x} bytes: not committed in the physical heap", n + 1,
+                    u32(at - physbase), bytes);
+      }
+    }
+    if (at >= membase && at - membase + bytes <= (uint64_t(1) << 32)) {
+      const u32 low = memory->HostToGuestVirtual(guest);
+      const uint64_t high = uint64_t(low) + bytes - 1;
+      if (high <= 0xFFFFFFFFull) {
+        auto *heap = memory->LookupHeap(low);
+        const bool same_heap = heap && heap == memory->LookupHeap(u32(high));
+        if (same_heap && heap->QueryRangeAccess(low, u32(high)) != rex::memory::PageAccess::kNoAccess)
+          return true;
+        // The physical heaps (0xC0000000's 16 MB pages: vertex data at 0xD8xxxxxx) keep no read bit in
+        // the pages' protection, so the walk below ran for them, and one VirtualQuery over the guest's large file
+        // view costs milliseconds (it scans the view's page tables to size the region: a core spent at 1 fps). A
+        // committed guest page is mapped readable on the host: the regions' commit state, still from the table.
+        if (same_heap) {
+          const u32 shift = u32(std::countr_zero(heap->page_size()));
+          u32 at_page = heap->heap_base() + (((low - heap->heap_base()) >> shift) << shift);
+          for (int i = 0; i < 64 && uint64_t(at_page) <= high; ++i) {
+            rex::memory::HeapAllocationInfo info{};
+            if (!heap->QueryRegionInfo(at_page, &info) || !(info.state & rex::memory::kMemoryAllocationCommit) ||
+                !info.region_size)
+              break;
+            if (uint64_t(at_page) + info.region_size > high)
+              return true;
+            at_page += info.region_size;
+          }
+        }
+        // 2026-11-17 (still 1 fps in the world, 98 % of the render thread in the walk below): the game
+        // allocates its vertex data through another view of physical memory (0xA0000000's 64 KB pages or 0xE0000000's
+        // 4 KB ones) and Renut addresses it through 0xC0000000, whose own page table has no record of it. Every
+        // physical view's allocation is made in the physical heap (PhysicalHeap delegates to its parent), and all of
+        // physical memory is one host view: committed there is readable here.
+        if (same_heap && low >= 0xA0000000u &&
+            physical_committed((low & 0x1FFFFFFFu) + (low >= 0xE0000000u ? 0x1000u : 0u)))  // the 4 KB view: +1 page
+          return true;
+        // Bring-up: what still takes the slow walk below (the first ones, then every power of two).
+        static std::atomic<uint32_t> slow{0};
+        const uint32_t n = slow.fetch_add(1, std::memory_order_relaxed);
+        if (n < 8 || (n & (n - 1)) == 0)
+          RGPU_INFO("[readable-slow] #{}: guest {:08X} + {:#x} bytes: {}", n + 1, low, bytes,
+                    !heap ? "no guest heap" : !same_heap ? "spans two heaps" : "the heap's page table says no access");
+      }
+    }
+  }
   static const size_t page = rex::memory::page_size();
   size_t off = 0;
   while (off < bytes) {
@@ -6297,7 +6469,22 @@ void AdvanceStreamCacheFrameLocked() {
   g_stream_memo.Clear();
   g_index_memo.Clear();
   // banjo-nx: banjo_renut_memory_policy's idle time (Renut's kStreamCacheIdleFrames without it).
-  const uint64_t idle_frames = banjo::renut_gpu::StreamCacheIdleFrames(kStreamCacheIdleFrames);
+  uint64_t idle_frames = banjo::renut_gpu::StreamCacheIdleFrames(kStreamCacheIdleFrames);
+  // 2026-11-21 (Switch: 263,000 stream cache entries after 90 s in the world, +2,800 a
+  // second): the policy's idle time is seconds counted as frames at 30 fps, so at 5-8 fps an entry lived 4-6 times
+  // longer. The frames of the idle time at the frame rate measured since the last sweep (60 frames ago), never more
+  // than at 30 fps.
+  {
+    static auto last_sweep = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(now - last_sweep).count();
+    last_sweep = now;
+    if (seconds > 0.0) {
+      const double fps = 60.0 / seconds;
+      if (fps < 30.0)
+        idle_frames = std::max<uint64_t>(60, uint64_t(double(idle_frames) * fps / 30.0));
+    }
+  }
   std::erase_if(g_stream_cache, [idle_frames](auto &entry) {
     if (g_stream_cache_frame - entry.second.last_used < idle_frames)
       return false;

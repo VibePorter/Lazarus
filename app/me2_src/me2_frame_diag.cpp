@@ -1009,3 +1009,132 @@ REX_HOOK_RAW(sub_827DDC18) {  // resume rendering (ResumeRenderingDuringLoad, Re
   __imp__sub_827DDC18(ctx, base);
   g_me2_d3d_suspended.store(false, std::memory_order_relaxed);
 }
+
+// me2-nx-deko (2026-11-18): the collision octree's RemovePrimitive, guarded. PC run 11-18 (ME1 import, male save from
+// the ME1 port): crash at the end of the prologue (after Opening_End_Seq, the ProNor -> next map change, GC caller
+// sub_82599A38) in the octree's RemovePrimitive (vtable 0x8213E5B8 slot 3 = sub_824B4EB8: for each node pointer in
+// the primitive component's OctreeNodes TArray (+288 data / +292 num / +296 max) remove the component from that node's
+// primitive list (sub_824B2388 = TArray RemoveSwap), then Num = 0). Element 23 of 0x6824C180's array was 0x43E46A99
+// (a float, ~456.8; elements 0..22 were fine): the array's tail is someone else's data. AddPrimitive is slot 2
+// (sub_824B4C70; component Bounds: Origin +204, BoxExtent +216, SphereRadius +228; Owner +76).
+// Guard: a node entry that is not an aligned, committed guest pointer is skipped (the valid ones are removed as the
+// original does) and the array is dropped (Data / Num / Max = 0: at worst a leak, never a free of a buffer that is not
+// its own). Logged with the component, its class, owner and bounds. AddPrimitive logs components that end up in an
+// unusual number of nodes (me2_octree_diag_nodes) or with Num > Max, to name the culprit even when the guard holds.
+REXCVAR_DEFINE_BOOL(me2_octree_guard, true, "ME2",
+                    "Collision octree RemovePrimitive: skip node entries that are not valid pointers (crash at the "
+                    "prologue's end, 11-18) and log the component")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(me2_octree_diag_nodes, 0, "ME2",
+                     "Collision octree AddPrimitive: log a component (at most 40) that is in at least this many "
+                     "nodes; 0 = off (default: level meshes are normally in 24-210 nodes, 11-18 PC log)")
+    .range(0, 1 << 20)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+namespace {
+uint32_t OctLoad32(const uint8_t* base, uint32_t va) {
+  return __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + va));
+}
+float OctLoadF(const uint8_t* base, uint32_t va) {
+  const uint32_t u = OctLoad32(base, va);
+  float f;
+  std::memcpy(&f, &u, 4);
+  return f;
+}
+bool OctPointer(uint32_t va, uint32_t len) { return va && (va & 3) == 0 && me2_guest_readable(va, len); }
+// "Outer.Name" of a UObject (Outer +0x28, Name +0x2C / number +0x30), or "?" when it does not look like one.
+std::string OctPath(const uint8_t* base, uint32_t object) {
+  std::string path;
+  for (int depth = 0; object && depth < 12; ++depth) {
+    if (!OctPointer(object, 0x38)) return path.empty() ? fmt::format("?{:08X}", object) : "?." + path;
+    char text[128];
+    if (!me2_name_text(base, OctLoad32(base, object + 0x2C), text, sizeof(text))) return "?" + path;
+    std::string part = text;
+    const uint32_t number = OctLoad32(base, object + 0x30);
+    if (number) part += "_" + std::to_string(number - 1);
+    path = path.empty() ? part : part + "." + path;
+    object = OctLoad32(base, object + 0x28);
+  }
+  return path;
+}
+std::string OctDescribe(const uint8_t* base, uint32_t prim) {
+  const uint32_t cls = OctPointer(prim, 0x40) ? OctLoad32(base, prim + 0x34) : 0;
+  const uint32_t owner = OctPointer(prim, 300) ? OctLoad32(base, prim + 76) : 0;
+  std::string out = fmt::format("{:08X} {} (class {}), owner {}", prim, OctPath(base, prim),
+                                cls ? OctPath(base, cls) : std::string("-"),
+                                owner ? OctPath(base, owner) : std::string("None"));
+  if (OctPointer(prim, 300))
+    out += fmt::format("; bounds origin ({:.1f} {:.1f} {:.1f}) extent ({:.1f} {:.1f} {:.1f}) radius {:.1f}",
+                       OctLoadF(base, prim + 204), OctLoadF(base, prim + 208), OctLoadF(base, prim + 212),
+                       OctLoadF(base, prim + 216), OctLoadF(base, prim + 220), OctLoadF(base, prim + 224),
+                       OctLoadF(base, prim + 228));
+  return out;
+}
+std::atomic<int> g_oct_add_logged{0}, g_oct_bad_logged{0};
+std::atomic<uint32_t> g_oct_guarded{0};
+}  // namespace
+
+REX_EXTERN(__imp__sub_824B4C70);
+REX_HOOK_RAW(sub_824B4C70) {  // collision octree AddPrimitive(this r3, UPrimitiveComponent* r4)
+  const uint32_t prim = ctx.r4.u32;
+  __imp__sub_824B4C70(ctx, base);
+  static const int32_t limit = REXCVAR_GET(me2_octree_diag_nodes);
+  if (limit <= 0 || g_oct_add_logged.load(std::memory_order_relaxed) >= 40 || !OctPointer(prim, 300)) return;
+  const uint32_t data = OctLoad32(base, prim + 288), num = OctLoad32(base, prim + 292),
+                 max = OctLoad32(base, prim + 296);
+  if (int32_t(num) < limit && num <= max) return;
+  if (g_oct_add_logged.fetch_add(1, std::memory_order_relaxed) >= 40) return;
+  REXLOG_WARN("[octree] AddPrimitive: {} -> in {} node(s) (max {}, data {:08X}){}", OctDescribe(base, prim), num,
+              max, data, num > max ? " NUM > MAX" : "");
+}
+
+REX_EXTERN(__imp__sub_824B2388);
+REX_EXTERN(__imp__sub_824B4EB8);
+REX_HOOK_RAW(sub_824B4EB8) {  // collision octree RemovePrimitive(this r3, UPrimitiveComponent* r4)
+  static const bool on = REXCVAR_GET(me2_octree_guard);
+  const uint32_t prim = ctx.r4.u32;
+  if (!on || !OctPointer(prim, 300)) {
+    __imp__sub_824B4EB8(ctx, base);
+    return;
+  }
+  const uint32_t data = OctLoad32(base, prim + 288), num = OctLoad32(base, prim + 292),
+                 max = OctLoad32(base, prim + 296);
+  bool bad = int32_t(num) < 0 || num > max || (num && !OctPointer(data, num * 4));
+  uint32_t first_bad = num;
+  if (!bad) {
+    for (uint32_t i = 0; i < num; ++i) {
+      const uint32_t node = OctLoad32(base, data + 4 * i);
+      if (!OctPointer(node, 12)) {
+        bad = true;
+        first_bad = i;
+        break;
+      }
+    }
+  }
+  if (!bad) {
+    __imp__sub_824B4EB8(ctx, base);
+    return;
+  }
+  g_oct_guarded.fetch_add(1, std::memory_order_relaxed);
+  if (g_oct_bad_logged.fetch_add(1, std::memory_order_relaxed) < 20) {
+    std::string entries;
+    const bool data_ok = OctPointer(data, 4 * std::min<uint32_t>(num, 64));
+    for (uint32_t i = 0; data_ok && i < std::min<uint32_t>(num, 64); ++i)
+      entries += fmt::format(" {:08X}", OctLoad32(base, data + 4 * i));
+    REXLOG_ERROR("[octree] RemovePrimitive: bad OctreeNodes on {}: num {} max {} data {:08X}, first bad entry {}; "
+                 "entries:{}; the valid ones removed, the array dropped (me2_octree_guard)",
+                 OctDescribe(base, prim), num, max, data, first_bad, data_ok ? entries : std::string(" (unreadable)"));
+  }
+  const uint32_t owner_ctx_r4 = prim;
+  if (OctPointer(data, 4 * std::min<uint32_t>(num, 4096))) {
+    for (uint32_t i = 0; i < num && i < 4096; ++i) {
+      const uint32_t node = OctLoad32(base, data + 4 * i);
+      if (!OctPointer(node, 12)) continue;
+      const uint32_t node_num = OctLoad32(base, node + 4);
+      if (int32_t(node_num) < 0 || (node_num && !OctPointer(OctLoad32(base, node), node_num * 4))) continue;
+      ctx.r3.u64 = node;
+      ctx.r4.u64 = owner_ctx_r4;
+      __imp__sub_824B2388(ctx, base);
+    }
+  }
+  for (uint32_t off = 288; off <= 296; off += 4) *reinterpret_cast<uint32_t*>(base + prim + off) = 0;
+}

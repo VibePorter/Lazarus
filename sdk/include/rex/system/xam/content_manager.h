@@ -29,6 +29,9 @@ namespace rex {
 namespace system {
 class KernelState;
 }  // namespace system
+namespace filesystem {
+class Device;
+}  // namespace filesystem
 }  // namespace rex
 
 namespace rex {
@@ -133,6 +136,10 @@ class ContentPackage {
   uint32_t GetPackageLicense() const { return license_; }
 
  private:
+  // me2-nx-deko (2026-11-19): content_overlay_root (content_manager.cpp).
+  std::unique_ptr<rex::filesystem::Device> WrapContentOverlay(std::unique_ptr<rex::filesystem::Device> device,
+                                                              const XCONTENT_AGGREGATE_DATA& data);
+
   KernelState* kernel_state_;
   std::string root_name_;
   std::string device_path_;

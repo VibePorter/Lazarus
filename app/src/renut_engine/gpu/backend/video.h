@@ -142,6 +142,19 @@ struct VideoState {
   uint32_t kick_lists_used[kFramesInFlight] = {};
   plume::RenderCommandList *pending_list = nullptr;
   uint64_t pending_ticket = 0;
+  // 2026-11-21 (renut_batched_uploads): a list's texture uploads in a companion list
+  // submitted right before it, so they cost one full barrier at its end (and at most one before, when they overwrite
+  // an image earlier work may use) instead of one each in the middle of the draws: ~50 full barriers a frame on the
+  // console, each one draining the GPU. upload_open: the open list's companion (recording); pending_upload:
+  // pending_list's (ended).
+  static constexpr uint32_t kUploadLists = kKickLists + 4;
+  std::unique_ptr<plume::RenderCommandList> upload_lists[kFramesInFlight][kUploadLists];
+  uint32_t upload_lists_used[kFramesInFlight] = {};
+  plume::RenderCommandList *upload_open = nullptr;
+  plume::RenderCommandList *pending_upload = nullptr;
+  plume::RenderTexture *upload_last = nullptr;  // a texture it wrote (the end barrier names one)
+  bool upload_waited = false;                   // it has waited for the GPU's earlier work (a full barrier)
+  uint64_t upload_copies = 0, upload_inplace = 0, upload_lists_made = 0;  // the [uploads] report
   uint32_t list_draws = 0;
   // Bumped each time a command list begins; bound state cached against an
   // older value has to be set again.
@@ -333,6 +346,13 @@ public:
   static void KickLocked(bool force = false);
   static void NoteDrawLocked();
   static plume::RenderCommandList *CommandListLocked();
+  // 2026-11-21 (renut_batched_uploads): the open list's upload companion (begun on first use), or null
+  // when batching is off or no list is free (the caller records into CommandListLocked() as before).
+  // 'overwrites_used': the image may be in use by work submitted earlier (not a new image): the companion waits for
+  // that work once.
+  static plume::RenderCommandList *UploadListLocked(bool overwrites_used, plume::RenderTexture *texture);
+  // An upload recorded in place (batching refused it), for the [uploads] report.
+  static void NoteInPlaceUploadLocked();
   static UploadRing &UploadsLocked();
 
   static uint32_t AllocateTextureSlotLocked();

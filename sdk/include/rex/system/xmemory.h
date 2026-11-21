@@ -16,6 +16,7 @@
 #include <mutex>
 #include <string>
 #include <utility>
+#include <atomic>
 #include <vector>
 
 #include <rex/memory/utils.h>
@@ -691,6 +692,22 @@ class Memory {
   rex::thread::global_critical_region global_critical_region_;
   std::vector<std::pair<PhysicalMemoryInvalidationCallback, void*>*>
       physical_memory_invalidation_callbacks_;
+
+ public:
+  // 2026-11-19: bumped at the start of every heap Decommit / Release and every Protect without read access
+  // (PhysicalHeap's go through its parent's too). A reader that found a guest range readable at generation G may reuse
+  // that answer while the generation is still G (Renut's GuestRangeReadable memo).
+  uint64_t release_generation() const { return release_generation_.load(std::memory_order_acquire); }
+  void BumpReleaseGeneration(int kind = 0) {
+    release_generation_.fetch_add(1, std::memory_order_acq_rel);
+    release_kinds_[kind & 3].fetch_add(1, std::memory_order_relaxed);
+  }
+  // Bumps by kind since the start: 0 Decommit, 1 Release, 2 Protect without read access.
+  uint64_t release_kind_count(int kind) const { return release_kinds_[kind & 3].load(std::memory_order_relaxed); }
+
+ private:
+  std::atomic<uint64_t> release_generation_{0};
+  std::atomic<uint64_t> release_kinds_[4] = {};
 };
 
 }  // namespace rex::memory

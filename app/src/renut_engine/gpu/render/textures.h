@@ -63,6 +63,12 @@ struct HostTexture {
   uint32_t alloc_width = 0;   // host texture size (block-aligned for BC, scaled)
   uint32_t alloc_height = 0;
   plume::RenderTextureLayout layout = plume::RenderTextureLayout::UNKNOWN;
+  // 2026-11-21 (renut_batched_uploads): the command list
+  // (VideoState::list_generation) a draw last sampled it in (TransitionTextureLocked to a read layout; every bind
+  // path and the memos' replays go through it). An upload while that list is still open is recorded in place, after
+  // the draws that read the old content; the lists before are ahead in the queue, and the upload companion waits
+  // for them.
+  uint64_t sampled_list = 0;
   uint32_t slot = UINT32_MAX;  // bindless texture slot
   bool render_target = false;  // created as a color target (resolve destination)
   // What 'view' was made with: the view and the fetch constant swizzle it

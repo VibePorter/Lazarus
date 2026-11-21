@@ -144,6 +144,10 @@ banjo_renut_store_cards = true
 me2_renut_repeat_draws = true
 me2_renut_delta_prefetch = false
 me2_renut_sparse_full_frames = 64
+# 2026-11-21: a command list's texture uploads go into one companion list with a single barrier
+# (deko3d), and the deferred vertex fills remember readable guest ranges until memory is released. false = as before.
+renut_batched_uploads = true
+renut_readable_memo = true
 me2_hot_stream_distance = true
 kernel_critsec_spin = 1024
 

@@ -595,11 +595,32 @@ bool Upload(HostTexture &t, const TextureFetch &fetch, bool defer_read, uint32_t
 
   auto &s = State();
   plume::RenderCommandList *cmd = s.command_list;
-  static const uint32_t kProfileLabel = gpu_profile::Label("texture uploads");
-  gpu_profile::Mark(s, kProfileLabel);
-  cmd->barriers(plume::RenderBarrierStage::COPY,
-                plume::RenderTextureBarrier(t.texture.get(), plume::RenderTextureLayout::COPY_DEST));
-  t.layout = plume::RenderTextureLayout::COPY_DEST;
+  // 2026-11-21 (renut_batched_uploads): into the open list's upload companion, which
+  // runs before the list's draws, unless a draw of this list has sampled the texture already (it must see the old
+  // content); streaming levels (a part of the chain) may go early: a level more is only more detail. The companion
+  // waits for earlier work before overwriting an image that is not new, and ends with the barrier these draws need, so
+  // the texture counts as readable at once.
+  // Nor a texture something in the list may have written (a render target, or one last left in a copy or write layout,
+  // an in-place upload's included): the early copy would land before that write.
+  const bool streaming_levels = first_level != 0 || end_level != UINT32_MAX;
+  const bool layout_read_or_new = t.layout == plume::RenderTextureLayout::UNKNOWN ||
+                                  t.layout == plume::RenderTextureLayout::SHADER_READ ||
+                                  t.layout == plume::RenderTextureLayout::DEPTH_READ;
+  const bool batchable = !t.render_target && layout_read_or_new &&
+                         (streaming_levels || t.sampled_list != s.list_generation);
+  plume::RenderCommandList *batch =
+      batchable ? Video::UploadListLocked(t.layout != plume::RenderTextureLayout::UNKNOWN, t.texture.get()) : nullptr;
+  if (batch) {
+    cmd = batch;
+    t.layout = plume::RenderTextureLayout::SHADER_READ;
+  } else {
+    Video::NoteInPlaceUploadLocked();
+    static const uint32_t kProfileLabel = gpu_profile::Label("texture uploads");
+    gpu_profile::Mark(s, kProfileLabel);
+    cmd->barriers(plume::RenderBarrierStage::COPY,
+                  plume::RenderTextureBarrier(t.texture.get(), plume::RenderTextureLayout::COPY_DEST));
+    t.layout = plume::RenderTextureLayout::COPY_DEST;
+  }
 
   const bool is_3d_data = fetch.Dimension() == TextureDimension::Tex3D;
   // Host array layers (cube faces, stacked layers); a stacked texture's extra
@@ -1564,6 +1585,9 @@ bool ReadOnlyLayout(plume::RenderTextureLayout layout) {
 }
 
 void TransitionTextureLocked(HostTexture *texture, plume::RenderTextureLayout layout) {
+  if (texture && (layout == plume::RenderTextureLayout::SHADER_READ ||
+                  layout == plume::RenderTextureLayout::DEPTH_READ))
+    texture->sampled_list = State().list_generation;  // 2026-11-21: renut_batched_uploads
   if (!texture || !texture->texture || texture->layout == layout)
     return;
   if (IsDeko3D() && banjo::renut_gpu::Deko3DBarrierLeanOn() && ReadOnlyLayout(texture->layout) &&

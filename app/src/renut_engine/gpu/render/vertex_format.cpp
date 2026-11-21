@@ -234,6 +234,70 @@ float DecodeComponent(u32 word, u32 shift, u32 bits, const DeclType &type) {
   return float(raw) / (bits == 32 ? 4294967295.0f : float((1u << bits) - 1u));
 }
 
+// 2026-11-19 (Switch: ConvertVertices 16 % of the render thread). The PC tally (renut_diag_fill_bytes'
+// [fill-kinds]) of the streams converted at every flush: SHORT4 copied with its halves swapped (two words a vertex, 780k
+// vertices a frame) and SHORT4 integers expanded to float4 with a swizzle (260k a frame), both a scalar loop per
+// vertex. NEON versions of both; ConvertVertices' first call compares them with the scalar ones on random data (all
+// endian modes, signed / unsigned, normalized / integer, swizzles) and keeps the scalar ones if any byte differs.
+bool g_neon_convert = false;  // set by NeonConvertSelfTest
+
+#if defined(__aarch64__)
+template <u32 kEndian>
+inline uint8x8_t SwapVector64(uint8x8_t v) {
+  if constexpr (kEndian == 1)
+    return vrev16_u8(v);
+  else if constexpr (kEndian == 2)
+    return vrev32_u8(v);
+  else if constexpr (kEndian == 3)
+    return vreinterpret_u8_u16(vrev32_u16(vreinterpret_u16_u8(v)));
+  else
+    return v;
+}
+
+// k16_16 (kFour false) / k16_16_16_16 to four floats, as ExpandElement's scalar decode and ExpandLoop's swizzle: the
+// components are the 16-bit halves of the swapped words, low half first; the swizzle is one table lookup over the four
+// components and the constants 0 and 1.
+template <u32 kEndian, bool kFour>
+void Expand16Neon(const u8 *src, u32 src_stride, u8 *dst, u32 dst_stride, u32 count, const DeclType &type) {
+  alignas(16) u8 index_bytes[16];
+  for (u32 i = 0; i < 4; ++i) {
+    const u32 pick = type.swizzle[i] < 6 ? type.swizzle[i] : 4;
+    const u32 base = pick < 4 ? pick * 4 : pick == 4 ? 16 : 20;
+    for (u32 b = 0; b < 4; ++b)
+      index_bytes[i * 4 + b] = u8(base + b);
+  }
+  const uint8x16_t index = vld1q_u8(index_bytes);
+  alignas(16) static const float kConstants[4] = {0.0f, 1.0f, 0.0f, 0.0f};
+  const uint8x16_t constants = vreinterpretq_u8_f32(vld1q_f32(kConstants));
+  const bool is_signed = type.is_signed, is_integer = type.is_integer;
+  const float32x4_t scale = vdupq_n_f32(is_signed ? 32767.0f : 65535.0f), minus_one = vdupq_n_f32(-1.0f);
+  for (u32 v = 0; v < count; ++v, src += src_stride, dst += dst_stride) {
+    uint16x4_t lanes;
+    if constexpr (kFour) {
+      lanes = vreinterpret_u16_u8(SwapVector64<kEndian>(vld1_u8(src)));
+    } else {
+      lanes = vcreate_u16(uint64_t(LoadGuestWord<kEndian>(src)));
+    }
+    float32x4_t c;
+    if (is_signed) {
+      c = vcvtq_f32_s32(vmovl_s16(vreinterpret_s16_u16(lanes)));
+      if (!is_integer)
+        c = vmaxq_f32(vdivq_f32(c, scale), minus_one);
+    } else {
+      c = vcvtq_f32_u32(vmovl_u16(lanes));
+      if (!is_integer)
+        c = vdivq_f32(c, scale);
+    }
+    if constexpr (!kFour) {
+      c = vsetq_lane_f32(0.0f, c, 2);
+      c = vsetq_lane_f32(1.0f, c, 3);
+    }
+    const uint8x16x2_t table = {{vreinterpretq_u8_f32(c), constants}};
+    vst1q_u8(dst, vqtbl2q_u8(table, index));
+  }
+}
+#endif
+
 // Expands one element of 'count' vertices to four floats: 'decode' fills the
 // format's components (before swizzle) of the first slots of c[6], which start
 // as 0, 0, 0, 1 followed by the swizzle constants 0 and 1.
@@ -298,6 +362,12 @@ void ExpandElement(const HostVertexElement &e, const u8 *src, u32 src_stride, u8
     });
     break;
   case k16_16:
+#if defined(__aarch64__)
+    if (g_neon_convert) {
+      Expand16Neon<kEndian, false>(src, src_stride, dst, dst_stride, count, type);
+      break;
+    }
+#endif
     expand([&](const u8 *p, float c[6]) {
       const u32 w = word(p, 0);
       c[0] = DecodeComponent(w, 0, 16, type);
@@ -305,6 +375,12 @@ void ExpandElement(const HostVertexElement &e, const u8 *src, u32 src_stride, u8
     });
     break;
   case k16_16_16_16:
+#if defined(__aarch64__)
+    if (g_neon_convert) {
+      Expand16Neon<kEndian, true>(src, src_stride, dst, dst_stride, count, type);
+      break;
+    }
+#endif
     expand([&](const u8 *p, float c[6]) {
       const u32 w0 = word(p, 0), w1 = word(p, 1);
       c[0] = DecodeComponent(w0, 0, 16, type);
@@ -572,6 +648,14 @@ void CopyWordsLoop(const u8 *src, u32 src_stride, u8 *dst, u32 dst_stride, u32 c
       return;
     }
   }
+  // 2026-11-19: a two-word element (SHORT4, halves swapped: 780k vertices a frame) is one 64-bit vector.
+  if constexpr (kWords == 2 && kEndian != 0) {
+    if (g_neon_convert) {
+      for (u32 v = 0; v < count; ++v, src += src_stride, dst += dst_stride)
+        vst1_u8(dst, SwapVector64<kEndian>(vld1_u8(src)));
+      return;
+    }
+  }
 #endif
   for (u32 v = 0; v < count; ++v, src += src_stride, dst += dst_stride)
     SwapWordsAs<kEndian>(src, dst, kWords);
@@ -619,10 +703,82 @@ void CopyElementWords(const u8 *src, u32 src_stride, u8 *dst, u32 dst_stride, u3
   }
 }
 
+// The NEON conversions against the scalar ones (g_neon_convert off, then on) on random vertices; true = all equal.
+bool NeonConvertSelfTest(u32 &cases) {
+  cases = 0;
+#if defined(__aarch64__)
+  constexpr u32 kCount = 37, kStride = 20, kOut = 16;
+  u8 src[kCount * kStride + 16];
+  uint64_t x = 0x9E3779B97F4A7C15ull;
+  for (u8 &b : src) {
+    x ^= x << 13, x ^= x >> 7, x ^= x << 17;
+    b = u8(x);
+  }
+  // Extremes in the first vertices: 0x8000 (-32768: clamped to -1 normalized), 0x7FFF, 0xFFFF, 0.
+  const u8 extremes[] = {0x80, 0x00, 0x7F, 0xFF, 0xFF, 0xFF, 0x00, 0x00};
+  std::memcpy(src + 4, extremes, sizeof(extremes));
+  std::memcpy(src + kStride + 4, extremes + 4, 4);
+  std::memcpy(src + kStride + 8, extremes, 4);
+  static const u8 kSwizzles[][4] = {{0, 1, 2, 3}, {1, 0, 3, 2}, {1, 0, 4, 5}, {2, 3, 0, 1}, {4, 5, 7, 0}, {3, 3, 1, 5}};
+  bool all_equal = true;
+  auto expand = [&](u32 endian, const HostVertexElement &e, u8 *out) {
+    switch (endian) {
+    case 1: ExpandElement<1>(e, src + 4, kStride, out, kOut, kCount); break;
+    case 2: ExpandElement<2>(e, src + 4, kStride, out, kOut, kCount); break;
+    case 3: ExpandElement<3>(e, src + 4, kStride, out, kOut, kCount); break;
+    default: ExpandElement<0>(e, src + 4, kStride, out, kOut, kCount); break;
+    }
+  };
+  for (u32 endian = 0; endian < 4; ++endian) {
+    for (u32 format : {u32(k16_16), u32(k16_16_16_16)}) {
+      for (u32 flags = 0; flags < 4; ++flags) {
+        for (const auto &swizzle : kSwizzles) {
+          HostVertexElement e;
+          e.conversion = ElementConversion::ExpandFloat;
+          e.type.format = format;
+          e.type.is_signed = (flags & 1) != 0;
+          e.type.is_integer = (flags & 2) != 0;
+          std::memcpy(e.type.swizzle, swizzle, 4);
+          u8 scalar[kCount * kOut], neon[kCount * kOut];
+          g_neon_convert = false;
+          expand(endian, e, scalar);
+          g_neon_convert = true;
+          expand(endian, e, neon);
+          g_neon_convert = false;
+          all_equal &= std::memcmp(scalar, neon, sizeof(scalar)) == 0;
+          ++cases;
+        }
+      }
+    }
+    u8 scalar[kCount * 8], neon[kCount * 8];
+    CopyElementWords(src + 4, kStride, scalar, 8, kCount, 2, endian);
+    g_neon_convert = true;
+    CopyElementWords(src + 4, kStride, neon, 8, kCount, 2, endian);
+    g_neon_convert = false;
+    all_equal &= std::memcmp(scalar, neon, sizeof(scalar)) == 0;
+    ++cases;
+  }
+  return all_equal;
+#else
+  return false;
+#endif
+}
+
 } // namespace
 
 void ConvertVertices(const HostVertexStream &stream, const u8 *guest, u32 guest_stride,
                      u32 vertex_count, u32 endian, u8 *host) {
+  static const bool neon_convert = [] {
+    u32 cases = 0;
+    const bool equal = NeonConvertSelfTest(cases);
+#if defined(__aarch64__)
+    RGPU_INFO("[neon-convert] self-test: {} cases, {}", cases,
+              equal ? "NEON conversions equal to the scalar ones: on" : "a NEON conversion DIFFERS: scalar kept");
+#endif
+    g_neon_convert = equal;  // once, here: renut_parallel_fills converts on two threads (no write per call)
+    return equal;
+  }();
+  (void)neon_convert;
   bool copy_only = true, same_layout = stream.host_stride == guest_stride && guest_stride % 4 == 0;
   for (const HostVertexElement &element : stream.elements) {
     copy_only &= element.conversion == ElementConversion::Copy32 && !element.swap_halves;

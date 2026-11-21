@@ -631,6 +631,33 @@ plume::RenderCommandList *SlotList(VideoState &s, uint32_t slot) {
 
 namespace {
 
+// 2026-11-21 (renut_batched_uploads; video.h VideoState::upload_lists): the open list's
+// upload companion ended with the barrier its list relies on (every copy done and the texture caches dropped before
+// the list's draws), or null when it had none.
+plume::RenderCommandList *EndUploadListLocked(VideoState &s) {
+  plume::RenderCommandList *list = s.upload_open;
+  if (!list)
+    return nullptr;
+  list->barriers(plume::RenderBarrierStage::COPY | plume::RenderBarrierStage::GRAPHICS,
+                 plume::RenderTextureBarrier(s.upload_last, plume::RenderTextureLayout::SHADER_READ));
+  list->end();
+  s.upload_open = nullptr;
+  s.upload_last = nullptr;
+  s.upload_waited = false;
+  return list;
+}
+
+// The lists to submit for 'main' with its companion first (null entries left out); returns the count.
+uint32_t WithUploads(const plume::RenderCommandList *upload, const plume::RenderCommandList *main,
+                     const plume::RenderCommandList **out) {
+  uint32_t n = 0;
+  if (upload)
+    out[n++] = upload;
+  if (main)
+    out[n++] = main;
+  return n;
+}
+
 // After the slot's fence has been waited: its frame's GPU time, the sum of its
 // lists' spans (so the gaps where the GPU waited on the CPU are left out).
 void CollectGpuTime(VideoState &s, uint32_t slot) {
@@ -807,6 +834,7 @@ void WaitSlotLocked(VideoState &s, uint32_t slot) {
   OcclusionDepthCollectLocked(slot);  // ME2 (2026-10-28, me2_occlusion_umbra_cpu): the slot's depth grid is done
   // banjo-nx (2026-10-19, banjo_deko3d_kick_submit): every list of the slot's frame has run: its kick lists are free.
   s.kick_lists_used[slot] = 0;
+  s.upload_lists_used[slot] = 0;  // 2026-11-21: and its upload companions
   s.slot_list[slot] = nullptr;
 }
 
@@ -831,12 +859,16 @@ void SubmitAndWaitLocked(VideoState &s) {
   EndListTiming(s, false);
   banjo::renut_gpu::record::Drain();  // banjo-nx (banjo_renut_record_worker): played on the real list first
   plume::RenderCommandList *current = SlotList(s, cur);
+  plume::RenderCommandList *current_upload = EndUploadListLocked(s);  // 2026-11-21: renut_batched_uploads
   current->end();
   PublishAll(s, cur);  // banjo-nx: banjo_renut_upload_cached (and the cleaner's ranges, 2026-10-19)
-  // banjo-nx (2026-10-19, banjo_deko3d_kick_submit): the list ended at the last kick first.
-  const plume::RenderCommandList *lists[] = {s.pending_list ? s.pending_list : current, current};
-  const uint32_t count = s.pending_list ? 2 : 1;
+  // banjo-nx (2026-10-19, banjo_deko3d_kick_submit): the list ended at the last kick first; 2026-11-21:
+  // each after its upload companion.
+  const plume::RenderCommandList *lists[4];
+  uint32_t count = WithUploads(s.pending_upload, s.pending_list, lists);
+  count += WithUploads(current_upload, current, lists + count);
   s.pending_list = nullptr;
+  s.pending_upload = nullptr;
   s.queue->executeCommandLists(lists, count, nullptr, 0, nullptr, 0, s.fences[cur].get());
   {
     render_thread::WaitScope wait;
@@ -846,6 +878,7 @@ void SubmitAndWaitLocked(VideoState &s) {
   // The slot's upload ring and retired objects stay: the rest of the frame
   // records into the same slot. banjo-nx: every list of it has run, so its first list is free again.
   s.kick_lists_used[cur] = 0;
+  s.upload_lists_used[cur] = 0;  // 2026-11-21: renut_batched_uploads
   s.slot_list[cur] = nullptr;
   s.command_list = banjo::renut_gpu::record::Wrap(s.command_lists[cur].get());
   s.command_list->begin();
@@ -862,14 +895,18 @@ void SubmitAndAdvance(VideoState &s, plume::RenderCommandSemaphore *wait,
     EndListTiming(s, true);
     banjo::renut_gpu::record::Drain();  // banjo-nx (banjo_renut_record_worker)
     plume::RenderCommandList *current = SlotList(s, cur);
+    plume::RenderCommandList *current_upload = EndUploadListLocked(s);  // 2026-11-21: renut_batched_uploads
     current->end();
     s.list_open = false;
     s.command_list = nullptr;
     PublishAll(s, cur);  // banjo-nx: banjo_renut_upload_cached (and the cleaner's ranges, 2026-10-19)
-    // banjo-nx (2026-10-19, banjo_deko3d_kick_submit): the list ended at the last kick first.
-    const plume::RenderCommandList *lists[] = {s.pending_list ? s.pending_list : current, current};
-    const uint32_t count = s.pending_list ? 2 : 1;
+    // banjo-nx (2026-10-19, banjo_deko3d_kick_submit): the list ended at the last kick first; 2026-11-21:
+    // each after its upload companion.
+    const plume::RenderCommandList *lists[4];
+    uint32_t count = WithUploads(s.pending_upload, s.pending_list, lists);
+    count += WithUploads(current_upload, current, lists + count);
     s.pending_list = nullptr;
+    s.pending_upload = nullptr;
     plume::RenderCommandSemaphore *waits[] = {wait};
     plume::RenderCommandSemaphore *signals[] = {signal};
     s.queue->executeCommandLists(lists, count, wait ? waits : nullptr, wait ? 1 : 0,
@@ -1108,7 +1145,9 @@ void Video::KickLocked(bool force) {
       detail::RingCleaner::Instance().Wait(s.pending_ticket);
     else
       s.uploads[cur].Publish();
-    const plume::RenderCommandList *lists[] = {s.pending_list};
+    const plume::RenderCommandList *lists[2];
+    const uint32_t count = detail::WithUploads(s.pending_upload, s.pending_list, lists);  // 2026-11-21: renut_batched_uploads
+    s.pending_upload = nullptr;
     // banjo-nx (2026-10-20, banjo_deko3d_latency_trim): a fence for each kick submission, how far the GPU has got.
     plume::RenderCommandFence *fence = nullptr;
 #if defined(PLUME_DEKO3D)
@@ -1120,7 +1159,7 @@ void Video::KickLocked(bool force) {
       fence = f.get();
     }
 #endif
-    s.queue->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, fence);
+    s.queue->executeCommandLists(lists, count, nullptr, 0, nullptr, 0, fence);
 #if defined(PLUME_DEKO3D)
     if (fence) {
       t.last_kick[cur] = plume::Deko3DCopyFence(fence);
@@ -1148,6 +1187,7 @@ void Video::KickLocked(bool force) {
   detail::EndListTiming(s, false);
   banjo::renut_gpu::record::Drain();
   plume::RenderCommandList *current = detail::SlotList(s, cur);
+  s.pending_upload = detail::EndUploadListLocked(s);  // 2026-11-21: submitted right before it
   current->end();
   s.pending_list = current;
   s.pending_ticket = detail::UseRingCleaner() ? ticket : 0;
@@ -1186,8 +1226,10 @@ void Video::KickLocked(bool force) {
         f = s.device->createCommandFence();
       fence = f.get();
     }
-    const plume::RenderCommandList *lists[] = {s.pending_list};
-    s.queue->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, fence);
+    const plume::RenderCommandList *lists[2];
+    const uint32_t count = detail::WithUploads(s.pending_upload, s.pending_list, lists);  // 2026-11-21: renut_batched_uploads
+    s.pending_upload = nullptr;
+    s.queue->executeCommandLists(lists, count, nullptr, 0, nullptr, 0, fence);
     if (fence) {
       t.last_kick[cur] = plume::Deko3DCopyFence(fence);
       ++t.kick_submits[cur];
@@ -1201,6 +1243,66 @@ void Video::KickLocked(bool force) {
 
 plume::RenderCommandList *Video::CommandListLocked() {
   return State().command_list;
+}
+
+// 2026-11-21: see VideoState::upload_lists. deko3d only (no image layouts there: the
+// companion's end barrier stands for every texture it wrote). Code default off; renut_batched_uploads = true in the
+// toml.
+REXCVAR_DEFINE_BOOL(renut_batched_uploads, false, "Nuts&Bolts/Renderer",
+                    "deko3d: a command list's texture uploads recorded into a companion list submitted right before "
+                    "it (one full barrier for them all instead of one each between the draws)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+namespace {
+void UploadReportLocked(VideoState &s) {
+  static auto window = std::chrono::steady_clock::now();
+  const auto now = std::chrono::steady_clock::now();
+  if (now - window < std::chrono::seconds(10))
+    return;
+  window = now;
+  if (s.upload_copies || s.upload_inplace)
+    RGPU_INFO("[uploads] 10 s: {} texture uploads batched in {} companion lists, {} recorded in place (sampled "
+              "already this frame, or no companion free) (renut_batched_uploads)",
+              s.upload_copies, s.upload_lists_made, s.upload_inplace);
+  s.upload_copies = s.upload_inplace = s.upload_lists_made = 0;
+}
+}  // namespace
+
+plume::RenderCommandList *Video::UploadListLocked(bool overwrites_used, plume::RenderTexture *texture) {
+  static const bool on = REXCVAR_GET(renut_batched_uploads);
+  auto &s = State();
+  if (!on || !IsDeko3D() || !s.list_open)
+    return nullptr;
+  UploadReportLocked(s);
+  const uint32_t cur = s.frame;
+  if (!s.upload_open) {
+    if (s.upload_lists_used[cur] >= VideoState::kUploadLists)
+      return nullptr;
+    std::unique_ptr<plume::RenderCommandList> &list = s.upload_lists[cur][s.upload_lists_used[cur]];
+    if (!list) {
+      list = s.queue->createCommandList();
+      if (!list)
+        return nullptr;
+    }
+    ++s.upload_lists_used[cur];
+    ++s.upload_lists_made;
+    list->begin();
+    s.upload_open = list.get();
+    s.upload_waited = false;
+  }
+  // An image earlier work may still read or write: the copies after this wait for that work (once a list).
+  if (overwrites_used && !s.upload_waited) {
+    s.upload_open->barriers(plume::RenderBarrierStage::COPY, static_cast<const plume::RenderTextureBarrier *>(nullptr),
+                            0);
+    s.upload_waited = true;
+  }
+  s.upload_last = texture;
+  ++s.upload_copies;
+  return s.upload_open;
+}
+
+void Video::NoteInPlaceUploadLocked() {
+  ++State().upload_inplace;
 }
 
 UploadRing &Video::UploadsLocked() {

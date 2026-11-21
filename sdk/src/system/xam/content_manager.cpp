@@ -19,6 +19,7 @@
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
 #include <rex/filesystem/devices/host_path_device.h>
+#include <rex/filesystem/devices/overlay_device.h>
 #include <rex/filesystem/devices/pack_device.h>
 #include <rex/filesystem/devices/stfs_container_device.h>
 #include <rex/logging.h>
@@ -58,6 +59,16 @@ REXCVAR_DEFINE_BOOL(content_marketplace_read_only, true, "Kernel",
 REXCVAR_DEFINE_STRING(content_backup_root, "", "Kernel",
                       "Folder where a copy of each save is left, with one subfolder per profile. "
                       "Empty = nothing is copied");
+// me2-nx-deko (2026-11-19): game_overlay_root for DLC. <content_overlay_root>/<package folder name>/... is laid over
+// that marketplace package's files (pack or loose), the same OverlayDevice as the game's overlay. Used by the Russian
+// voice-over (its DLC LOC packages and afc files); a package without a folder there mounts as before.
+REXCVAR_DEFINE_STRING(content_overlay_root, "", "Kernel",
+                      "Folder of per-package overlays for marketplace content (DLC): <root>/<package folder name>/"
+                      "... replaces or adds files of that package. Empty = off")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// system/runtime.cpp: the Russian voice-over's DLC half is <me2_russian_voiceover_root>/dlc (root resolved there).
+REXCVAR_DECLARE(bool, me2_russian_voiceover);
+REXCVAR_DECLARE(std::string, me2_russian_voiceover_root);
 
 namespace rex {
 namespace system {
@@ -220,29 +231,79 @@ ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view
   // me2-nx-deko (2026-11-07): a DLC package folder may hold just its asset pack, <name>/<name>.nxpack + .nxidx
   // (tools/build_dlc_packs.py), the same format as the game's pack: 23 packages are then ~70 files on the SD card
   // instead of ~1,400 (MTP uploads) and a mount reads one index instead of walking the folder.
+  std::unique_ptr<rex::filesystem::Device> mounted;
   if (read_only && rex::filesystem::PackDevice::Exists(package_path)) {
     auto pack = std::make_unique<rex::filesystem::PackDevice>(device_path_, package_path);
     if (pack->Initialize()) {
-      fs->RegisterDevice(std::move(pack));
-      fs->RegisterSymbolicLink(root_name_ + ":", device_path_);
-      return;
+      mounted = std::move(pack);
+    } else {
+      REXSYS_ERROR("[pack] DLC '{}': its pack could not be mounted, using the loose files of {}", data.file_name(),
+                   rex::path_to_utf8(package_path));
     }
-    REXSYS_ERROR("[pack] DLC '{}': its pack could not be mounted, using the loose files of {}", data.file_name(),
-                 rex::path_to_utf8(package_path));
   }
-  auto device = std::make_unique<rex::filesystem::HostPathDevice>(device_path_, package_path, read_only,
-                                                                  /*allow_share_delete=*/true);
-  if (read_only) {
-    // package_path = <content root>/<xuid>/<title>/<type>/<name>
-    std::filesystem::path root = package_path;
-    if (!root.has_filename()) root = root.parent_path();
-    const std::string name = rex::path_to_utf8(root.filename());
-    for (int i = 0; i < 4 && root.has_parent_path(); ++i) root = root.parent_path();
-    device->SetIndexPath(root.parent_path() / "cache" / rex::to_path("vfs_index_dlc_" + name + ".bin"));
+  if (!mounted) {
+    auto device = std::make_unique<rex::filesystem::HostPathDevice>(device_path_, package_path, read_only,
+                                                                    /*allow_share_delete=*/true);
+    if (read_only) {
+      // package_path = <content root>/<xuid>/<title>/<type>/<name>
+      std::filesystem::path root = package_path;
+      if (!root.has_filename()) root = root.parent_path();
+      const std::string name = rex::path_to_utf8(root.filename());
+      for (int i = 0; i < 4 && root.has_parent_path(); ++i) root = root.parent_path();
+      device->SetIndexPath(root.parent_path() / "cache" / rex::to_path("vfs_index_dlc_" + name + ".bin"));
+    }
+    device->Initialize();
+    mounted = std::move(device);
   }
-  device->Initialize();
-  fs->RegisterDevice(std::move(device));
+  if (marketplace) {
+    mounted = WrapContentOverlay(std::move(mounted), data);
+  }
+  fs->RegisterDevice(std::move(mounted));
   fs->RegisterSymbolicLink(root_name_ + ":", device_path_);
+}
+
+// content_overlay_root: <root>/<package folder name>/ over the package's own device (see the cvar).
+std::unique_ptr<rex::filesystem::Device> ContentPackage::WrapContentOverlay(
+    std::unique_ptr<rex::filesystem::Device> device, const XCONTENT_AGGREGATE_DATA& data) {
+  std::string overlay_root = REXCVAR_GET(content_overlay_root);
+  std::erase(overlay_root, '"');  // string cvars can come back quoted
+  if (overlay_root.empty() && REXCVAR_GET(me2_russian_voiceover)) {
+    overlay_root = rex::path_to_utf8(rex::to_path(REXCVAR_GET(me2_russian_voiceover_root)) / "dlc");
+  }
+  if (overlay_root.empty()) return device;
+  std::filesystem::path name = package_path_;
+  if (!name.has_filename()) name = name.parent_path();
+  std::error_code ec;
+  const auto dir = std::filesystem::absolute(rex::to_path(overlay_root), ec) / name.filename();
+  if (ec) return device;
+  // 2026-11-21: the overlay folder may hold just its pack, <name>/<name>.nxpack + .nxidx (the DLC packs' layout,
+  // build_dlc_packs.py); the pack wins over loose files.
+  std::unique_ptr<rex::filesystem::Device> overlay;
+  const char* kind = "folder";
+  if (rex::filesystem::PackDevice::Exists(dir)) {
+    auto pack = std::make_unique<rex::filesystem::PackDevice>(device_path_, dir);
+    if (pack->Initialize()) {
+      overlay = std::move(pack);
+      kind = "pack";
+    } else {
+      REXSYS_ERROR("[overlay] DLC '{}': the pack of {} could not be mounted, trying the loose files",
+                   data.file_name(), rex::path_to_utf8(dir));
+    }
+  }
+  if (!overlay) {
+    if (!std::filesystem::is_directory(dir, ec)) return device;
+    auto loose = std::make_unique<rex::filesystem::HostPathDevice>(device_path_, dir, /*read_only=*/true);
+    if (!loose->Initialize()) {
+      REXSYS_ERROR("[overlay] DLC '{}': {} could not be read, the package alone", data.file_name(),
+                   rex::path_to_utf8(dir));
+      return device;
+    }
+    overlay = std::move(loose);
+  }
+  auto merged = std::make_unique<rex::filesystem::OverlayDevice>(std::move(device), std::move(overlay));
+  merged->Initialize();  // the overlay's files into the package's directories (listings too)
+  REXSYS_INFO("[overlay] DLC '{}': {} ({}) over its files", data.file_name(), rex::path_to_utf8(dir), kind);
+  return merged;
 }
 
 ContentPackage::~ContentPackage() {

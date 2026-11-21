@@ -1,0 +1,8 @@
+# The Russian voice-over is made from game files (yours and SynthVoiceRu's): none of it belongs in the tree.
+ru_vo_work/
+*.afc
+*.wem
+*.pcc
+*.xdelta
+*.jsonl
+packed_codebooks_aoTuV_603.bin

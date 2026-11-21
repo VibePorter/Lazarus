@@ -3,6 +3,7 @@
 
 # --- Game files and what is made from them -------------------------------------
 /assets/
+/ru_vo_work/
 /app/generated/
 *.xex
 *.xexp
